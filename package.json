@@ -1,0 +1,30 @@
+{
+  "name": "@weibaohui/dsh-sync",
+  "version": "9999999.9.9",
+  "description": "dsh-sync custom build",
+  "license": "MIT",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./client/bundle.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22.5",
+    "dsh": ">=0.1.7-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "src",
+    "client",
+    "docs",
+    "cordis.patch.yml"
+  ]
+}
