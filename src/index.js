@@ -812,8 +812,9 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   // advance shadow baseline to FETCH_HEAD — safe items now match live, so the
   // subsequent push overlay keeps every remote-only file instead of deleting it.
   // (记录用的 lastSyncedCommit 同样前进：未解决文件的真基线在 pendingBoth 里逐文件记账)
-  await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
-  await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+  // [final-C] 失败不再静默：reset 挂掉还继续记账，会让状态与真实 HEAD 脱节
+  try { await gitExec(binary, ['checkout', eff.branch], repoDir) } catch (e) { throw new Error('对账前 checkout 失败：' + String(e && e.message)) }
+  try { await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir) } catch (e) { throw new Error('对账前 reset 失败：' + String(e && e.message)) }
   state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
   return { reconciled: true, applied, bothModified, remoteDeleted, localKept, changed: changed.length }
 }
@@ -1652,6 +1653,9 @@ module.exports = {
               try { sessionsUp = await fsP.readdir(join(src.from, ws.name), { withFileTypes: true }) } catch {}
               for (const s of sessionsUp) {
                 if (!s.isDirectory()) continue
+                // [final-A] 子代理会话目录不带 "session-" 前缀（DSH 真会话一律带），
+                // 它们 UI 上看不见、跨设备同步纯属占地方。只上传真会话。
+                if (!s.name.startsWith('session-')) continue
                 const sPath = join(src.from, ws.name, s.name)
                 let filesUp = []
                 try { filesUp = await fsP.readdir(sPath) } catch {}
@@ -1816,6 +1820,8 @@ module.exports = {
               const cwsSessionIds = []
               for (const se of sessionsList) {
                 if (!se.isDirectory()) continue
+                // [final-B] 同理：子代理会话不落地
+                if (!se.name.startsWith('session-')) continue
                 const dstSession = join(targetWsDir, se.name)
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
                 await copyTree(join(cwsPath, se.name), dstSession, {})
