@@ -1692,7 +1692,25 @@ module.exports = {
 
     // ── 下载：云 → 本地（单向，覆盖本地） ──
     const runDownload = async (eff) => {
-      const allDownloadedSessionIds = []
+      // [fix-4] 残留 index.lock 自检：上次上传被强杀时 git 会留下锁，
+      // 不处理的话后面 reset --hard 必失败——而老代码把那句失败吞了，
+      // 于是出现「下载完成」但仓库没更新的假成功。
+      try {
+        const lockFile = join(repoDir, '.git', 'index.lock')
+        const lst = await fsP.stat(lockFile)
+        const ageMs = Date.now() - lst.mtimeMs
+        if (ageMs > 5 * 60 * 1000) {
+          await fsP.unlink(lockFile)
+          ctx.logger?.warn?.('dsh-sync: 清理残留 index.lock（' + Math.round(ageMs / 60000) + ' 分钟未释放，判定为上次中断遗留）')
+        } else {
+          throw new Error('影子仓库被 git 占用（index.lock 存在 ' + Math.round(ageMs / 1000) + ' 秒）。请稍等片刻或重启 DSH 后重试，不要强杀正在同步的进程。')
+        }
+      } catch (e) {
+        if (e && e.code === 'ENOENT') { /* 无锁，正常 */ }
+        else if (e && /^影子仓库被 git 占用/.test(String(e.message))) throw e
+      }
+      const allDownloadedSessionIds = [],
+        skipped = []
       let finalWorkspacePath = null
       const remote = await ensureShadowRepo(eff.gitBinary, eff, repoDir)
       const spec = syncSpec(eff, defaultRoots(), state.instanceId)
@@ -1702,14 +1720,35 @@ module.exports = {
       }
       const hasRemote = await gitExec(eff.gitBinary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
       if (!hasRemote) return { downloaded: false, empty: true }
-      await gitExec(eff.gitBinary, ['checkout', eff.branch], repoDir).catch(() => {})
-      await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+      try {
+        await gitExec(eff.gitBinary, ['checkout', eff.branch], repoDir)
+      } catch (e) {
+        skipped.push('checkout ' + eff.branch + ' 失败: ' + String(e && e.message))
+      }
+      try {
+        await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir)
+      } catch (e) {
+        // [fix-1] 老代码是 .catch(()=>{}) —— 失败被吞掉，界面照样报「下载完成」
+        throw new Error('影子仓库更新失败：' + String(e && e.message) + '。最常见原因是上次中断留下的 index.lock。')
+      }
       const applied = []
       for (const group of spec) {
         for (const src of group.sources) {
           const source = join(repoDir, src.to)
+          // [fix-3] standalone 组的影子路径恒为 backup/<本机实例>/... —— 那是「你自己的备份」。
+          // 下载时拿它覆盖 live 等于拿旧配置盖新配置（装的插件会因此消失）。
+          // 恢复请走快照还原或「远端浏览 → 远端对齐」，那条路才是跨机取配置。
+          if (String(src.to).split(sep).join('/').startsWith('backup/')) {
+            skipped.push(src.to + '（本机备份，下载不覆盖）')
+            continue
+          }
           const haveSource = await fsP.access(source).then(() => true).catch(() => false)
-          if (!haveSource) continue
+          if (!haveSource) {
+            // [fix-2] 老代码直接 continue 且不吭声，于是「远端有但仓库没拉到」
+            // 和「本机没装」长得一模一样——都表现为静默跳过 + 下载完成
+            skipped.push(src.to + '（影子仓库缺失，可能未拉取成功）')
+            continue
+          }
           if (src.file) {
             try {
               await fsP.mkdir(join(src.from, '..'), { recursive: true })
@@ -1918,7 +1957,7 @@ module.exports = {
       }
       state.lastSyncAt = new Date().toISOString()
       await saveState()
-      return { downloaded: true, applied }
+      return { downloaded: true, applied, skipped }
     }
     // ── Agent-run jobs (action buttons → apiproxy 主对话级 session) ──
     // conflictRunJobs: 冲突 PR 解决；alignRunJobs: AI 智能对齐（语义合并双方改动）
