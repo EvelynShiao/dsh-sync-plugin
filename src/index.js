@@ -66,7 +66,7 @@ const DEFAULT_SYNC_SETTINGS = {
   syncOnStartup: false,
   intervalMinutes: 30,
   conflictMode: 'ai',   // 'ai' (action button → in-process agent) | 'manual'
-  syncSkills: false,   // [size-skip] 默认忽略：skills 12,941 文件 / 76MB
+  syncSkills: true,    // 原版策略不变；体积由 [size-skip] 的 treeSignature 把关
   syncSessions: false,
   syncSettings: true,
   syncPlugins: true,
