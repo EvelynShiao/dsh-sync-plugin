@@ -66,7 +66,7 @@ const DEFAULT_SYNC_SETTINGS = {
   syncOnStartup: false,
   intervalMinutes: 30,
   conflictMode: 'ai',   // 'ai' (action button → in-process agent) | 'manual'
-  syncSkills: true,
+  syncSkills: false,   // [size-skip] 默认忽略：skills 12,941 文件 / 76MB
   syncSessions: false,
   syncSettings: true,
   syncPlugins: true,
@@ -408,6 +408,33 @@ function strategyForPath(spec, shadowRel) {
   return undefined
 }
 
+/** 目录规模签名：总字节数 + 文件数（可带 include/exclude 过滤）。用于「体积未变即跳过」。 */
+async function treeSignature(dir, opts) {
+    const { includeFiles, excludeDirs, excludeNames, followSymlinks } = opts || {}
+    let bytes = 0, files = 0, exists = false
+    const walk = async (d) => {
+        let entries
+        try { entries = await fsP.readdir(d, { withFileTypes: true }) } catch { return }
+        if (!exists) exists = true
+        for (const ent of entries) {
+            if (ent.name === '.git') continue
+            const p = join(d, ent.name)
+            if (ent.isDirectory()) {
+                if (excludeDirs && excludeDirs.has(ent.name)) continue
+                await walk(p)
+            } else {
+                if (excludeNames && excludeNames.has(ent.name)) continue
+                if (includeFiles && !includeFiles.has(ent.name)) continue
+                try {
+                    const st = followSymlinks ? await fsP.stat(p) : ent
+                    if (st && st.isFile()) { bytes += st.size; files++ }
+                } catch { }
+            }
+        }
+    }
+    await walk(dir)
+    return exists ? (bytes + ':' + files) : null
+}
 async function copyTree(from, to, opts) {
   const { includeFiles, excludeDirs, excludeNames, followSymlinks } = opts || {}
   await fsP.mkdir(to, { recursive: true })
@@ -1668,6 +1695,18 @@ module.exports = {
               }
             }
           } else {
+             // [size-skip] 源与影子的「总字节数:文件数」一致 → 整组跳过（不删不拷）。
+             // 对 skills（12,941 文件 / 76MB）收益最大；体积+文件数双匹配，
+             // 误判面远窄于单看时间戳；git 层仍有内容哈希兜底。
+             const sigOpts = { includeFiles: src.includeFiles, excludeDirs: src.excludeDirs, excludeNames: src.excludeNames, followSymlinks: src.followSymlinks }
+             try {
+               const sigA = await treeSignature(src.from, sigOpts)
+               const sigB = await treeSignature(target, sigOpts)
+               if (sigA !== null && sigB !== null && sigA === sigB) {
+                 skipped.push(src.to + ' (体积未变，跳过)')
+                 continue
+               }
+             } catch { /* 签名失败 → 照常拷贝 */ }
             if (group.strategy === 'standalone') {
               await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
             }
