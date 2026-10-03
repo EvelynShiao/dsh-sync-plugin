@@ -80,8 +80,8 @@ const DEFAULT_SYNC_SETTINGS = {
   pluginsStrategy: 'standalone',
   knowledgeStrategy: 'merge',   // merge = 顶层共享路径（手机端才能读到）；standalone = 每机各存各的
   snapshotSkills: false,      // 快照是否包含技能（体积大，默认只含 设置+插件清单）
-  snapshotAuto: true,         // 每天首个同步自动打一份本地快照（auto-<日期>）
-  snapshotLocalKeep: 30,      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
+  snapshotAuto: false,           // [用户设定] 不要每天自动快照         // 每天首个同步自动打一份本地快照（auto-<日期>）
+  snapshotLocalKeep: 5,           // [用户设定] 只保留 5 份      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
 }
 
 const STRATEGY_VALUES = ['standalone', 'merge']
