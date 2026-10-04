@@ -205,7 +205,7 @@ async function ensureConfig(retries = 40) {
 // 之后即使 ensureConfig 把 Config 建好，ctx.settings.update 用的仍是它手里的 null，
 // 于是抛 Cannot use 'in' operator to search for 'toJSON' in null，设置只进内存。
 // 这里直接把生效值写回 profiles/web/cordis.patch.yml —— 与 settings 服务写的是同一个文件。
-function writeProfileFileSync(clearToken) {
+function writeProfileFileSync(effIn, clearToken) {
   const fsx = require('node:fs')
   const cpPath = join(dshHome(), 'profiles', 'web', 'cordis.patch.yml')
   let raw
@@ -238,7 +238,7 @@ function writeProfileFileSync(clearToken) {
       if (m && m[1] && m[1] !== "null" && m[1] !== "~") { keptToken = m[1]; break }
     }
   }
-  const eff = syncSettings()
+  const eff = effIn
   const vals = {}
   for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy']) vals[k] = eff[k]
   for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
@@ -2471,7 +2471,7 @@ module.exports = {
                 // host 侧 Config 在加载期已固化为 null（竞态），settings 服务这条路走不通。
                 // 直接写回 profile —— 与 settings 服务写的是同一个文件，效果等价。
                 try {
-                  writeProfileFileSync(clearToken)
+                  writeProfileFileSync(syncSettings(), clearToken)
                   settingsPersistFailed = null
                 } catch (e2) {
                   settingsPersistFailed = ((e && e.message) || String(e)) + " | 直写回退失败: " + ((e2 && e2.message) || String(e2))
