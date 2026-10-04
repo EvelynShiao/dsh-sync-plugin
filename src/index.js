@@ -200,6 +200,73 @@ async function ensureConfig(retries = 40) {
   return configBuilding
 }
 
+// ── 绕开 settings 服务直写 profile ───────────────────────────────────────
+// cordis 在插件加载期就把 module.exports.Config 读走固化了（那一刻是 null —— 竞态），
+// 之后即使 ensureConfig 把 Config 建好，ctx.settings.update 用的仍是它手里的 null，
+// 于是抛 Cannot use 'in' operator to search for 'toJSON' in null，设置只进内存。
+// 这里直接把生效值写回 profiles/web/cordis.patch.yml —— 与 settings 服务写的是同一个文件。
+function writeProfileFileSync(clearToken) {
+  const fsx = require('node:fs')
+  const cpPath = join(dshHome(), 'profiles', 'web', 'cordis.patch.yml')
+  let raw
+  try { raw = fsx.readFileSync(cpPath, "utf8") }
+  catch (e) { throw new Error('读不到 cordis.patch.yml: ' + String((e && e.message) || e)) }
+  const eol = raw.indexOf('\r\n') >= 0 ? '\r\n' : '\n'
+  const lines = raw.split(/\r?\n/)
+  let start = -1
+  for (let i = 0; i < lines.length; i++) if (/^-\s+id:\s*dsh-sync\s*$/.test(lines[i])) { start = i; break }
+  if (start < 0) throw new Error('找不到 - id: dsh-sync 条目')
+  let end = start + 1
+  while (end < lines.length && !/^-\s+id:/.test(lines[end])) end++
+  let syncIdx = -1
+  for (let i = start; i < end; i++) if (/^\s*sync:\s*$/.test(lines[i])) { syncIdx = i; break }
+  if (syncIdx < 0) throw new Error('找不到 config.sync 段')
+  const baseIndent = (lines[syncIdx].match(/^ */) || [''])[0]
+  let blockEnd = syncIdx + 1
+  while (blockEnd < end) {
+    const l = lines[blockEnd]
+    if (!l.trim()) { blockEnd++; continue }
+    const ind = (l.match(/^ */) || [''])[0].length
+    if (ind <= baseIndent.length) break
+    blockEnd++
+  }
+  // 现有 token（除非本次明确清空），避免被新块覆盖掉
+  let keptToken = null
+  if (!clearToken) {
+    for (let i = syncIdx + 1; i < blockEnd; i++) {
+      const m = lines[i].match(/^\s+token:\s*(.+?)\s*$/)
+      if (m && m[1] && m[1] !== "null" && m[1] !== "~") { keptToken = m[1]; break }
+    }
+  }
+  const eff = syncSettings()
+  const vals = {}
+  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy']) vals[k] = eff[k]
+  for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
+  for (const k of ['intervalMinutes','snapshotLocalKeep']) vals[k] = eff[k]
+  if (keptToken && !vals.token) vals.token = keptToken
+  const fmt = (v) => {
+    if (v === undefined || v === null) return null
+    if (typeof v === "boolean" || typeof v === "number") return String(v)
+    const s = String(v)
+    if (s === '' || /[:#{}\[\],&*?|>'"%@`]/.test(s) || s !== s.trim() || s.indexOf(': ') >= 0) return JSON.stringify(s)
+    return s
+  }
+  const newBlock = []
+  for (const k of Object.keys(vals)) {
+    const s = fmt(vals[k])
+    if (s === null) continue
+    newBlock.push(baseIndent + '  ' + k + ': ' + s)
+  }
+  const out = lines.slice(0, syncIdx + 1).concat(newBlock, [""]).concat(lines.slice(blockEnd))
+  fsx.writeFileSync(cpPath, out.join(eol))
+  // 回读校验：关键字段必须在
+  const chk = fsx.readFileSync(cpPath, "utf8")
+  for (const k of ['repoUrl', 'sessionsStrategy', 'knowledgeStrategy']) {
+    if (chk.indexOf(k) < 0) throw new Error('回读校验失败，' + k + ' 不在文件里')
+  }
+  return true
+}
+
 // legacy settings.yaml.imported 读取（dsh 0.1.7 迁移残留；只支持平铺 key: value）
 function legacySettingsPath() {
   return process.env.DSH_HOME ? join(resolve(process.env.DSH_HOME), 'settings.yaml.imported') : join(homedir(), '.dsh', 'settings.yaml.imported')
@@ -2400,7 +2467,16 @@ module.exports = {
                 if (!Config) throw new Error("Config 仍不可用: " + (configError || "Schema 为 null"))
                 if (Object.keys(patch).length > 0) await ctx.settings.update(SYNC_SETTINGS_NS, { sync: patch })
                 if (clearToken) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'token'] }])
-              } catch (e) { settingsPersistFailed = e && e.message || String(e) }
+              } catch (e) {
+                // host 侧 Config 在加载期已固化为 null（竞态），settings 服务这条路走不通。
+                // 直接写回 profile —— 与 settings 服务写的是同一个文件，效果等价。
+                try {
+                  writeProfileFileSync(clearToken)
+                  settingsPersistFailed = null
+                } catch (e2) {
+                  settingsPersistFailed = ((e && e.message) || String(e)) + " | 直写回退失败: " + ((e2 && e2.message) || String(e2))
+                }
+              }
             }
             const eff = syncSettings()
             const { token, ...safe } = eff
