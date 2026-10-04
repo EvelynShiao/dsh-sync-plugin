@@ -164,6 +164,42 @@ try {
     fsx.appendFileSync(join(pj, 'logs', 'dsh-sync-init.log'), `${new Date().toISOString()}  Schema=${Schema ? 'ok' : 'NULL'}  Config=${Config ? 'ok' : 'NULL'}  schemaLoad=${schemaLoadError || "-"}  err=${configError || '-'}\n`) }
 } catch {}
 
+// ── Config 延后构建 ───────────────────────────────────────────────────────
+// 顶层同步 require(schemastery) 会撞上 cosmokit 正在进行的动态 import：
+//   Cannot require() ES Module ... cosmokit/lib/index.js because it is not yet fully loaded
+// 这是启动期竞态，晚一点（用户点保存时）再构建必然成功。
+// 因此把构建挪到这里，带重试；Config 建成后 settings.update 才能写进 profile。
+let configBuilding = null
+async function ensureConfig(retries = 40) {
+  if (Config) return Config
+  if (configBuilding) return configBuilding
+  configBuilding = (async () => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        if (!Schema) {
+          const cr = require('node:module').createRequire
+          const pth = require('node:path')
+          const abs = pth.join(dshHome(), 'profiles', 'web', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs')
+          Schema = cr(abs)(abs)
+        }
+        if (Schema) {
+          Config = Schema.object({ sync: syncSettingsSchema(Schema).volatile() })
+          break
+        }
+      } catch (e) { configError = String((e && e.message) || e) }
+      await new Promise((r) => setTimeout(r, 150))
+    }
+    try {
+      const fsx = require('node:fs')
+      const dir = typeof dshHome === 'function' ? dshHome() : null
+      if (dir) { fsx.mkdirSync(join(dir, 'logs'), { recursive: true })
+        fsx.appendFileSync(join(dir, 'logs', 'dsh-sync-init.log'), `${new Date().toISOString()}  ensureConfig -> Schema=${Schema ? 'ok' : 'NULL'} Config=${Config ? 'ok' : 'NULL'} err=${configError || '-'}\n`) }
+    } catch {}
+    return Config
+  })()
+  return configBuilding
+}
+
 // legacy settings.yaml.imported 读取（dsh 0.1.7 迁移残留；只支持平铺 key: value）
 function legacySettingsPath() {
   return process.env.DSH_HOME ? join(resolve(process.env.DSH_HOME), 'settings.yaml.imported') : join(homedir(), '.dsh', 'settings.yaml.imported')
@@ -1626,6 +1662,9 @@ module.exports = {
         if (Object.keys(values).length === 0 || Object.keys(values).every((k) => values[k] === DEFAULT_SYNC_SETTINGS[k])) { migrationSettled = true; return }
         if (ctx.settings && typeof ctx.settings.update === 'function') {
           try {
+                // 延后构建：启动期有竞态，等用户真正保存时再建（见 ensureConfig）
+                await ensureConfig()
+                if (!Config) throw new Error("Config 仍不可用: " + (configError || "Schema 为 null"))
             await ctx.settings.update(SYNC_SETTINGS_NS, { sync: values })
             migrationSettled = true
             refreshLive()
@@ -2356,6 +2395,9 @@ module.exports = {
             // 0.1.7 持久化：平铺 patch 挂进 sync: 子对象；token 清空走 mutate.unset
             if (ctx.settings && typeof ctx.settings.update === 'function') {
               try {
+                // 延后构建：启动期有 cosmokit 并发 import 竞态，用户点保存时再（带重试）建
+                await ensureConfig()
+                if (!Config) throw new Error("Config 仍不可用: " + (configError || "Schema 为 null"))
                 if (Object.keys(patch).length > 0) await ctx.settings.update(SYNC_SETTINGS_NS, { sync: patch })
                 if (clearToken) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'token'] }])
               } catch (e) { settingsPersistFailed = e && e.message || String(e) }
