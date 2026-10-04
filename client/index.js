@@ -105,6 +105,8 @@ const ZH = {
   conflictModeManual: '人工网页合并',
   conflictModeHint: '两台机器改了同一文件时：AI 模式弹出按钮由 AI 自动解决；人工模式 PR 挂起等你去 gitcode.com 合并',
   toggleSkills: '技能 skills',
+        toggleMemory: '长期记忆（session-kit）',
+        toggleKnowledge: '知识库（knowledge-sqlite）',
   toggleSessions: '会话 sessions',
   toggleSettings: '设置 settings',
   togglePlugins: '插件 plugins',
@@ -216,6 +218,8 @@ const EN = {
   conflictModeManual: 'Manual web merge',
   conflictModeHint: 'When two machines edit the same file: AI mode shows a button the AI resolves; manual mode leaves the PR open for you to merge on gitcode.com',
   toggleSkills: 'Skills',
+        toggleMemory: 'Long-term memory (session-kit)',
+        toggleKnowledge: 'Knowledge base (knowledge-sqlite)',
   toggleSessions: 'Sessions',
   toggleSettings: 'Settings',
   togglePlugins: 'Plugins',
@@ -686,8 +690,8 @@ function SettingsSection({ t }) {
   const [autoSync, setAutoSync] = useState(true)
   const [syncOnStartup, setSyncOnStartup] = useState(false)
   const [conflictMode, setConflictMode] = useState('ai')
-  const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true })
-  const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' })
+  const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true , memory: true, knowledge: true })
+  const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' , memory: 'merge', knowledge: 'merge' })
   const [snapCfg, setSnapCfg] = useState({ auto: true, skills: false, localKeep: 30 })
   const [snapList, setSnapList] = useState(null)
   const [snapName, setSnapName] = useState('')
@@ -770,7 +774,7 @@ function SettingsSection({ t }) {
   }
   const doSave = async () => {
     try {
-      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep }
+      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep }
       if (token !== '') patch.token = token
       await putSettings(patch)
       setToken('')
@@ -881,7 +885,8 @@ function SettingsSection({ t }) {
             h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('groupHint')),
             h('div', { className: 'sk-toggles' },
               groupCard('skills', t('toggleSkills')), groupCard('sessions', t('toggleSessions')),
-              groupCard('settings', t('toggleSettings')), groupCard('plugins', t('togglePlugins'))),
+              groupCard('settings', t('toggleSettings')), groupCard('plugins', t('togglePlugins')),
+          groupCard('memory', t('toggleMemory')), groupCard('knowledge', t('toggleKnowledge'))),
             h('div', { className: 'sk-dir' }, t('strategyHint'))),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },

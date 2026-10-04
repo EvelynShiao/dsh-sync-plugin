@@ -71,6 +71,7 @@ const DEFAULT_SYNC_SETTINGS = {
   syncSettings: true,
   syncPlugins: true,
   syncKnowledge: true,   // 跨机共享知识库（knowledge.sqlite，单文件、journal_mode=delete 可安全拷贝）
+  syncMemory: true,             // session-kit 长期记忆库
   // 每组独立策略：'backup' 各机云上独立备份（写 backup/<instanceId>/，本地永不被
   // 覆盖）| 'union' 并集同步（新增都收、逐文件三方、双方改动交 AI）| 'remote'
   // 覆盖·远端为准（本地只读镜像，远端删本地也删）| 'local' 覆盖·本地为准（远端只是回显）
@@ -79,6 +80,7 @@ const DEFAULT_SYNC_SETTINGS = {
   settingsStrategy: 'standalone',
   pluginsStrategy: 'standalone',
   knowledgeStrategy: 'merge',   // merge = 顶层共享路径（手机端才能读到）；standalone = 每机各存各的
+  memoryStrategy: 'merge',      // 记忆与知识库同理：顶层共享路径，两端可读
   snapshotSkills: false,      // 快照是否包含技能（体积大，默认只含 设置+插件清单）
   snapshotAuto: false,           // [用户设定] 不要每天自动快照         // 每天首个同步自动打一份本地快照（auto-<日期>）
   snapshotLocalKeep: 10,           // [用户设定] 只保留 5 份      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
@@ -109,11 +111,13 @@ function syncSettingsSchema(S) {
     syncSettings: S.boolean(),
     syncPlugins: S.boolean(),
     syncKnowledge: S.boolean(),
+    syncMemory: S.boolean(),
     skillsStrategy: S.string(),
     sessionsStrategy: S.string(),
     settingsStrategy: S.string(),
     pluginsStrategy: S.string(),
     knowledgeStrategy: S.string(),
+    memoryStrategy: S.string(),
     snapshotSkills: S.boolean(),
     snapshotAuto: S.boolean(),
     snapshotLocalKeep: S.number(),
@@ -347,6 +351,7 @@ function defaultRoots() {
     settingsFile: join(dh, 'settings.yaml'),
     profiles: join(dh, 'profiles'),
     knowledge: join(dh, 'knowledge.sqlite'),
+    sessionKitMemory: join(dh, 'profiles', 'web', '.dsh-session-kit', 'memory.sqlite'),
   }
 }
 
@@ -358,6 +363,7 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
   const settingsStrategy = STRATEGY_VALUES.includes(eff.settingsStrategy) ? eff.settingsStrategy : 'standalone'
   const pluginsStrategy = STRATEGY_VALUES.includes(eff.pluginsStrategy) ? eff.pluginsStrategy : 'standalone'
   const knowledgeStrategy = STRATEGY_VALUES.includes(eff.knowledgeStrategy) ? eff.knowledgeStrategy : 'merge'
+  const memoryStrategy = STRATEGY_VALUES.includes(eff.memoryStrategy) ? eff.memoryStrategy : 'merge'
   if (eff.syncSkills) groups.push({
     name: 'skills', strategy: skillsStrategy,
     sources: [
@@ -389,6 +395,10 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
   })
   // 知识库：单文件、按整文件比对。SQLite 是二进制，两侧都改会走冲突流程
   // （conflictMode: ai 由对齐步骤处理，失败则人工选边）；日常单端写入不会触发。
+  if (eff.syncMemory) groups.push({
+    name: 'memory', strategy: memoryStrategy,
+    sources: [{ from: roots.sessionKitMemory, to: memoryStrategy === 'standalone' ? backup('memory/memory.sqlite') : 'memory/memory.sqlite', file: true }],
+  })
   if (eff.syncKnowledge) groups.push({
     name: 'knowledge', strategy: knowledgeStrategy,
     sources: [{ from: roots.knowledge, to: knowledgeStrategy === 'standalone' ? backup('knowledge/knowledge.sqlite') : 'knowledge/knowledge.sqlite', file: true }],
@@ -2285,14 +2295,14 @@ module.exports = {
             for (const key of ['repoUrl', 'branch', 'gitBinary', 'conflictMode', 'downloadWorkspacePath']) {
               if (typeof body[key] === 'string' && body[key] !== '') patch[key] = body[key]
             }
-            for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy']) {
+            for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy', 'knowledgeStrategy', 'memoryStrategy']) {
               if (STRATEGY_VALUES.includes(body[key])) patch[key] = body[key]
             }
             for (const key of ['snapshotSkills', 'snapshotAuto']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.snapshotLocalKeep === 'number' && body.snapshotLocalKeep >= 1) patch.snapshotLocalKeep = Math.floor(body.snapshotLocalKeep)
-            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins']) {
+            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins', 'syncKnowledge', 'syncMemory']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes
