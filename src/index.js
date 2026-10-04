@@ -125,13 +125,31 @@ function syncSettingsSchema(S) {
   })
 }
 let Config = null
+let configError = null
 try {
   Config = Schema
     ? Schema.object({
       sync: syncSettingsSchema(Schema).volatile(),
     })
     : null
-} catch { /* schemastery <3.18.4 无 .volatile()：降级为无 Config（设置写回不可用），插件运行不受影响 */ }
+} catch (e) { configError = String((e && e.message) || e) }
+// 兜底链：主路径失败不能让 Config 停在 null —— null 会让 settings.update 抛
+// "Cannot use 'in' operator to search for 'toJSON' in null"，设置只进内存、重启即丢。
+if (!Config && Schema) {
+  try { Config = Schema.object({ sync: syncSettingsSchema(Schema) }) }
+  catch (e) { configError = (configError ? configError + " | " : "") + "no-volatile: " + String((e && e.message) || e) }
+}
+if (!Config && Schema) {
+  try { Config = Schema.object({ sync: Schema.any() }) }
+  catch (e) { configError = (configError ? configError + " | " : "") + "any: " + String((e && e.message) || e) }
+}
+// 无论成败都落一行日志，方便定位（原来是空 catch，问题永远看不见）
+try {
+  const fsx = require('node:fs')
+  const pj = typeof dshHome === 'function' ? dshHome() : null
+  if (pj) { fsx.mkdirSync(join(pj, 'logs'), { recursive: true })
+    fsx.appendFileSync(join(pj, 'logs', 'dsh-sync-init.log'), `${new Date().toISOString()}  Schema=${Schema ? 'ok' : 'NULL'}  Config=${Config ? 'ok' : 'NULL'}  err=${configError || '-'}\n`) }
+} catch {}
 
 // legacy settings.yaml.imported 读取（dsh 0.1.7 迁移残留；只支持平铺 key: value）
 function legacySettingsPath() {
@@ -1811,6 +1829,9 @@ module.exports = {
       state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
       state.lastSyncAt = new Date().toISOString()
       await saveState()
+      // 无条件清理：原来 prune 只在 snapshotAuto !== false 的分支里，
+      // 用户关掉每日自动快照后日常同步就永远不清理 → 上限形同虚设（曾堆到 16 份）。
+      try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
       return { uploaded: true }
     }
 
@@ -2229,7 +2250,7 @@ module.exports = {
             const eff = syncSettings()
             const { token, ...safe } = eff
             const repoExists = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
-            sendJson(res, 200, {
+            sendJson(res, 200, { configOk: !!Config, schemaOk: !!Schema, configError: configError || null,
               repoUrl: eff.repoUrl, branch: eff.branch, dir: displayPath(repoDir), repoExists,
               instanceId: state.instanceId,
               gitAvailable: await gitAvailable(eff.gitBinary),
@@ -2329,7 +2350,7 @@ module.exports = {
             const eff = syncSettings()
             const { token, ...safe } = eff
             // 设置写回失败必须让 UI 知道：原来只 warn，界面仍提示「已保存」→ 重启即丢
-            if (settingsPersistFailed) { sendJson(res, 500, { error: "设置写回失败（仅本次运行生效，重启会丢）: " + settingsPersistFailed }); return }
+            if (settingsPersistFailed) { sendJson(res, 500, { error: "设置写回失败（仅本次运行生效，重启会丢）: " + settingsPersistFailed + (configError ? " [Config层: " + configError + "]" : "") }); return }
             sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '' })
             return
           }
