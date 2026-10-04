@@ -2292,6 +2292,7 @@ module.exports = {
             const body = await readJsonBody(req)
             await stateLoaded
             const patch = {}
+            let settingsPersistFailed = null
             for (const key of ['repoUrl', 'branch', 'gitBinary', 'conflictMode', 'downloadWorkspacePath']) {
               if (typeof body[key] === 'string' && body[key] !== '') patch[key] = body[key]
             }
@@ -2323,10 +2324,12 @@ module.exports = {
               try {
                 if (Object.keys(patch).length > 0) await ctx.settings.update(SYNC_SETTINGS_NS, { sync: patch })
                 if (clearToken) await ctx.settings.mutate(SYNC_SETTINGS_NS, [{ op: 'unset', path: ['sync', 'token'] }])
-              } catch (e) { ctx.logger.warn(`dsh-sync: settings update 失败（仅本次运行生效）: ${e && e.message}`) }
+              } catch (e) { settingsPersistFailed = e && e.message || String(e) }
             }
             const eff = syncSettings()
             const { token, ...safe } = eff
+            // 设置写回失败必须让 UI 知道：原来只 warn，界面仍提示「已保存」→ 重启即丢
+            if (settingsPersistFailed) { sendJson(res, 500, { error: "设置写回失败（仅本次运行生效，重启会丢）: " + settingsPersistFailed }); return }
             sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '' })
             return
           }
