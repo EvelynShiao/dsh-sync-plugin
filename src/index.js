@@ -81,7 +81,7 @@ const DEFAULT_SYNC_SETTINGS = {
   knowledgeStrategy: 'merge',   // merge = 顶层共享路径（手机端才能读到）；standalone = 每机各存各的
   snapshotSkills: false,      // 快照是否包含技能（体积大，默认只含 设置+插件清单）
   snapshotAuto: false,           // [用户设定] 不要每天自动快照         // 每天首个同步自动打一份本地快照（auto-<日期>）
-  snapshotLocalKeep: 5,           // [用户设定] 只保留 5 份      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
+  snapshotLocalKeep: 10,           // [用户设定] 只保留 5 份      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
 }
 
 const STRATEGY_VALUES = ['standalone', 'merge']
@@ -406,6 +406,76 @@ function strategyForPath(spec, shadowRel) {
     }
   }
   return undefined
+}
+
+/** 目录签名：递归累计字节数与文件数（尊重 include/exclude 过滤，两侧可比）。 */
+async function dirSignature(dir, opts) {
+  const includeFiles = opts && opts.includeFiles, excludeDirs = opts && opts.excludeDirs, excludeNames = opts && opts.excludeNames
+  let entries = []
+  try { entries = await fsP.readdir(dir, { withFileTypes: true }) } catch { return { size: -1, files: -1 } }
+  let size = 0, files = 0
+  for (const e of entries) {
+    if (e.name === '.git') continue
+    const full = join(dir, e.name)
+    if (e.isDirectory()) {
+      if (excludeDirs && excludeDirs.has(e.name)) continue
+      const sub = await dirSignature(full, opts)
+      if (sub.files < 0) continue
+      size += sub.size; files += sub.files
+    } else {
+      if (includeFiles && !includeFiles.has(e.name)) continue
+      if (excludeNames && excludeNames.has(e.name)) continue
+      try { const st = await fsP.stat(full); size += st.size; files += 1 } catch {}
+    }
+  }
+  return { size, files }
+}
+
+/**
+ * 差量同步：
+ *   1) 先比整棵签名 —— 相同则整棵跳过（「大的文件夹 size 一样就不看小的了」）
+ *   2) 不同则逐级下钻，文件按字节大小比对，只有不同才拷贝
+ *   3) 目标侧多余的删除（等价原 rm+全量拷，但未变部分原地不动）
+ */
+async function syncTreeDifferential(from, to, opts) {
+  const stat = { signed: 0, copied: 0, removed: 0 }
+  const a = await dirSignature(from, opts)
+  if (a.files < 0) return stat
+  const b = await dirSignature(to, opts)
+  if (b.files >= 0 && a.size === b.size && a.files === b.files) { stat.signed = 1; return stat }
+  await fsP.mkdir(to, { recursive: true })
+  const includeFiles = opts && opts.includeFiles, excludeDirs = opts && opts.excludeDirs, excludeNames = opts && opts.excludeNames
+  let srcEntries = [], dstEntries = []
+  try { srcEntries = await fsP.readdir(from, { withFileTypes: true }) } catch { return stat }
+  try { dstEntries = await fsP.readdir(to, { withFileTypes: true }) } catch {}
+  for (const e of srcEntries) {
+    if (e.name === '.git') continue
+    const s = join(from, e.name), d = join(to, e.name)
+    if (e.isDirectory()) {
+      if (excludeDirs && excludeDirs.has(e.name)) continue
+      const sub = await syncTreeDifferential(s, d, opts)
+      stat.signed += sub.signed; stat.copied += sub.copied; stat.removed += sub.removed
+    } else {
+      if (includeFiles && !includeFiles.has(e.name)) continue
+      if (excludeNames && excludeNames.has(e.name)) continue
+      let ss = null, ds = null
+      try { ss = await fsP.stat(s) } catch { continue }
+      try { ds = await fsP.stat(d) } catch {}
+      if (ds && ds.size === ss.size) continue
+      try { await fsP.copyFile(s, d); stat.copied += 1 } catch {}
+    }
+  }
+  for (const e of dstEntries) {
+    if (e.name === '.git') continue
+    const s = join(from, e.name), d = join(to, e.name)
+    let exists = false
+    try { await fsP.access(s); exists = true } catch {}
+    if (exists) continue
+    if (e.isDirectory()) { if (excludeDirs && excludeDirs.has(e.name)) continue }
+    else { if (includeFiles && !includeFiles.has(e.name)) continue; if (excludeNames && excludeNames.has(e.name)) continue }
+    try { await fsP.rm(d, { recursive: true, force: true }); stat.removed += 1 } catch {}
+  }
+  return stat
 }
 
 /** 目录规模签名：总字节数 + 文件数（可带 include/exclude 过滤）。用于「体积未变即跳过」。 */
@@ -879,8 +949,11 @@ async function pruneLocalSnapshots(snapshotsDir, keep, cloudNames) {
   const removed = []
   for (let i = 0; i < dirs.length; i++) {
     if (i < keep) continue
-    const manualUnclouded = !dirs[i].startsWith('auto-') && !dirs[i].startsWith('pre-restore-') && !(cloudNames || []).includes(dirs[i])
-    if (manualUnclouded) continue
+    // 上限对所有快照生效：原实现只删 auto-/pre-restore-，手动拍的永不删 → 上限形同虚设（曾堆到 17 份）。
+    // 仍保留两类：restore 前的安全快照（回滚兜底）、已在云端的（本地可删、云端还在）。
+    const name = dirs[i]
+    if (name.startsWith('pre-restore-')) continue
+    if ((cloudNames || []).includes(name)) continue
     try { await fsP.rm(join(snapshotsDir, dirs[i]), { recursive: true, force: true }); removed.push(dirs[i]) } catch {}
   }
   return removed
@@ -1707,10 +1780,8 @@ module.exports = {
                  continue
                }
              } catch { /* 签名失败 → 照常拷贝 */ }
-            if (group.strategy === 'standalone') {
-              await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
-            }
-            await copyTree(src.from, target, {
+            // [differential] 整组签名不同 → 逐级下钻，只拷有差异的文件，不再全量重拷
+            await syncTreeDifferential(src.from, target, {
               includeFiles: src.includeFiles,
               excludeDirs: src.excludeDirs,
               excludeNames: src.excludeNames,
@@ -1975,9 +2046,9 @@ module.exports = {
             await copyTree(source, src.from, {})
             applied.push(src.to + ' (merge)')
           } else {
-            await fsP.rm(src.from, { recursive: true, force: true }).catch(() => {})
-            await copyTree(source, src.from, {})
-            applied.push(src.to)
+            // [differential] 云端覆盖本地也走差量：只写有变化的，未变的原地不动
+            const dr = await syncTreeDifferential(source, src.from, {})
+            applied.push(src.to + (dr.signed ? ' (体积未变)' : ' (差量 拷' + dr.copied + ' 删' + dr.removed + ')'))
           }
         }
       }

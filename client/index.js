@@ -69,6 +69,14 @@ const ZH = {
   syncing: '同步中，可能需要一分钟…',
   syncDone: '同步完成',
   syncFailed: '同步失败',
+  uploadAll: '上传',
+  downloadAll: '下载',
+  uploadBtn: '上传',
+  downloadBtn: '下载',
+  uploadHint: '本地 → 云端：把本机的会话、设置、插件清单、技能、知识库推上去',
+  downloadHint: '云端 → 本地：从云端拉取并覆盖本地（覆盖前自动拍安全快照，可回滚）',
+  strategyStandalone: '各机独立（写进 backup/<本机>/，两端互不覆盖）',
+  strategyMerge: '合并覆盖（写进顶层共享路径，两端共用）',
   save: '保存',
   saved: '设置已保存',
   repoUrlLabel: '仓库地址',
@@ -168,6 +176,12 @@ const EN = {
   syncing: 'Syncing, may take a minute…',
   syncDone: 'Sync complete',
   syncFailed: 'Sync failed',
+  uploadBtn: 'Upload',
+  downloadBtn: 'Download',
+  uploadHint: 'Local → remote: push sessions, settings, plugins, skills and knowledge',
+  downloadHint: 'Remote → local: pull and overwrite local (safety snapshot first)',
+  strategyStandalone: 'Per machine (own backup/<id>/, never overwritten)',
+  strategyMerge: 'Merge (shared top-level path, used by both ends)',
   save: 'Save',
   saved: 'Settings saved',
   repoUrlLabel: 'Repository URL',
@@ -661,7 +675,7 @@ function SettingsSection({ t }) {
   const [syncOnStartup, setSyncOnStartup] = useState(false)
   const [conflictMode, setConflictMode] = useState('ai')
   const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true })
-  const [gs, setGs] = useState({ skills: 'union', sessions: 'backup', settings: 'backup', plugins: 'backup' })
+  const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' })
   const [snapCfg, setSnapCfg] = useState({ auto: true, skills: false, localKeep: 30 })
   const [snapList, setSnapList] = useState(null)
   const [snapName, setSnapName] = useState('')
@@ -703,6 +717,28 @@ function SettingsSection({ t }) {
   // AI smart align: POST runs a deterministic sync first (remote-only files
   // pulled back), then streams the semantic-merge agent run; dialog opens
   // already running with the both-modified file list.
+  // 单向上传：本地 → 云端（只推不拉，不覆盖本地）
+  const doUpload = async () => {
+    setBusy(true)
+    try {
+      const r = await fetch(API + '/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      onToast(t('syncDone'), 2600)
+    } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
+    finally { setBusy(false); refresh() }
+  }
+  // 单向下载：云端 → 本地（覆盖本地，覆盖前服务端会先拍安全快照）
+  const doDownload = async () => {
+    setBusy(true)
+    try {
+      const r = await fetch(API + '/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      onToast(t('syncDone'), 2600)
+    } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
+    finally { setBusy(false); refresh() }
+  }
   const doAlign = async () => {
     setAlignBusy(true)
     try {
@@ -762,7 +798,8 @@ function SettingsSection({ t }) {
   try {
     const row = (label, value) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '3px 0' } },
       h('span', { className: 'sk-dir' }, label), h('span', { className: 'sk-hint', style: { wordBreak: 'break-all', textAlign: 'right' } }, value))
-    const STRATS = ['backup', 'union', 'remote', 'local']
+    // 只留后端 STRATEGY_VALUES 真正认的两个值：之前给的 backup/union/remote/local 后端一律回退 standalone，选了等于没选
+    const STRATS = ['standalone', 'merge']
     const cap = (v) => v[0].toUpperCase() + v.slice(1)
     const groupCard = (key, label) => h('div', { key, className: 'sk-gcard' + (g[key] ? ' on' : '') },
       h('label', { className: 'sk-toggle' + (g[key] ? ' on' : ''), style: { border: 'none', background: 'transparent', padding: 0, cursor: 'pointer' } },
@@ -860,12 +897,8 @@ function SettingsSection({ t }) {
             h(ButtonLite, { onClick: doSave }, t('save')),
             h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
             h('span', { className: 'sk-spacer' }),
-            h(ButtonLite, {
-              disabled: alignBusy || status.syncing || !status.repoUrl || !status.hasToken,
-              title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined,
-              onClick: doAlign,
-            }, alignBusy ? t('running') : t('alignBtn')),
-            h(ButtonLite, { primary: true, disabled: busy || status.syncing || alignBusy, onClick: doSync }, busy ? t('syncing') : t('syncNow'))))
+            h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('uploadHint'), onClick: doUpload }, t('uploadBtn')),
+            h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn'))))
   } catch (renderErr) {
     ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))
     body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },
