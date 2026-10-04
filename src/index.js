@@ -48,7 +48,20 @@ function loadSchemastery() {
   if (process.env.DSHSYNC_DEBUG) console.warn(`[dsh-sync] schemastery unavailable: ${errors.join(' | ')}`)
   return null
 }
-const Schema = loadSchemastery()
+let Schema = loadSchemastery()
+// ── Schema 自救：loadSchemastery 在宿主加载环境里常返回 null（其内部 require 解析不到），
+// 一旦为 null，下面的 Config 三元表达式会静默得到 null，settings.update 随后抛
+// "Cannot use 'in' operator to search for 'toJSON' in null"，设置只进内存、重启即丢。
+// 这里用 createRequire(绝对路径) 强制加载 profile 自带的 schemastery（lib/index.cjs）。
+let schemaLoadError = null
+if (!Schema) {
+  try {
+    const cr = require('node:module').createRequire
+    const pth = require('node:path')
+    const abs = pth.join(dshHome(), 'profiles', 'web', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs')
+    Schema = cr(abs)(abs)
+  } catch (e) { schemaLoadError = String((e && e.message) || e) }
+}
 
 const GITCODE_API_BASE = 'https://api.gitcode.com/api/v5'
 const MAX_BODY_BYTES = 64 * 1024
@@ -148,7 +161,7 @@ try {
   const fsx = require('node:fs')
   const pj = typeof dshHome === 'function' ? dshHome() : null
   if (pj) { fsx.mkdirSync(join(pj, 'logs'), { recursive: true })
-    fsx.appendFileSync(join(pj, 'logs', 'dsh-sync-init.log'), `${new Date().toISOString()}  Schema=${Schema ? 'ok' : 'NULL'}  Config=${Config ? 'ok' : 'NULL'}  err=${configError || '-'}\n`) }
+    fsx.appendFileSync(join(pj, 'logs', 'dsh-sync-init.log'), `${new Date().toISOString()}  Schema=${Schema ? 'ok' : 'NULL'}  Config=${Config ? 'ok' : 'NULL'}  schemaLoad=${schemaLoadError || "-"}  err=${configError || '-'}\n`) }
 } catch {}
 
 // legacy settings.yaml.imported 读取（dsh 0.1.7 迁移残留；只支持平铺 key: value）
