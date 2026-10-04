@@ -2471,6 +2471,52 @@ module.exports = {
           }
 
           // POST /dsh-sync/api/snapshot/restore {name} → 恢复（先拍 pre-restore 安全快照）
+          // POST /dsh-sync/api/snapshot/delete {name} → 删除本地快照（云端保留，可再取回）
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/snapshot/delete')) {
+            const body = await readJsonBody(req)
+            await stateLoaded
+            const name = sanitizeSnapshotName(body.name)
+            if (!name) { sendJson(res, 400, { error: '缺少快照名' }); return }
+            const dir = join(syncDir, 'snapshots', name)
+            const exists = await fsP.access(dir).then(() => true).catch(() => false)
+            if (!exists && !(state.cloudSnapshots || []).includes(name)) { sendJson(res, 404, { error: '没有这个快照' }); return }
+            if (exists) {
+              try { await fsP.rm(dir, { recursive: true, force: true }) }
+              catch (e) { sendJson(res, 500, { error: String(e && e.message || e) }); return }
+            }
+            // 若云端也存在，从云端名单里一并摘除（避免 list 里出现取不到的幽灵项）
+            if (state.cloudSnapshots && state.cloudSnapshots.includes(name)) {
+              state.cloudSnapshots = state.cloudSnapshots.filter(n => n !== name)
+              await saveState()
+            }
+            sendJson(res, 200, { name, removed: true })
+            return
+          }
+
+          // POST /dsh-sync/api/snapshot/rename {name, newName} → 重命名本地+云端名单
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/snapshot/rename')) {
+            const body = await readJsonBody(req)
+            await stateLoaded
+            const name = sanitizeSnapshotName(body.name)
+            const newName = sanitizeSnapshotName(body.newName)
+            if (!name || !newName) { sendJson(res, 400, { error: '缺少快照名' }); return }
+            if (name === newName) { sendJson(res, 400, { error: '新旧名字相同' }); return }
+            const from = join(syncDir, 'snapshots', name)
+            const to = join(syncDir, 'snapshots', newName)
+            const hasFrom = await fsP.access(from).then(() => true).catch(() => false)
+            if (!hasFrom) { sendJson(res, 404, { error: '本地没有这个快照' }); return }
+            const hasTo = await fsP.access(to).then(() => true).catch(() => false)
+            if (hasTo) { sendJson(res, 409, { error: '同名快照已存在' }); return }
+            try { await fsP.rename(from, to) }
+            catch (e) { sendJson(res, 500, { error: String(e && e.message || e) }); return }
+            if (state.cloudSnapshots && state.cloudSnapshots.includes(name)) {
+              state.cloudSnapshots = state.cloudSnapshots.map(n => n === name ? newName : n)
+              await saveState()
+            }
+            sendJson(res, 200, { name, newName })
+            return
+          }
+
           if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/snapshot/restore')) {
             const body = await readJsonBody(req)
             await stateLoaded

@@ -69,6 +69,12 @@ const ZH = {
   syncing: '同步中，可能需要一分钟…',
   syncDone: '同步完成',
   syncFailed: '同步失败',
+  snapshotDelete: '删除',
+  snapshotRename: '重命名',
+  snapshotDeleteConfirm: '确定删除快照 {name}？此操作不可恢复。',
+  snapshotDeleted: '快照已删除',
+  snapshotRenamePrompt: '重命名快照 {name}：',
+  snapshotRenamed: '快照已重命名',
   uploadAll: '上传',
   downloadAll: '下载',
   uploadBtn: '上传',
@@ -176,6 +182,12 @@ const EN = {
   syncing: 'Syncing, may take a minute…',
   syncDone: 'Sync complete',
   syncFailed: 'Sync failed',
+  snapshotDelete: 'Delete',
+  snapshotRename: 'Rename',
+  snapshotDeleteConfirm: 'Delete snapshot {name}? This cannot be undone.',
+  snapshotDeleted: 'Snapshot deleted',
+  snapshotRenamePrompt: 'Rename snapshot {name}:',
+  snapshotRenamed: 'Snapshot renamed',
   uploadBtn: 'Upload',
   downloadBtn: 'Download',
   uploadHint: 'Local → remote: push sessions, settings, plugins, skills and knowledge',
@@ -789,6 +801,35 @@ function SettingsSection({ t }) {
     } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
     finally { setSnapBusy(false) }
   }
+  const doDelete = async (name) => {
+    if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+      if (!window.confirm(t('snapshotDeleteConfirm', { name }))) return
+    }
+    setSnapBusy(true)
+    try {
+      const r = await fetch(API + '/snapshot/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      onToast(t('snapshotDeleted'), 2400)
+      refresh()
+    } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+    finally { setSnapBusy(false) }
+  }
+  const doRename = async (name) => {
+    if (typeof window === 'undefined' || typeof window.prompt !== 'function') return
+    const newName = window.prompt(t('snapshotRenamePrompt', { name }), name)
+    if (!newName || newName === name) return
+    setSnapBusy(true)
+    try {
+      const r = await fetch(API + '/snapshot/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, newName }) })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      onToast(t('snapshotRenamed'), 2400)
+      refresh()
+    } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+    finally { setSnapBusy(false) }
+  }
+
   const doClearToken = async () => {
     try { await putSettings({ token: null }); onToast(t('saved'), 2200); refresh() }
     catch (e) { onToast(e.message || t('operationFailed'), 4000) }
@@ -876,7 +917,9 @@ function SettingsSection({ t }) {
                       h('span', { style: { fontSize: 12.5 } }, s.name),
                       h(Tag, { tone: s.inCloud ? 'accent' : undefined }, s.inCloud ? t('snapshotInCloud') : t('snapshotLocalOnly')),
                       h('span', { className: 'sk-spacer' }),
-                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'))))))),
+                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'),
+                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRename(s.name) }, t('snapshotRename')),
+                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doDelete(s.name) }, t('snapshotDelete')))))))),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
             h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
             h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
