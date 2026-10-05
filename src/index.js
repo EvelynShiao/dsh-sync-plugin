@@ -2378,11 +2378,14 @@ module.exports = {
               intervalMinutes: eff.intervalMinutes, conflictMode: eff.conflictMode,
               syncSkills: eff.syncSkills, syncSessions: eff.syncSessions,
               syncSettings: eff.syncSettings, syncPlugins: eff.syncPlugins,
+              syncMemory: eff.syncMemory, syncKnowledge: eff.syncKnowledge,
               strategies: {
                 skills: STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'standalone',
                 sessions: STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'merge',
                 settings: STRATEGY_VALUES.includes(eff.settingsStrategy) ? eff.settingsStrategy : 'standalone',
                 plugins: STRATEGY_VALUES.includes(eff.pluginsStrategy) ? eff.pluginsStrategy : 'standalone',
+                knowledge: STRATEGY_VALUES.includes(eff.knowledgeStrategy) ? eff.knowledgeStrategy : 'merge',
+                memory: STRATEGY_VALUES.includes(eff.memoryStrategy) ? eff.memoryStrategy : 'merge',
               },
               snapshot: { skills: eff.snapshotSkills === true, auto: eff.snapshotAuto !== false, localKeep: eff.snapshotLocalKeep || 30 },
               hasToken: typeof token === 'string' && token !== '',
@@ -2481,7 +2484,25 @@ module.exports = {
             const eff = syncSettings()
             const { token, ...safe } = eff
             // 设置写回失败必须让 UI 知道：原来只 warn，界面仍提示「已保存」→ 重启即丢
+            // 诊断：把本次保存收到的字段与走哪条路径落盘，便于定位"改了没生效"
+            try {
+              const __fs = require('node:fs')
+              const __dir = typeof dshHome === 'function' ? dshHome() : null
+              if (__dir) {
+                __fs.mkdirSync(join(__dir, 'logs'), { recursive: true })
+                __fs.appendFileSync(join(__dir, 'logs', 'dsh-sync-init.log'), `${new Date().toISOString()} PUT patchKeys=[${Object.keys(patch)}] eff={intervalMinutes:${syncSettings().intervalMinutes},syncMemory:${syncSettings().syncMemory},sessionsStrategy:${syncSettings().sessionsStrategy},snapshotLocalKeep:${syncSettings().snapshotLocalKeep}} fail=${settingsPersistFailed ? JSON.stringify(settingsPersistFailed) : 'none'}\n`)
+              }
+            } catch {}
             if (settingsPersistFailed) { sendJson(res, 500, { error: "设置写回失败（仅本次运行生效，重启会丢）: " + settingsPersistFailed + (configError ? " [Config层: " + configError + "]" : "") }); return }
+            // 诊断：把本次保存收到的字段与走哪条路径落盘，便于定位"改了没生效"
+            try {
+              const __fs = require('node:fs')
+              const __dir = typeof dshHome === 'function' ? dshHome() : null
+              if (__dir) {
+                __fs.mkdirSync(join(__dir, 'logs'), { recursive: true })
+                __fs.appendFileSync(join(__dir, 'logs', 'dsh-sync-init.log'), `${new Date().toISOString()} PUT patchKeys=[${Object.keys(patch)}] eff={intervalMinutes:${syncSettings().intervalMinutes},syncMemory:${syncSettings().syncMemory},sessionsStrategy:${syncSettings().sessionsStrategy},snapshotLocalKeep:${syncSettings().snapshotLocalKeep}} fail=${settingsPersistFailed ? JSON.stringify(settingsPersistFailed) : 'none'}\n`)
+              }
+            } catch {}
             sendJson(res, 200, { settings: safe, hasToken: typeof token === 'string' && token !== '' })
             return
           }
