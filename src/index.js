@@ -1092,19 +1092,28 @@ function sanitizeSnapshotName(raw) {
 
 /** 本地快照滚动清理：按名字倒序保留 keep 份。手动命名且未上云的不自动删
  *  （用户显式产物）；其余（auto- / pre-restore- / 已上云的）超窗即删。 */
+/** 本地快照滚动清理：按【修改时间】倒序（最新在前）保留 keep 份，窗外一律删时间早的。
+ *  原实现按目录名字符串排序 —— 手动命名（如「改变前」）在字典序里位置随机，
+ *  会挤掉真正该保留的最新快照。仍保留：最新的 pre-restore-（回滚兜底）、已上云的（云端还在）。 */
 async function pruneLocalSnapshots(snapshotsDir, keep, cloudNames) {
   let entries = []
   try { entries = await fsP.readdir(snapshotsDir, { withFileTypes: true }) } catch { return [] }
-  const dirs = entries.filter(e => e.isDirectory()).map(e => e.name).sort().reverse()
+  const withTime = []
+  for (const e of entries) {
+    if (!e.isDirectory()) continue
+    let mt = 0
+    try { mt = (await fsP.stat(join(snapshotsDir, e.name))).mtimeMs } catch {}
+    withTime.push({ name: e.name, mt })
+  }
+  withTime.sort((x, y) => y.mt - x.mt)   // 新 → 旧
+  const newestRestore = withTime.find((x) => x.name.startsWith('pre-restore-'))
   const removed = []
-  for (let i = 0; i < dirs.length; i++) {
+  for (let i = 0; i < withTime.length; i++) {
     if (i < keep) continue
-    // 上限对所有快照生效：原实现只删 auto-/pre-restore-，手动拍的永不删 → 上限形同虚设（曾堆到 17 份）。
-    // 仍保留两类：restore 前的安全快照（回滚兜底）、已在云端的（本地可删、云端还在）。
-    const name = dirs[i]
-    if (name.startsWith('pre-restore-')) continue
-    if ((cloudNames || []).includes(name)) continue
-    try { await fsP.rm(join(snapshotsDir, dirs[i]), { recursive: true, force: true }); removed.push(dirs[i]) } catch {}
+    const name = withTime[i].name
+    if (newestRestore && name === newestRestore.name) continue  // 回滚兜底永远留一份
+    if ((cloudNames || []).includes(name)) continue             // 已上云的本地可删但没必要，省流量
+    try { await fsP.rm(join(snapshotsDir, name), { recursive: true, force: true }); removed.push(name) } catch {}
   }
   return removed
 }
@@ -2754,6 +2763,10 @@ module.exports = {
               }
             }
             await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
+            // 恢复把 cordis.patch.yml 写回了，但插件内存里的 liveSettings 还是旧值 ——
+            // 不刷新则下面这次 runSync 会拿旧值把刚恢复的配置又覆盖回去（恢复没生效的元凶）。
+            refreshLive()
+            await new Promise((r) => setTimeout(r, 500))
             runSync({ autoAlign: false }).catch(() => {})
             sendJson(res, 200, { restored: restored, safetySnapshot: safetyName })
             return
