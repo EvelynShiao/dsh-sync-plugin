@@ -1794,6 +1794,13 @@ module.exports = {
     const createLocalSnapshot = async (eff, name) => {
       const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
       await mirrorLiveToShadow(spec, syncDir)
+      // 归档/置顶标记也存一份：快照里有会话但没有这个标记，恢复出来的对话会变成"未分组"。
+      try {
+        const fsx = require('node:fs')
+        const wjPath = join(dshHome(), 'storages', 'workspace.json')
+        const wj = JSON.parse(fsx.readFileSync(wjPath, 'utf8'))
+        fsx.writeFileSync(join(syncDir, 'snapshots', name, '.dsh-sync-groups.json'), JSON.stringify({ archivedSessionIds: (wj.global && wj.global.archivedSessionIds) || [], pinnedSessionIds: (wj.global && wj.global.pinnedSessionIds) || [] }))
+      } catch {}
       return join(syncDir, 'snapshots', name)
     }
 
@@ -2766,6 +2773,23 @@ module.exports = {
               }
             }
             await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
+            // 归档/置顶标记合并回 workspace.json —— 否则恢复出来的对话全是"未分组"。
+            // 只合并（并集），不替换：避免把当前已归档但快照里没有的对话弄丢。
+            try {
+              const fsx = require('node:fs')
+              const metaP = join(syncDir, 'snapshots', name, '.dsh-sync-groups.json')
+              const meta = JSON.parse(fsx.readFileSync(metaP, "utf8"))
+              const wjPath = join(dshHome(), 'storages', 'workspace.json')
+              const wj = JSON.parse(fsx.readFileSync(wjPath, "utf8"))
+              wj.global = wj.global || {}
+              let changed = 0
+              for (const key of ["archivedSessionIds", "pinnedSessionIds"]) {
+                const cur = Array.isArray(wj.global[key]) ? wj.global[key] : []
+                const add = (Array.isArray(meta[key]) ? meta[key] : []).filter((x) => !cur.includes(x))
+                if (add.length) { wj.global[key] = cur.concat(add); changed += add.length }
+              }
+              if (changed > 0) fsx.writeFileSync(wjPath, JSON.stringify(wj, null, 2))
+            } catch {}
             // 恢复把 cordis.patch.yml 写回了，但插件内存里的 liveSettings 还是旧值 ——
             // 不刷新则下面这次 runSync 会拿旧值把刚恢复的配置又覆盖回去（恢复没生效的元凶）。
             refreshLive()
