@@ -10,3 +10,8 @@
 - insert:
     - id: dsh-sync
       name: '@weibaohui/dsh-sync'
+
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+      config:
+        auto: false

@@ -2755,11 +2755,23 @@ module.exports = {
             // 反向写回 live（快照里有哪些组就恢复哪些）
             const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
             const restored = []
+            // 快照里实际包含的会话 id —— 决定归档状态以谁为准（旧快照没有会话 → 空集 → 退化为并集）
+            const snapSessionIds = new Set()
             for (const group of spec) {
               for (const src of group.sources) {
                 const snapPath = join(syncDir, src.to)   // src.to 已含 snapshots/<名字>/ 前缀，快照根就是 syncDir
                 const have = await fsP.access(snapPath).then(() => true).catch(() => false)
                 if (!have) continue
+                if (group.name === 'sessions') {
+                  // 两级：<工作区>/<session-xxx>，只收真实会话目录
+                  try {
+                    for (const wsName of await fsP.readdir(snapPath)) {
+                      const wsDir = join(snapPath, wsName)
+                      if (!(await fsP.stat(wsDir)).isDirectory()) continue
+                      for (const sd of await fsP.readdir(wsDir)) if (sd.startsWith('session-')) snapSessionIds.add(sd)
+                    }
+                  } catch {}
+                }
                 if (src.file) {
                   await fsP.mkdir(join(src.from, '..'), { recursive: true })
                   await fsP.copyFile(snapPath, src.from)
@@ -2774,7 +2786,6 @@ module.exports = {
             }
             await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
             // 归档/置顶标记合并回 workspace.json —— 否则恢复出来的对话全是"未分组"。
-            // 只合并（并集），不替换：避免把当前已归档但快照里没有的对话弄丢。
             try {
               const fsx = require('node:fs')
               const metaP = join(syncDir, 'snapshots', name, '.dsh-sync-groups.json')
@@ -2783,10 +2794,27 @@ module.exports = {
               const wj = JSON.parse(fsx.readFileSync(wjPath, "utf8"))
               wj.global = wj.global || {}
               let changed = 0
+              // 归档/置顶标记按【快照里包含的会话】重算：
+              // 旧实现只做并集（只加不减），于是"归档前拍的快照"永远无法取消归档 ——
+              // 恢复出来的对话仍然带归档标记。现在：快照里有的会话以快照为准，快照里没有的保持现状。
               for (const key of ["archivedSessionIds", "pinnedSessionIds"]) {
                 const cur = Array.isArray(wj.global[key]) ? wj.global[key] : []
-                const add = (Array.isArray(meta[key]) ? meta[key] : []).filter((x) => !cur.includes(x))
-                if (add.length) { wj.global[key] = cur.concat(add); changed += add.length }
+                const snap = Array.isArray(meta[key]) ? meta[key] : []
+                if (snapSessionIds.size === 0) {
+                  // 旧快照不含会话：无从判断，退化为并集（安全，不动当前状态）
+                  const add = snap.filter((x) => !cur.includes(x))
+                  if (add.length) { wj.global[key] = cur.concat(add); changed += add.length }
+                  continue
+                }
+                const snapSet = new Set(snap.filter((x) => snapSessionIds.has(x)))
+                // 快照里没有的会话 → 不动；在快照里的 → 用快照的标记（快照说没归档 → 取消归档）
+                const kept = cur.filter((x) => !snapSessionIds.has(x) || snapSet.has(x))
+                const added = [...snapSet].filter((x) => !kept.includes(x))
+                const next = kept.concat(added)
+                if (next.length !== cur.length || next.some((x, i2) => cur[i2] !== x)) {
+                  wj.global[key] = next
+                  changed += Math.abs(next.length - cur.length) || 1
+                }
               }
               if (changed > 0) fsx.writeFileSync(wjPath, JSON.stringify(wj, null, 2))
             } catch {}
