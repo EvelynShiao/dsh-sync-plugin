@@ -1074,13 +1074,13 @@ function snapshotMirrorSpec(eff, roots, instanceId, name) {
   // 源不存在时 syncSpec 仍会生成空组 → 快照里多一个空目录、恢复时 have=false 静默跳过。
   const fsxAccess = (p) => { try { require('node:fs').accessSync(p); return true } catch { return false } }
   const shared = {
-    syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: true,
+    syncSkills: true, syncSessions: true, syncSettings: true, syncPlugins: true,
     syncKnowledge: true, syncMemory: true,
     skillsStrategy: 'standalone', sessionsStrategy: 'standalone', settingsStrategy: 'standalone', pluginsStrategy: 'standalone',
     knowledgeStrategy: 'merge', memoryStrategy: 'merge',
   }
   return syncSpec(shared, roots, instanceId)
-    .filter(g => g.name !== 'sessions' && (g.name !== 'skills' || eff.snapshotSkills === true)
+    .filter(g => (g.name !== 'skills' || eff.snapshotSkills === true)
       && !(g.name === 'settings' && !fsxAccess('settings.yaml')))
     .map(g => ({ ...g, sources: g.sources.map(s => ({ ...s, to: `snapshots/${name}/${s.to}` })) }))
 }
@@ -2757,6 +2757,9 @@ module.exports = {
                   await fsP.mkdir(join(src.from, '..'), { recursive: true })
                   await fsP.copyFile(snapPath, src.from)
                 } else {
+                  // 会话组：像「下载覆盖本地」一样整批替换，否则本地多出的对话不会消失。
+                  // have 检查已保证快照里确实有 sessions 才走到这（旧快照没有 → 直接跳过，本地对话不受影响）。
+                  if (group.name === 'sessions') await fsP.rm(src.from, { recursive: true, force: true }).catch(() => {})
                   await copyTree(snapPath, src.from, { includeFiles: src.includeFiles, excludeDirs: src.excludeDirs, excludeNames: src.excludeNames, followSymlinks: src.followSymlinks })
                 }
                 if (!restored.includes(group.name)) restored.push(group.name)
