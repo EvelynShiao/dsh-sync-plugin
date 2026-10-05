@@ -1070,12 +1070,18 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
  *  大头）。快照固定用共享规范布局（settings/settings.yaml 等），与各组当前策略
  *  无关——恢复时按同样布局写回。 */
 function snapshotMirrorSpec(eff, roots, instanceId, name) {
+  // settings.yaml 在 DSH 0.1.7 后就不再落盘（配置在 cordis.patch.yml，由 plugins 组捎带），
+  // 源不存在时 syncSpec 仍会生成空组 → 快照里多一个空目录、恢复时 have=false 静默跳过。
+  const fsxAccess = (p) => { try { require('node:fs').accessSync(p); return true } catch { return false } }
   const shared = {
     syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: true,
-    skillsStrategy: 'union', sessionsStrategy: 'union', settingsStrategy: 'union', pluginsStrategy: 'union',
+    syncKnowledge: true, syncMemory: true,
+    skillsStrategy: 'standalone', sessionsStrategy: 'standalone', settingsStrategy: 'standalone', pluginsStrategy: 'standalone',
+    knowledgeStrategy: 'merge', memoryStrategy: 'merge',
   }
   return syncSpec(shared, roots, instanceId)
-    .filter(g => g.name !== 'sessions' && (g.name !== 'skills' || eff.snapshotSkills === true))
+    .filter(g => g.name !== 'sessions' && (g.name !== 'skills' || eff.snapshotSkills === true)
+      && !(g.name === 'settings' && !fsxAccess('settings.yaml')))
     .map(g => ({ ...g, sources: g.sources.map(s => ({ ...s, to: `snapshots/${name}/${s.to}` })) }))
 }
 
