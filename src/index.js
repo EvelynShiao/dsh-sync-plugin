@@ -1,4 +1,4 @@
-'use strict'
+﻿'use strict'
 
 /**
  * dsh-plugin-dsh-sync — Host half
@@ -1454,7 +1454,7 @@ const ALIGN_PROMPT_ZH = [
   '4. settings.yaml 逐键保留双方；本机路径/机器相关字段以本机为准；任何 token/apiKey/密钥字段保留两边但**严禁在输出中回显密钥值**。',
   '5. 二进制或压缩文件（.zst/.gz 及 session 日志二进制）不合并，保留本机版，在汇报里列出。',
   '6. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv；令牌不得出现在任何输出或提交信息里。',
-  '7. 合并完成后触发确定性同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`，等待返回 JSON。',
+  '7. 合并完成后触发确定性同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/upload`，等待返回 JSON。',
   '8. 再查状态：`curl -s {{apiBase}}/dsh-sync/api/status`。若 pendingConflict 非空（仍有冲突 PR）：在影子仓库 `git fetch https://oauth2:<令牌>@gitcode.com/<owner>/<repo>.git <分支>` → checkout 该分支 → `git merge FETCH_HEAD` → 按上述规则解冲突 → `git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit` → push 回该分支 → 调 GitCode API 合并 PR（头用 `PRIVATE-TOKEN: <令牌>`，不要用 Authorization: Bearer；`PUT /repos/<owner>/<repo>/pulls/<编号>/merge`，body `{"merge_method":"squash"}`）。',
   '9. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果、PR 编号与链接（若有）。',
   '',
@@ -1491,7 +1491,7 @@ const REMOTE_ALIGN_PROMPT_ZH = [
   '3. settings.yaml（YAML）：逐键合并，保留两边所有 provider/model/credential 配置；本机路径/机器相关字段以本机为准；token/apiKey/密钥字段保留两边值但**严禁在输出中回显密钥值**。',
   '4. 插件清单（package.json 等 JSON）：并集合并 dependencies，保留两边所有插件条目；版本冲突取较新者。',
   '5. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv。',
-  '6. 合并完成后触发同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`。',
+  '6. 合并完成后触发同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/upload`。',
   '7. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果。',
 ].join('\n')
 
@@ -1848,7 +1848,7 @@ module.exports = {
           result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
           state.lastSyncAt = new Date().toISOString()
           // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
-          // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
+          // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/upload 推送）
           result.alignSkipped = autoAlign && eff.conflictMode === 'ai' && both.length > AUTO_ALIGN_MAX_FILES
             ? { reason: `bothModified ${both.length} 个，超过自动对齐规模上限 ${AUTO_ALIGN_MAX_FILES}（多为双机首次收敛 churn，非人工冲突）；保留双方版本，可到设置页手动处理` }
             : undefined
