@@ -197,7 +197,38 @@ async function ensureConfig(retries = 40) {
     } catch {}
     return Config
   })()
-  return configBuilding
+  // 失败的构建不缓存：竞态窗口过去后回填循环/下次保存能重新构建（只清自己那趟）
+  const building = configBuilding
+  const settle = (c) => { if (!c && configBuilding === building) configBuilding = null }
+  building.then(settle, () => settle(null))
+  return building
+}
+
+// ── runtime.Config 回填（启动竞态修复，2026-10-06）──────────────────────────
+// 现象：加载期 require(schemastery) 撞上 cosmokit 动态 import 竞态 → module.exports.Config=null；
+// cordis 注册期把它固化进 runtime.Config，之后 ensureConfig 建好 schema 也只改模块变量，
+// runtime 那份永远是 null。宿主 dsh-settings 的 describe()/write() 每次现读 runtime.Config，
+// 遇 null 抛 "Cannot use 'in' operator to search for 'toJSON' in null"，把整个设置子系统
+// 打崩（模型页「加载提供商目录失败」、设置页「保存失败」）。
+// 修法：等竞态过去 ensureConfig 建出真 schema 后，回填进同一个 runtime 对象——
+// 只补缺（rt.Config 仍为 falsy 才写），绝不覆盖已有值；外层多轮重试兜住慢竞态。
+async function backfillRuntimeConfig(ctx) {
+  try {
+    const rt = (ctx && ctx.fiber && ctx.fiber.runtime) || (ctx && ctx.runtime)
+    if (!rt || rt.Config) return false
+    for (let round = 0; round < 10 && !rt.Config; round++) {
+      let built = null
+      try { built = await ensureConfig() } catch {}
+      if (built && !rt.Config) {
+        rt.Config = built
+        try { if (ctx.logger && ctx.logger.info) ctx.logger.info('dsh-sync: 已回填 runtime.Config（修复设置系统 toJSON-in-null 崩溃）') } catch {}
+        return true
+      }
+      if (rt.Config) return true
+      await new Promise((r) => { const t = setTimeout(r, 3000); if (t.unref) t.unref() })
+    }
+  } catch {}
+  return false
 }
 
 // ── 绕开 settings 服务直写 profile ───────────────────────────────────────
@@ -1667,7 +1698,7 @@ module.exports = {
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
-    syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml },
+    syncSettingsSchema, Config, backfillRuntimeConfig, parseLegacySettingsYaml, __seedLegacyYaml },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -1675,6 +1706,9 @@ module.exports = {
     const repoDir = join(syncDir, 'repo')
     const stateFile = join(syncDir, 'state.json')
     const lockFile = join(syncDir, '.lock')
+
+    // 启动竞态修复：延迟回填被 cordis 固化为 null 的 runtime.Config（详见 backfillRuntimeConfig）
+    backfillRuntimeConfig(ctx)
 
     // ── 0.1.7 settings 接线 ──
     // 命名空间必须匹配 /^[a-z][a-z0-9-]*$/ —— 点号形式会被 settings 写入通道拒绝
