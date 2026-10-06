@@ -334,8 +334,29 @@ function parseLegacySettingsYaml(text) {
 // ── Shared helpers (ported from skills-management so conventions match) ──
 
 function encodeWorkspaceDir(workspacePath) {
-  const p = String(workspacePath).replace(/:/g, '').replace(/[\\/]/g, '-').replace(/^-+/, '').replace(/-+$/, '')
-  return '--' + p + '--'
+  // [fix-中文目录] 与宿主 projectKey()（dsh-session-persistence-jsonl:875）逐字符一致：
+  // 旧实现把中文原样留在目录名里（--...work-作文--），宿主按 cwd 重算的期望路径却是
+  // 转义形态（--...work-~4F5C~6587--），下载落盘即产生双份目录 → header 身份校验必崩
+  // （corrupt session log → workspace 服务整体不可用）。分隔符连跑折叠为单个 -，非安全
+  // 字符（含中文、空格、~）编码为 ~XXXX，超长截断——纯 ASCII 路径输出与旧实现完全一致。
+  const cwd = String(workspacePath)
+  let readable = ''
+  let separatorRun = false
+  for (let i = 0; i < cwd.length; i++) {
+    const code = cwd.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+      separatorRun = false
+    }
+  }
+  return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
 }
 function dshHome() { return process.env.DSH_HOME ? resolve(process.env.DSH_HOME) : join(homedir(), '.dsh') }
 
@@ -736,7 +757,17 @@ function resolveLivePath(spec, shadowRel) {
       } else if (norm === to) {
         return src.from
       } else if (norm.startsWith(to + '/')) {
-        return join(src.from, norm.slice(to.length + 1))
+        const rel = norm.slice(to.length + 1)
+        // [fix-中文目录] sessions 组的项目目录名必须是宿主 projectKey 的转义形态（ASCII）。
+        // 远端历史里可能残留旧版产生的中文副本（--...work-作文--），落盘后 header cwd
+        // identify 指向 --...work-~4F5C~6587-- → corrupt session log 全链路崩。
+        // 拉取/预对齐/远端对齐三条写回路都经此收口：含非 ASCII 字符的项目目录一律不映射，
+        // 调用方按未解析处理（skip），中文工作区本体与转义目录不受影响。
+        if (group.name === 'sessions') {
+          const seg = rel.split('/')[0]
+          if (seg && /[^\x00-\x7F]/.test(seg)) return undefined
+        }
+        return join(src.from, rel)
       }
     }
   }
@@ -1698,7 +1729,7 @@ module.exports = {
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
-    syncSettingsSchema, Config, backfillRuntimeConfig, parseLegacySettingsYaml, __seedLegacyYaml },
+    syncSettingsSchema, Config, backfillRuntimeConfig, encodeWorkspaceDir, resolveLivePath, parseLegacySettingsYaml, __seedLegacyYaml },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -1950,6 +1981,9 @@ module.exports = {
             try { wsDirsUp = await fsP.readdir(src.from, { withFileTypes: true }) } catch {}
             for (const ws of wsDirsUp) {
               if (!ws.isDirectory()) continue
+              // [fix-中文目录] 本机若混入非转义形态的中文项目目录（手工拷贝等来源），
+              // 不得上传回流污染远端——宿主 projectKey 产出恒为 ASCII，此形态必是外来副本。
+              if (/[^\x00-\x7F]/.test(ws.name)) continue
               const wsTarget = join(target, ws.name)
               await fsP.mkdir(wsTarget, { recursive: true })
               let sessionsUp = []
