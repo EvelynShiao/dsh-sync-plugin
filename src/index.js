@@ -1,4 +1,4 @@
-﻿'use strict'
+'use strict'
 
 /**
  * dsh-plugin-dsh-sync — Host half
@@ -2172,6 +2172,14 @@ module.exports = {
                 if (!se.isDirectory()) continue
                 // [final-B] 同理：子代理会话不落地
                 if (!se.name.startsWith('session-')) continue
+                // [small-skip] <1KB 空壳会话（开对话框没说话的草稿）不落地不登记，
+                // 否则云端草稿会随下载反复复活；与上传侧 st.size < 1024 对齐
+                let filesSm = []
+                try { filesSm = await fsP.readdir(join(cwsPath, se.name)) } catch {}
+                const zstSm = filesSm.find(x => x.endsWith('.zstd'))
+                let stSm = null
+                try { if (zstSm) stSm = await fsP.stat(join(cwsPath, se.name, zstSm)) } catch {}
+                if (!stSm || stSm.size < 1024) continue
                 const dstSession = join(targetWsDir, se.name)
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
                 await copyTree(join(cwsPath, se.name), dstSession, {})
