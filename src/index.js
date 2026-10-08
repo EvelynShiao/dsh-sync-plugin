@@ -94,6 +94,11 @@ const DEFAULT_SYNC_SETTINGS = {
   pluginsStrategy: 'standalone',
   knowledgeStrategy: 'merge',   // merge = 顶层共享路径（手机端才能读到）；standalone = 每机各存各的
   memoryStrategy: 'merge',      // 记忆与知识库同理：顶层共享路径，两端可读
+  // 上传语义：true(默认)=完全覆盖。影子仓库先按 live 重建镜像，共享组远端多余
+  // 的文件会被真正删除（这就是 UI 上「上传=覆盖」的字面含义）；只保护别的实例的
+  // backup/<otherInstance>/ 备份与 settings.yaml，避免多机互相删数据。
+  // false = 旧行为：首次并集加入 + 双方改动文件保留远端版本。
+  uploadOverwrite: true,
   snapshotSkills: false,      // 快照是否包含技能（体积大，默认只含 设置+插件清单）
   snapshotAuto: false,           // [用户设定] 不要每天自动快照         // 每天首个同步自动打一份本地快照（auto-<日期>）
   snapshotLocalKeep: 10,           // [用户设定] 只保留 5 份      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
@@ -131,6 +136,7 @@ function syncSettingsSchema(S) {
     pluginsStrategy: S.string(),
     knowledgeStrategy: S.string(),
     memoryStrategy: S.string(),
+    uploadOverwrite: S.boolean(),
     snapshotSkills: S.boolean(),
     snapshotAuto: S.boolean(),
     snapshotLocalKeep: S.number(),
@@ -197,38 +203,7 @@ async function ensureConfig(retries = 40) {
     } catch {}
     return Config
   })()
-  // 失败的构建不缓存：竞态窗口过去后回填循环/下次保存能重新构建（只清自己那趟）
-  const building = configBuilding
-  const settle = (c) => { if (!c && configBuilding === building) configBuilding = null }
-  building.then(settle, () => settle(null))
-  return building
-}
-
-// ── runtime.Config 回填（启动竞态修复，2026-10-06）──────────────────────────
-// 现象：加载期 require(schemastery) 撞上 cosmokit 动态 import 竞态 → module.exports.Config=null；
-// cordis 注册期把它固化进 runtime.Config，之后 ensureConfig 建好 schema 也只改模块变量，
-// runtime 那份永远是 null。宿主 dsh-settings 的 describe()/write() 每次现读 runtime.Config，
-// 遇 null 抛 "Cannot use 'in' operator to search for 'toJSON' in null"，把整个设置子系统
-// 打崩（模型页「加载提供商目录失败」、设置页「保存失败」）。
-// 修法：等竞态过去 ensureConfig 建出真 schema 后，回填进同一个 runtime 对象——
-// 只补缺（rt.Config 仍为 falsy 才写），绝不覆盖已有值；外层多轮重试兜住慢竞态。
-async function backfillRuntimeConfig(ctx) {
-  try {
-    const rt = (ctx && ctx.fiber && ctx.fiber.runtime) || (ctx && ctx.runtime)
-    if (!rt || rt.Config) return false
-    for (let round = 0; round < 10 && !rt.Config; round++) {
-      let built = null
-      try { built = await ensureConfig() } catch {}
-      if (built && !rt.Config) {
-        rt.Config = built
-        try { if (ctx.logger && ctx.logger.info) ctx.logger.info('dsh-sync: 已回填 runtime.Config（修复设置系统 toJSON-in-null 崩溃）') } catch {}
-        return true
-      }
-      if (rt.Config) return true
-      await new Promise((r) => { const t = setTimeout(r, 3000); if (t.unref) t.unref() })
-    }
-  } catch {}
-  return false
+  return configBuilding
 }
 
 // ── 绕开 settings 服务直写 profile ───────────────────────────────────────
@@ -757,17 +732,7 @@ function resolveLivePath(spec, shadowRel) {
       } else if (norm === to) {
         return src.from
       } else if (norm.startsWith(to + '/')) {
-        const rel = norm.slice(to.length + 1)
-        // [fix-中文目录] sessions 组的项目目录名必须是宿主 projectKey 的转义形态（ASCII）。
-        // 远端历史里可能残留旧版产生的中文副本（--...work-作文--），落盘后 header cwd
-        // identify 指向 --...work-~4F5C~6587-- → corrupt session log 全链路崩。
-        // 拉取/预对齐/远端对齐三条写回路都经此收口：含非 ASCII 字符的项目目录一律不映射，
-        // 调用方按未解析处理（skip），中文工作区本体与转义目录不受影响。
-        if (group.name === 'sessions') {
-          const seg = rel.split('/')[0]
-          if (seg && /[^\x00-\x7F]/.test(seg)) return undefined
-        }
-        return join(src.from, rel)
+        return join(src.from, norm.slice(to.length + 1))
       }
     }
   }
@@ -835,6 +800,10 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
     try { deletedRaw = await gitExec(binary, ['diff', '--name-only', '--diff-filter=D', 'FETCH_HEAD'], repoDir) } catch {}
     for (const p of deletedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)) {
       if (p.startsWith(ownBackupPrefix)) continue
+      // 覆盖模式（默认）：共享组里「远端有、本机没有」的文件就是本机删过，
+      // 该随镜像一起删掉——否则坏数据永远留在云端、每次下载都复活。
+      // 只保护别的实例的 backup/ 备份（那才是真正的每机私有数据）。
+      if (eff.uploadOverwrite !== false && !p.startsWith('backup/')) continue
       await gitExec(binary, ['checkout', 'FETCH_HEAD', '--', p], repoDir).catch(() => {})
     }
     // settings.yaml 带各机凭证与模型配置：首次接入若与本机不同，整文件覆盖会在下次
@@ -853,7 +822,9 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
 
   // 双方都改过的文件不随快照覆盖推送：恢复成远端版本，交给 AI 智能对齐/用户裁决。
   // 否则本分支永远基于 main tip、PR 恒可合并 = 对端改动被静默覆盖（真机实证）。
-  for (const p of preserve || []) {
+  // 覆盖模式（默认）下不回滚：本机就是真源。显式 uploadOverwrite:false 才保留
+  // 「双方都改过的文件交远端裁决」这条冲突保护。
+  for (const p of (eff.uploadOverwrite !== false ? [] : preserve || [])) {
     await gitExec(binary, ['checkout', 'FETCH_HEAD', '--', p], repoDir).catch(() => {})
   }
 
@@ -1136,13 +1107,13 @@ function snapshotMirrorSpec(eff, roots, instanceId, name) {
   // 源不存在时 syncSpec 仍会生成空组 → 快照里多一个空目录、恢复时 have=false 静默跳过。
   const fsxAccess = (p) => { try { require('node:fs').accessSync(p); return true } catch { return false } }
   const shared = {
-    syncSkills: true, syncSessions: true, syncSettings: true, syncPlugins: true,
+    syncSkills: true, syncSessions: false, syncSettings: true, syncPlugins: true,
     syncKnowledge: true, syncMemory: true,
     skillsStrategy: 'standalone', sessionsStrategy: 'standalone', settingsStrategy: 'standalone', pluginsStrategy: 'standalone',
     knowledgeStrategy: 'merge', memoryStrategy: 'merge',
   }
   return syncSpec(shared, roots, instanceId)
-    .filter(g => (g.name !== 'skills' || eff.snapshotSkills === true)
+    .filter(g => g.name !== 'sessions' && (g.name !== 'skills' || eff.snapshotSkills === true)
       && !(g.name === 'settings' && !fsxAccess('settings.yaml')))
     .map(g => ({ ...g, sources: g.sources.map(s => ({ ...s, to: `snapshots/${name}/${s.to}` })) }))
 }
@@ -1516,7 +1487,7 @@ const ALIGN_PROMPT_ZH = [
   '4. settings.yaml 逐键保留双方；本机路径/机器相关字段以本机为准；任何 token/apiKey/密钥字段保留两边但**严禁在输出中回显密钥值**。',
   '5. 二进制或压缩文件（.zst/.gz 及 session 日志二进制）不合并，保留本机版，在汇报里列出。',
   '6. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv；令牌不得出现在任何输出或提交信息里。',
-  '7. 合并完成后触发确定性同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/upload`，等待返回 JSON。',
+  '7. 合并完成后触发确定性同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`，等待返回 JSON。',
   '8. 再查状态：`curl -s {{apiBase}}/dsh-sync/api/status`。若 pendingConflict 非空（仍有冲突 PR）：在影子仓库 `git fetch https://oauth2:<令牌>@gitcode.com/<owner>/<repo>.git <分支>` → checkout 该分支 → `git merge FETCH_HEAD` → 按上述规则解冲突 → `git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit` → push 回该分支 → 调 GitCode API 合并 PR（头用 `PRIVATE-TOKEN: <令牌>`，不要用 Authorization: Bearer；`PUT /repos/<owner>/<repo>/pulls/<编号>/merge`，body `{"merge_method":"squash"}`）。',
   '9. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果、PR 编号与链接（若有）。',
   '',
@@ -1553,7 +1524,7 @@ const REMOTE_ALIGN_PROMPT_ZH = [
   '3. settings.yaml（YAML）：逐键合并，保留两边所有 provider/model/credential 配置；本机路径/机器相关字段以本机为准；token/apiKey/密钥字段保留两边值但**严禁在输出中回显密钥值**。',
   '4. 插件清单（package.json 等 JSON）：并集合并 dependencies，保留两边所有插件条目；版本冲突取较新者。',
   '5. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv。',
-  '6. 合并完成后触发同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/upload`。',
+  '6. 合并完成后触发同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`。',
   '7. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果。',
 ].join('\n')
 
@@ -1729,7 +1700,7 @@ module.exports = {
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
-    syncSettingsSchema, Config, backfillRuntimeConfig, encodeWorkspaceDir, resolveLivePath, parseLegacySettingsYaml, __seedLegacyYaml },
+    syncSettingsSchema, Config, parseLegacySettingsYaml, __seedLegacyYaml },
 
   apply(ctx, config = {}) {
     const dh = dshHome()
@@ -1737,9 +1708,6 @@ module.exports = {
     const repoDir = join(syncDir, 'repo')
     const stateFile = join(syncDir, 'state.json')
     const lockFile = join(syncDir, '.lock')
-
-    // 启动竞态修复：延迟回填被 cordis 固化为 null 的 runtime.Config（详见 backfillRuntimeConfig）
-    backfillRuntimeConfig(ctx)
 
     // ── 0.1.7 settings 接线 ──
     // 命名空间必须匹配 /^[a-z][a-z0-9-]*$/ —— 点号形式会被 settings 写入通道拒绝
@@ -1859,13 +1827,6 @@ module.exports = {
     const createLocalSnapshot = async (eff, name) => {
       const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
       await mirrorLiveToShadow(spec, syncDir)
-      // 归档/置顶标记也存一份：快照里有会话但没有这个标记，恢复出来的对话会变成"未分组"。
-      try {
-        const fsx = require('node:fs')
-        const wjPath = join(dshHome(), 'storages', 'workspace.json')
-        const wj = JSON.parse(fsx.readFileSync(wjPath, 'utf8'))
-        fsx.writeFileSync(join(syncDir, 'snapshots', name, '.dsh-sync-groups.json'), JSON.stringify({ archivedSessionIds: (wj.global && wj.global.archivedSessionIds) || [], pinnedSessionIds: (wj.global && wj.global.pinnedSessionIds) || [] }))
-      } catch {}
       return join(syncDir, 'snapshots', name)
     }
 
@@ -1913,7 +1874,7 @@ module.exports = {
           result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
           state.lastSyncAt = new Date().toISOString()
           // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
-          // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/upload 推送）
+          // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
           result.alignSkipped = autoAlign && eff.conflictMode === 'ai' && both.length > AUTO_ALIGN_MAX_FILES
             ? { reason: `bothModified ${both.length} 个，超过自动对齐规模上限 ${AUTO_ALIGN_MAX_FILES}（多为双机首次收敛 churn，非人工冲突）；保留双方版本，可到设置页手动处理` }
             : undefined
@@ -1981,9 +1942,6 @@ module.exports = {
             try { wsDirsUp = await fsP.readdir(src.from, { withFileTypes: true }) } catch {}
             for (const ws of wsDirsUp) {
               if (!ws.isDirectory()) continue
-              // [fix-中文目录] 本机若混入非转义形态的中文项目目录（手工拷贝等来源），
-              // 不得上传回流污染远端——宿主 projectKey 产出恒为 ASCII，此形态必是外来副本。
-              if (/[^\x00-\x7F]/.test(ws.name)) continue
               const wsTarget = join(target, ws.name)
               await fsP.mkdir(wsTarget, { recursive: true })
               let sessionsUp = []
@@ -2172,14 +2130,6 @@ module.exports = {
                 if (!se.isDirectory()) continue
                 // [final-B] 同理：子代理会话不落地
                 if (!se.name.startsWith('session-')) continue
-                // [small-skip] <1KB 空壳会话（开对话框没说话的草稿）不落地不登记，
-                // 否则云端草稿会随下载反复复活；与上传侧 st.size < 1024 对齐
-                let filesSm = []
-                try { filesSm = await fsP.readdir(join(cwsPath, se.name)) } catch {}
-                const zstSm = filesSm.find(x => x.endsWith('.zstd'))
-                let stSm = null
-                try { if (zstSm) stSm = await fsP.stat(join(cwsPath, se.name, zstSm)) } catch {}
-                if (!stSm || stSm.size < 1024) continue
                 const dstSession = join(targetWsDir, se.name)
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
                 await copyTree(join(cwsPath, se.name), dstSession, {})
@@ -2831,69 +2781,21 @@ module.exports = {
             // 反向写回 live（快照里有哪些组就恢复哪些）
             const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
             const restored = []
-            // 快照里实际包含的会话 id —— 决定归档状态以谁为准（旧快照没有会话 → 空集 → 退化为并集）
-            const snapSessionIds = new Set()
             for (const group of spec) {
               for (const src of group.sources) {
                 const snapPath = join(syncDir, src.to)   // src.to 已含 snapshots/<名字>/ 前缀，快照根就是 syncDir
                 const have = await fsP.access(snapPath).then(() => true).catch(() => false)
                 if (!have) continue
-                if (group.name === 'sessions') {
-                  // 两级：<工作区>/<session-xxx>，只收真实会话目录
-                  try {
-                    for (const wsName of await fsP.readdir(snapPath)) {
-                      const wsDir = join(snapPath, wsName)
-                      if (!(await fsP.stat(wsDir)).isDirectory()) continue
-                      for (const sd of await fsP.readdir(wsDir)) if (sd.startsWith('session-')) snapSessionIds.add(sd)
-                    }
-                  } catch {}
-                }
                 if (src.file) {
                   await fsP.mkdir(join(src.from, '..'), { recursive: true })
                   await fsP.copyFile(snapPath, src.from)
                 } else {
-                  // 会话组：像「下载覆盖本地」一样整批替换，否则本地多出的对话不会消失。
-                  // have 检查已保证快照里确实有 sessions 才走到这（旧快照没有 → 直接跳过，本地对话不受影响）。
-                  if (group.name === 'sessions') await fsP.rm(src.from, { recursive: true, force: true }).catch(() => {})
                   await copyTree(snapPath, src.from, { includeFiles: src.includeFiles, excludeDirs: src.excludeDirs, excludeNames: src.excludeNames, followSymlinks: src.followSymlinks })
                 }
                 if (!restored.includes(group.name)) restored.push(group.name)
               }
             }
             await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
-            // 归档/置顶标记合并回 workspace.json —— 否则恢复出来的对话全是"未分组"。
-            try {
-              const fsx = require('node:fs')
-              const metaP = join(syncDir, 'snapshots', name, '.dsh-sync-groups.json')
-              const meta = JSON.parse(fsx.readFileSync(metaP, "utf8"))
-              const wjPath = join(dshHome(), 'storages', 'workspace.json')
-              const wj = JSON.parse(fsx.readFileSync(wjPath, "utf8"))
-              wj.global = wj.global || {}
-              let changed = 0
-              // 归档/置顶标记按【快照里包含的会话】重算：
-              // 旧实现只做并集（只加不减），于是"归档前拍的快照"永远无法取消归档 ——
-              // 恢复出来的对话仍然带归档标记。现在：快照里有的会话以快照为准，快照里没有的保持现状。
-              for (const key of ["archivedSessionIds", "pinnedSessionIds"]) {
-                const cur = Array.isArray(wj.global[key]) ? wj.global[key] : []
-                const snap = Array.isArray(meta[key]) ? meta[key] : []
-                if (snapSessionIds.size === 0) {
-                  // 旧快照不含会话：无从判断，退化为并集（安全，不动当前状态）
-                  const add = snap.filter((x) => !cur.includes(x))
-                  if (add.length) { wj.global[key] = cur.concat(add); changed += add.length }
-                  continue
-                }
-                const snapSet = new Set(snap.filter((x) => snapSessionIds.has(x)))
-                // 快照里没有的会话 → 不动；在快照里的 → 用快照的标记（快照说没归档 → 取消归档）
-                const kept = cur.filter((x) => !snapSessionIds.has(x) || snapSet.has(x))
-                const added = [...snapSet].filter((x) => !kept.includes(x))
-                const next = kept.concat(added)
-                if (next.length !== cur.length || next.some((x, i2) => cur[i2] !== x)) {
-                  wj.global[key] = next
-                  changed += Math.abs(next.length - cur.length) || 1
-                }
-              }
-              if (changed > 0) fsx.writeFileSync(wjPath, JSON.stringify(wj, null, 2))
-            } catch {}
             // 恢复把 cordis.patch.yml 写回了，但插件内存里的 liveSettings 还是旧值 ——
             // 不刷新则下面这次 runSync 会拿旧值把刚恢复的配置又覆盖回去（恢复没生效的元凶）。
             refreshLive()
