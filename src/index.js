@@ -807,7 +807,8 @@ async function readPromptBindings(home, titleToPath) {
     let row = null
     try { row = db.prepare("SELECT value FROM memory_settings WHERE key = 'promptWorkshop'").get() } finally { db.close() }
     if (!row?.value) return null
-    const wp = JSON.parse(row.value)?.workspacePresets
+    const j = JSON.parse(row.value)
+    const wp = j?.workspacePresets
     if (!wp || typeof wp !== 'object') return null
     const out = {}
     for (const [path, preset] of Object.entries(wp)) {
@@ -824,6 +825,24 @@ async function readPromptBindings(home, titleToPath) {
     } catch {}
     return null
   }
+}
+
+/* 读整个 promptWorkshop 状态（版本+绑定+autoApply）。
+   关键认知（2026-10-09 实验）：preset-lite 的 cordis.patch.yml 只是**投影**——session-kit
+   在开机与版本变更时用 regeneratePromptExtras(versions) 从 memory.sqlite 重写它。所以
+   只同步文件永远没用：下载把带测试的文件拷回来，下次开机 session-kit 又按 memory.sqlite
+   里的版本列表（无测试）把文件重写回去 → 测试消失。真相在 memory.sqlite 的 versions。 */
+async function readPromptWorkshopState(home) {
+  try {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(memorySqlitePath(home), { readOnly: true })
+    let row = null
+    try { row = db.prepare("SELECT value FROM memory_settings WHERE key = 'promptWorkshop'").get() } finally { db.close() }
+    if (!row?.value) return null
+    const j = JSON.parse(row.value)
+    if (!Array.isArray(j?.versions)) return null
+    return { versions: j.versions, workspacePresets: j.workspacePresets ?? {}, autoApply: j.autoApply === true }
+  } catch { return null }
 }
 
 async function applyPromptBindings(home, bindings, titleToPath) {
@@ -853,6 +872,49 @@ async function applyPromptBindings(home, bindings, titleToPath) {
   return { ok: true, changed }
 }
 
+/* 下载时把云端 promptWorkshop 状态（版本+绑定+autoApply）整体写进本机 memory.sqlite。
+   「下载即覆盖」语义：云端版本列表为准，本机独有版本被覆盖（用户明确要求）。
+   bindings 的标题键翻译回本机路径。写完文件后 session-kit 需重启才生效（它开机从
+   memory.sqlite 读 versions 并 regeneratePromptExtras 重写 preset 文件——所以重启后
+   cordis.patch.yml 也会跟着变成云端版本）。 */
+async function applyPromptWorkshopState(home, state2, titleToPath) {
+  if (!state2 || typeof state2 !== 'object' || !Array.isArray(state2.versions)) return { ok: true, changed: 0 }
+  try {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(memorySqlitePath(home))
+    try {
+      let row = null
+      try { row = db.prepare("SELECT value FROM memory_settings WHERE key = 'promptWorkshop'").get() } catch {}
+      const j = row?.value ? JSON.parse(row.value) : {}
+      const wp = {}
+      for (const [title, preset] of Object.entries(state2.bindings ?? {})) {
+        const localPath = titleToPath.get(title)
+        if (localPath && typeof preset === 'string') wp[localPath] = preset
+      }
+      const next = { ...j, versions: state2.versions, workspacePresets: wp, autoApply: state2.autoApply === true }
+      const nextStr = JSON.stringify(next)
+      const curStr = row?.value ?? ''
+      if (nextStr === curStr) return { ok: true, changed: 0 }
+      db.prepare("INSERT INTO memory_settings (key, value, updated_at) VALUES ('promptWorkshop', ?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+        .run(nextStr, Date.now())
+      try {
+        const fsx = require('node:fs')
+        fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+          `${new Date().toISOString()} applyPromptWorkshopState: versions=${state2.versions.length} bindings=${Object.keys(wp).length}（重启 DSH 后 session-kit 重生成 preset 文件）\n`)
+      } catch {}
+      return { ok: true, changed: 1 }
+    } finally { db.close() }
+  } catch (e) {
+    try {
+      const fsx = require('node:fs')
+      fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+        `${new Date().toISOString()} applyPromptWorkshopState FAILED: ${String(e && e.message || e)}\n`)
+    } catch {}
+    return { ok: false, changed: 0 }
+  }
+}
+
 async function readWorkspaceOrder() {
   const wsPath = join(dshHome(), 'storages', 'workspace.json')
   let doc
@@ -864,16 +926,27 @@ async function readWorkspaceOrder() {
   // 归档/置顶标记也同步（会话 id 可跨设备移植），让一台设备归档/置顶能带到其他设备
   order.archived = Array.isArray(doc?.global?.archivedSessionIds) ? doc.global.archivedSessionIds.filter((s) => typeof s === 'string') : []
   order.pinned = Array.isArray(doc?.global?.pinnedSessionIds) ? doc.global.pinnedSessionIds.filter((s) => typeof s === 'string') : []
-  // 提示词工作区绑定：路径键 → 标题键（跨设备可移植）
+  // 提示词工作区绑定+版本：路径键 → 标题键（跨设备可移植）。版本也必须同步——
+  // cordis.patch.yml 只是投影，session-kit 从 memory.sqlite 的 versions 重写它。
   {
     const titleToPath = new Map()
     for (const w of Object.values(table)) if (w?.title && w.path) titleToPath.set(w.title, w.path)
     const bindings = await readPromptBindings(dshHome(), titleToPath)
     if (bindings) order.promptBindings = bindings
+    const wsState = await readPromptWorkshopState(dshHome())
+    if (wsState) {
+      // workspacePresets 键翻译成标题
+      const tp = {}
+      for (const [p, preset] of Object.entries(wsState.workspacePresets ?? {})) {
+        const t = titleFromPath(p)
+        if (t) tp[t] = preset
+      }
+      order.promptWorkshop = { versions: wsState.versions, bindings: tp, autoApply: wsState.autoApply }
+    }
     try {
       const fsx = require('node:fs')
       const logp = join(dshHome(), 'logs', 'dsh-sync-init.log')
-      fsx.appendFileSync(logp, `${new Date().toISOString()} readWorkspaceOrder promptBindings=${bindings ? Object.keys(bindings).length : 'null'}\n`)
+      fsx.appendFileSync(logp, `${new Date().toISOString()} readWorkspaceOrder promptBindings=${bindings ? Object.keys(bindings).length : 'null'} versions=${order.promptWorkshop?.versions?.length ?? 'null'}\n`)
     } catch {}
   }
   const byTitle = new Set()
@@ -951,7 +1024,13 @@ async function applyWorkspaceOrder(order) {
   // 提示词工作区绑定：标题键 → 本机路径键，写进本机 memory.sqlite（session-kit 缓存在
   // 内存，需重启才生效——这是宿主设计，文件层面已同步到位）
   let bindingsChanged = 0
-  if (order.promptBindings && typeof order.promptBindings === 'object') {
+  if (order.promptWorkshop && typeof order.promptWorkshop === 'object') {
+    // 完整状态（版本+绑定+autoApply）：下载即覆盖，版本列表以云端为准
+    const titleToPath2 = new Map()
+    for (const w of Object.values(table)) if (w?.title && w.path) titleToPath2.set(w.title, w.path)
+    const wr = await applyPromptWorkshopState(dshHome(), order.promptWorkshop, titleToPath2)
+    if (wr?.ok) bindingsChanged = wr.changed || 0
+  } else if (order.promptBindings && typeof order.promptBindings === 'object') {
     const titleToPath = new Map()
     for (const w of Object.values(table)) if (w?.title && w.path) titleToPath.set(w.title, w.path)
     const br = await applyPromptBindings(dshHome(), order.promptBindings, titleToPath)
