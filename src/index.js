@@ -2737,8 +2737,13 @@ module.exports = {
             const release = await acquireLock(lockFile)
             if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行' }); return }
             try {
-              const safetyName = `pre-download-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
-              try { await createLocalSnapshot(eff, safetyName) } catch {}
+              // pre-download 安全快照改 opt-in（snapshotSafety===true 才建）：它每次下载都建、
+              // 越积越多，用户不要自动快照。云端仍有原始数据，下载失败可重新下载。
+              let safetyName
+              if (eff.snapshotSafety === true) {
+                safetyName = `pre-download-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
+                try { await createLocalSnapshot(eff, safetyName) } catch {}
+              }
               const r = await runDownload(eff)
               sendJson(res, 200, { ...r, safetySnapshot: safetyName })
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
@@ -2962,10 +2967,12 @@ module.exports = {
             // 创建时间：①元数据文件（创建时写，最可靠）②名字里内嵌的 ISO 时间戳
             // ③目录 mtime。不用 birthtime——拷贝/同步后会变，跨设备不一致。
             const tsFromName = (n) => {
+              // 名字里的时间是 toISOString() 生成的 UTC，解析必须当 UTC（补 Z），
+              // 否则当本地时间会双重偏移（偏一个时区）。UI 再 toLocale 转本地显示。
               const m = String(n).match(/(\d{4}-\d{2}-\d{2})[T_](\d{2})[-:](\d{2})[-:](\d{2})/)
-              if (m) { const d = new Date(`${m[1]}T${m[2]}:${m[3]}:${m[4]}`); if (!isNaN(d)) return d.toISOString() }
+              if (m) { const d = new Date(`${m[1]}T${m[2]}:${m[3]}:${m[4]}Z`); if (!isNaN(d)) return d.toISOString() }
               const d2 = String(n).match(/(\d{4}-\d{2}-\d{2})/)
-              if (d2) { const d = new Date(`${d2[1]}T00:00:00`); if (!isNaN(d)) return d.toISOString() }
+              if (d2) { const d = new Date(`${d2[1]}T00:00:00Z`); if (!isNaN(d)) return d.toISOString() }
               return undefined
             }
             try {
@@ -3126,8 +3133,11 @@ module.exports = {
             if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
             let safetyName
             try {
-              safetyName = `pre-remote-pull-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
-              try { await createLocalSnapshot(eff, safetyName) } catch {}
+              // pre-remote-pull 安全快照改 opt-in（同 pre-download）
+              if (eff.snapshotSafety === true) {
+                safetyName = `pre-remote-pull-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
+                try { await createLocalSnapshot(eff, safetyName) } catch {}
+              }
               const applyResult = await applyRemotePullPlan(eff.gitBinary, eff, { repoDir, state, roots: defaultRoots() }, planResult.plan)
               runSync({ autoAlign: false }).catch(() => {})
               try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
