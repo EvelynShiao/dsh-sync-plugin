@@ -526,7 +526,7 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
   const knowledgeStrategy = STRATEGY_VALUES.includes(eff.knowledgeStrategy) ? eff.knowledgeStrategy : 'merge'
   const memoryStrategy = STRATEGY_VALUES.includes(eff.memoryStrategy) ? eff.memoryStrategy : 'merge'
   if (eff.syncSkills) groups.push({
-    name: 'skills', strategy: skillsStrategy,
+    name: 'skills', strategy: skillsStrategy, overwriteOnDownload: true,
     sources: [
       { from: roots.dshSkills, to: skillsStrategy === 'standalone' ? backup('skills/dsh') : 'skills/dsh' },
       // 软链解引用成实文件：跨机不能指望同一个 link target 存在
@@ -539,14 +539,14 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
     sources: [{ from: roots.sessions, to: sessionsStrategy === 'standalone' ? backup('sessions') : 'sessions', excludeNames: new Set(['session_projcache.json']) }],
   })
   if (eff.syncSettings) groups.push({
-    name: 'settings', strategy: settingsStrategy,
+    name: 'settings', strategy: settingsStrategy, overwriteOnDownload: true,
     // 整文件同步、不脱敏——前提是私仓校验通过
     sources: [{ from: roots.settingsFile, to: settingsStrategy === 'standalone' ? backup('settings/settings.yaml') : 'settings/settings.yaml', file: true }],
   })
   if (eff.syncPlugins) {
     const pluginsTo = pluginsStrategy === 'standalone' ? backup('plugins') : 'plugins'
     groups.push({
-      name: 'plugins', strategy: pluginsStrategy,
+      name: 'plugins', strategy: pluginsStrategy, overwriteOnDownload: true,
       sources: [{
         from: roots.profiles, to: pluginsTo,
         // 只存声明：package.json / patch / 锁文件。node_modules 按机重装，
@@ -563,7 +563,7 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
   // 两个目录永不相交 → 提示词从来没到过手机。standalone 是刻意的（package.json 等确实
   // 该各机独立），所以提示词单独一组走共享路径 prompts/，谁上传谁的版本即为云端真源。
   if (eff.syncPlugins) groups.push({
-    name: 'prompts', strategy: 'merge',
+    name: 'prompts', strategy: 'merge', overwriteOnDownload: true,
     sources: [{
       from: join(roots.profiles, 'web', 'node_modules', 'dsh-preset-lite', 'cordis.patch.yml'),
       to: 'prompts/preset-lite-cordis.patch.yml',
@@ -1241,27 +1241,13 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       applied++
     } catch { skipped++ }
   }
-  // prompts（提示词）无条件镜像：云端为真源。实验实证（2026-10-09）：上传后 lastSynced
-  // 已推进，本地再改提示词 → diff(lastSynced, 云端)=空 → 文件不进变更列表 → 永远不下载。
-  // 用户要的是「下载=云端强制覆盖」，所以不管基线，直接从 FETCH_HEAD 最新版本写本地。
-  for (const group of spec.filter((g) => g.name === 'prompts')) {
-    for (const src of group.sources) {
-      if (!src.file) continue
-      try {
-        const remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${src.to}`, repoDir)
-        if (remoteBuf === null) continue   // 云端没有该文件就不动本地
-        let liveBuf = null
-        try { liveBuf = await fsP.readFile(src.from) } catch {}
-        if (liveBuf !== null && Buffer.compare(liveBuf, remoteBuf) === 0) continue  // 相同跳过
-        await fsP.mkdir(join(src.from, '..'), { recursive: true })
-        await atomicWriteFile(src.from, remoteBuf)
-        applied++
-      } catch { /* 单文件失败不阻断 */ }
-    }
-  }
-  // 覆盖·远端为准的组：整组强制镜像（本地只读）——不在本轮变更集里的文件也要
-  // 回归远端版本（本地乱改被冲掉、本地多出来的文件按远端为准删除）
-  for (const group of spec.filter(g => g.strategy === 'remote')) {
+  // prompts（提示词）无条件镜像已由下面的 overwriteOnDownload 强制镜像覆盖，此处不再单列。
+  // 覆盖·远端为准的组 + 标记 overwriteOnDownload 的配置组：整组强制镜像——不在本轮变更
+  // 集里的文件也要回归远端版本（本地乱改被冲掉、本地多出来的文件按远端为准删除）。
+  // 用户明确要求「下载即覆盖」（2026-10-09）：配置类（skills/settings/plugins/prompts）
+  // 云端为真源；会话/记忆/知识库仍走 merge（live 会话不能覆盖、SQLite 有打开句柄）。
+  await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})   // 影子工作区对齐 FETCH_HEAD，强制镜像才有远端最新内容
+  for (const group of spec.filter(g => g.strategy === 'remote' || g.overwriteOnDownload === true)) {
     for (const src of group.sources) {
       const shadowDir = join(repoDir, src.to)
       const haveShadow = await fsP.access(shadowDir).then(() => true).catch(() => false)
