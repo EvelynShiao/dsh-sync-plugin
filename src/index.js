@@ -2299,6 +2299,10 @@ module.exports = {
 
     // ── 上传：本地 → 云（单向） ──
     const runUpload = async (eff) => {
+      // 残留 index.lock 清理：上传按钮走本函数（非 runPush），上次上传被强杀会留下锁，
+      // 之后 git add 必报 "remove the file manually"（手机 2026-10-09 复现）。
+      // 本函数被调用前已持有 sync .lock，此刻的 git 锁必是残留，安全删。
+      await clearStaleGitLock(repoDir)
       const remote = await ensureShadowRepo(eff.gitBinary, eff, repoDir)
       const spec = syncSpec(eff, defaultRoots(), state.instanceId)
       try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
