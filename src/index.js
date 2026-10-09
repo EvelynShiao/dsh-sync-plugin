@@ -1156,6 +1156,24 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       applied++
     } catch { skipped++ }
   }
+  // prompts（提示词）无条件镜像：云端为真源。实验实证（2026-10-09）：上传后 lastSynced
+  // 已推进，本地再改提示词 → diff(lastSynced, 云端)=空 → 文件不进变更列表 → 永远不下载。
+  // 用户要的是「下载=云端强制覆盖」，所以不管基线，直接从 FETCH_HEAD 最新版本写本地。
+  for (const group of spec.filter((g) => g.name === 'prompts')) {
+    for (const src of group.sources) {
+      if (!src.file) continue
+      try {
+        const remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${src.to}`, repoDir)
+        if (remoteBuf === null) continue   // 云端没有该文件就不动本地
+        let liveBuf = null
+        try { liveBuf = await fsP.readFile(src.from) } catch {}
+        if (liveBuf !== null && Buffer.compare(liveBuf, remoteBuf) === 0) continue  // 相同跳过
+        await fsP.mkdir(join(src.from, '..'), { recursive: true })
+        await atomicWriteFile(src.from, remoteBuf)
+        applied++
+      } catch { /* 单文件失败不阻断 */ }
+    }
+  }
   // 覆盖·远端为准的组：整组强制镜像（本地只读）——不在本轮变更集里的文件也要
   // 回归远端版本（本地乱改被冲掉、本地多出来的文件按远端为准删除）
   for (const group of spec.filter(g => g.strategy === 'remote')) {
