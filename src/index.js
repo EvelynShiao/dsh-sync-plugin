@@ -767,6 +767,90 @@ async function ensureShadowRepo(binary, eff, repoDir) {
 
 // ── Three-way push: local deltas → branch → PR → merge | conflict ──
 
+// ── 排序同步：把手动排序抽成可移植顺序文件 ──────────────────────────
+// 排序存在 workspace.json 的两个数组里：global.workspaceIds（工作区顺序）与
+// tables.workspaces[id].sessionIds（会话顺序）。跨设备不可移植的是 path（绝对路径，
+// PC/手机完全不同）与 id（各机随机 UUID），可移植的是 title（=目录名）与 sessionId
+// （=会话目录名，sessions 组已在同步）。所以顺序文件按 title / sessionId 记。
+// 应用时只重排数组、绝不增删条目、绝不碰标题/绑定/墓碑。
+const ORDER_FILE = 'workspace-order.json'
+
+async function readWorkspaceOrder() {
+  const wsPath = join(dshHome(), 'storages', 'workspace.json')
+  let doc
+  try { doc = JSON.parse(await fsP.readFile(wsPath, 'utf8')) } catch { return null }
+  const table = doc?.tables?.workspaces
+  if (!table || typeof table !== 'object') return null
+  const wsIds = Array.isArray(doc?.global?.workspaceIds) ? doc.global.workspaceIds : []
+  const order = { version: 1, workspaces: [], sessions: {} }
+  const byTitle = new Set()
+  // 先按 workspaceIds 顺序收（这就是显示顺序）
+  for (const id of wsIds) {
+    const w = table[id]
+    if (!w || typeof w.title !== 'string' || byTitle.has(w.title)) continue
+    byTitle.add(w.title)
+    order.workspaces.push(w.title)
+    order.sessions[w.title] = Array.isArray(w.sessionIds) ? w.sessionIds.filter(s => typeof s === 'string') : []
+  }
+  // 表里有、但不在 workspaceIds 的（悬空）也带上，避免顺序丢失
+  for (const w of Object.values(table)) {
+    if (!w || typeof w.title !== 'string' || byTitle.has(w.title)) continue
+    byTitle.add(w.title)
+    order.workspaces.push(w.title)
+    order.sessions[w.title] = Array.isArray(w.sessionIds) ? w.sessionIds.filter(s => typeof s === 'string') : []
+  }
+  return order
+}
+
+async function applyWorkspaceOrder(order) {
+  if (!order || !Array.isArray(order.workspaces) || typeof order.sessions !== 'object') return { ok: false, error: 'invalid-order' }
+  const wsPath = join(dshHome(), 'storages', 'workspace.json')
+  let doc
+  try { doc = JSON.parse(await fsP.readFile(wsPath, 'utf8')) } catch { return { ok: false, error: 'workspace.json-unreadable' } }
+  const table = doc?.tables?.workspaces
+  const wsIds = doc?.global?.workspaceIds
+  if (!table || !Array.isArray(wsIds)) return { ok: false, error: 'unexpected-workspace-shape' }
+  // title -> id（重复 title 只认第一个，其余原位不动）
+  const idByTitle = new Map()
+  for (const id of wsIds) {
+    const t = table[id]?.title
+    if (typeof t === 'string' && !idByTitle.has(t)) idByTitle.set(t, id)
+  }
+  // 按 order.workspaces 重排 workspaceIds；未知/重复的保持原相对顺序垫底
+  const orderedIds = []
+  for (const t of order.workspaces) { const id = idByTitle.get(t); if (id && !orderedIds.includes(id)) orderedIds.push(id) }
+  const restIds = wsIds.filter(id => !orderedIds.includes(id))
+  const newWsIds = [...orderedIds, ...restIds]
+  let changed = false
+  if (newWsIds.length === wsIds.length && newWsIds.some((v, i) => v !== wsIds[i])) {
+    doc.global.workspaceIds = newWsIds
+    changed = true
+  }
+  // 每个工作区的 sessionIds 重排（只排本机已知的，未知的垫底；绝不跨工作区移动）
+  let sessReordered = 0
+  for (const id of newWsIds) {
+    const w = table[id]
+    if (!w || !Array.isArray(w.sessionIds)) continue
+    const list = order.sessions?.[w.title]
+    if (!Array.isArray(list)) continue
+    const known = list.filter(s => w.sessionIds.includes(s))
+    if (!known.length) continue
+    const rest = w.sessionIds.filter(s => !known.includes(s))
+    const newS = [...known, ...rest]
+    if (newS.length === w.sessionIds.length && newS.some((v, i) => v !== w.sessionIds[i])) {
+      w.sessionIds = newS
+      sessReordered++
+      changed = true
+    }
+  }
+  if (!changed) return { ok: true, changed: false }
+  try {
+    await fsP.copyFile(wsPath, wsPath + '.bak-order')
+    await atomicWriteFile(wsPath, JSON.stringify(doc, null, 2))
+  } catch (e) { return { ok: false, error: 'write-failed: ' + String(e?.message ?? e) } }
+  return { ok: true, changed: true, sessions: sessReordered }
+}
+
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
   const remote = await ensureShadowRepo(binary, eff, repoDir)
   const spec = syncSpec(eff, roots, instanceId)
@@ -826,6 +910,15 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   // 「双方都改过的文件交远端裁决」这条冲突保护。
   for (const p of (eff.uploadOverwrite !== false ? [] : preserve || [])) {
     await gitExec(binary, ['checkout', 'FETCH_HEAD', '--', p], repoDir).catch(() => {})
+  }
+
+  // 3.5 排序同步：把手动排序导出成可移植顺序文件（title/sessionId 键）。
+  // 放在 commit 之前=本地顺序最后写、赢过 firstJoin 恢复与 preserve 回滚。
+  if (eff.syncOrder !== false) {
+    try {
+      const order = await readWorkspaceOrder()
+      if (order && order.workspaces.length) await atomicWriteFile(join(repoDir, ORDER_FILE), JSON.stringify(order, null, 2))
+    } catch { /* 排序导出失败不阻断推送 */ }
   }
 
   // 4. commit on a fresh branch
@@ -2304,6 +2397,23 @@ module.exports = {
             try { ctx.logger?.info?.(`dsh-sync: archive-reconcile removed ${removed} stale tombstones`) } catch {}
           }
         } catch (e) { try { ctx.logger?.warn?.('dsh-sync: archive-reconcile: ' + (e && e.message)) } catch {} }
+      }
+      // 排序同步：应用云端顺序到 live workspace.json。必须排在上面会话注册
+      // (attachSession) 与 archive-reconcile 之后——否则刚追加的会话顺序被打乱。
+      // 只重排数组、不增删条目、不碰标题/绑定/墓碑（applyWorkspaceOrder 内保证）。
+      if (eff.syncOrder !== false) {
+        try {
+          const orderBuf = await fsP.readFile(join(repoDir, ORDER_FILE)).catch(() => null)
+          if (orderBuf) {
+            const orderRes = await applyWorkspaceOrder(JSON.parse(orderBuf.toString('utf8')))
+            if (orderRes?.ok && orderRes.changed) {
+              applied.push(`workspace-order（重排 ${orderRes.sessions} 个工作区的会话顺序）`)
+              try { ctx.logger?.info?.('dsh-sync: workspace order applied') } catch {}
+            } else if (!orderRes?.ok) {
+              try { ctx.logger?.warn?.('dsh-sync: workspace order failed: ' + (orderRes?.error ?? '')) } catch {}
+            }
+          }
+        } catch (e) { try { ctx.logger?.warn?.('dsh-sync: workspace order: ' + (e && e.message)) } catch {} }
       }
       state.lastSyncAt = new Date().toISOString()
       await saveState()
