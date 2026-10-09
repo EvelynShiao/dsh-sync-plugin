@@ -543,17 +543,30 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
     // 整文件同步、不脱敏——前提是私仓校验通过
     sources: [{ from: roots.settingsFile, to: settingsStrategy === 'standalone' ? backup('settings/settings.yaml') : 'settings/settings.yaml', file: true }],
   })
-  if (eff.syncPlugins) groups.push({
-    name: 'plugins', strategy: pluginsStrategy,
-    sources: [{
-      from: roots.profiles, to: pluginsStrategy === 'standalone' ? backup('plugins') : 'plugins',
-      // 只存声明：package.json / patch / 锁文件。node_modules 按机重装，
-      // .dsh-market 是市场缓存，cordis.yml 是 loader 产物（可重建）
-      includeFiles: new Set(['package.json', 'cordis.patch.yml', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']),
-      excludeDirs: new Set(['node_modules', '.dsh-market']),
-      excludeNames: new Set(['cordis.yml']),
-    }],
-  })
+  if (eff.syncPlugins) {
+    const pluginsTo = pluginsStrategy === 'standalone' ? backup('plugins') : 'plugins'
+    groups.push({
+      name: 'plugins', strategy: pluginsStrategy,
+      sources: [
+        {
+          from: roots.profiles, to: pluginsTo,
+          // 只存声明：package.json / patch / 锁文件。node_modules 按机重装，
+          // .dsh-market 是市场缓存，cordis.yml 是 loader 产物（可重建）
+          includeFiles: new Set(['package.json', 'cordis.patch.yml', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']),
+          excludeDirs: new Set(['node_modules', '.dsh-market']),
+          excludeNames: new Set(['cordis.yml']),
+        },
+        // Lite 预设的提示词版本（persona + workshop:extra 生成区）写在插件自带的
+        // cordis.patch.yml 里，而它在 node_modules 下被上面 excludeDirs 排除 → 提示词
+        // 不同步。单独把这一个文件纳入同步，让提示词版本跨设备一致。
+        {
+          from: join(roots.profiles, 'web', 'node_modules', 'dsh-preset-lite', 'cordis.patch.yml'),
+          to: pluginsTo + '/web/node_modules/dsh-preset-lite/cordis.patch.yml',
+          file: true,
+        },
+      ],
+    })
+  }
   // 知识库：单文件、按整文件比对。SQLite 是二进制，两侧都改会走冲突流程
   // （conflictMode: ai 由对齐步骤处理，失败则人工选边）；日常单端写入不会触发。
   if (eff.syncMemory) groups.push({
@@ -851,6 +864,16 @@ async function applyWorkspaceOrder(order) {
   return { ok: true, changed: true, sessions: sessReordered }
 }
 
+// ── 清残留 git index.lock ──
+// 上次 git 进程被中断（上传失败/手机中断）会留下 .git/index.lock，之后所有 git 操作
+// 报 "remove the file manually to continue"。sync 自己有 .lock 保证同一时刻只有一个
+// 同步在跑，所以此刻若 index.lock 还在 = 上次中断的残留，安全删除。
+async function clearStaleGitLock(repoDir) {
+  const lock = join(repoDir, '.git', 'index.lock')
+  try { await fsP.access(lock); } catch { return false }
+  try { await fsP.unlink(lock); return true } catch { return false }
+}
+
 // ── 下载后归一化 + 去重（跨设备兼容的核心）──
 // 会话项目目录由 header.cwd 派生（encodeWorkspaceDir），而 cwd 是各设备绝对路径：
 // PC 的 --C-Users-... 与手机的 --root-... 是两个不同目录 → 同一会话 id 在云端存成两份
@@ -930,6 +953,7 @@ async function normalizeDownloadedSessions(home) {
 }
 
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
+  await clearStaleGitLock(repoDir)   // 上次中断的 index.lock 会让 git add 报"手动删除"
   const remote = await ensureShadowRepo(binary, eff, repoDir)
   const spec = syncSpec(eff, roots, instanceId)
   // 首次接入判定必须在任何基线推进之前读
@@ -1062,6 +1086,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
 // ── Three-way pull: remote deltas → live, only for untouched files ──
 
 async function runPull(binary, eff, { repoDir, state, logger, roots }) {
+  await clearStaleGitLock(repoDir)
   const remote = authedUrl(eff.repoUrl, eff.token)
   const spec = syncSpec(eff, roots, state.instanceId)
   const lastSynced = state.lastSyncedCommit
@@ -2509,6 +2534,9 @@ module.exports = {
           try { ctx.inject(['sessions'], async (svcs) => { if (typeof svcs?.sessions?.refresh === 'function') await svcs.sessions.refresh() }) } catch {}
         }
       } catch (e) { try { ctx.logger?.warn?.('dsh-sync: session-normalize: ' + (e && e.message)) } catch {} }
+      // 强制扫盘刷新：下载后无条件刷新会话列表 + 触发投影预热，让新会话不重启就显示
+      try { ctx.inject(['sessions'], async (svcs) => { if (typeof svcs?.sessions?.refresh === 'function') await svcs.sessions.refresh() }) } catch {}
+      try { ctx.logger?.info?.('dsh-sync: download done, sessions refresh dispatched') } catch {}
       state.lastSyncAt = new Date().toISOString()
       await saveState()
       return { downloaded: true, applied, skipped }
