@@ -851,46 +851,82 @@ async function applyWorkspaceOrder(order) {
   return { ok: true, changed: true, sessions: sessReordered }
 }
 
-// ── 下载后按会话 id 去重 ──
-// 跨设备路径键会让同一会话在云端存成两个不同项目目录（PC 的 --C-Users-... 与手机的
-// --root-...），merge 策略只增不删 → 每次下载都拉回重复 → 宿主报
-// "duplicate JSONL session id in multiple project directories" 拒绝加载。
-// 这里下载收尾扫一遍：同一 id 出现在多个项目目录时，保留「匹配本地 workspace 路径」
-// 的那份（权威），其余移入备份（可恢复，不硬删）。
-async function dedupeSessionDirs(home) {
+// ── 下载后归一化 + 去重（跨设备兼容的核心）──
+// 会话项目目录由 header.cwd 派生（encodeWorkspaceDir），而 cwd 是各设备绝对路径：
+// PC 的 --C-Users-... 与手机的 --root-... 是两个不同目录 → 同一会话 id 在云端存成两份
+// → merge 只增不删 → 每次下载都拉回重复 → 宿主报 "duplicate JSONL session id" 拒绝加载。
+// 归一化：下载收尾把「非本机权威目录」里的会话，按 cwd 的文件夹名匹配到本地 workspace，
+// 把 header.cwd 改写成本机路径并搬进本机权威目录 → 同一会话无论哪台设备推的都落到同一
+// 目录 → 上传覆盖天然生效、彻底无重复。本机已有的 id（权威目录里）优先，外来副本入备份。
+function scanZstdFrames(buf) {
+  const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+  const idx = []
+  let i = -1
+  while ((i = buf.indexOf(magic, i + 1)) !== -1) idx.push(i)
+  idx.push(buf.length)
+  return idx
+}
+async function normalizeDownloadedSessions(home) {
+  const zlib = require('node:zlib')
   const sessionsRoot = join(home, 'sessions')
+  const wsByFolder = new Map()
   const authDirs = new Set()
   try {
     const doc = JSON.parse(await fsP.readFile(join(home, 'storages', 'workspace.json'), 'utf8'))
-    for (const w of Object.values(doc?.tables?.workspaces ?? {})) if (w?.path) authDirs.add(encodeWorkspaceDir(w.path))
-  } catch { /* 读不到就只保留第一个目录，保守 */ }
-  const idDirs = new Map()
+    for (const w of Object.values(doc?.tables?.workspaces ?? {})) {
+      if (!w?.path) continue
+      authDirs.add(encodeWorkspaceDir(w.path))
+      const folder = String(w.path).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      wsByFolder.set(folder, w.path)
+    }
+  } catch { return { normalized: 0, deduped: 0 } }
   let wsNames = []
-  try { wsNames = (await fsP.readdir(sessionsRoot, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name) } catch { return { removed: 0 } }
+  try { wsNames = (await fsP.readdir(sessionsRoot, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name) } catch { return { normalized: 0, deduped: 0 } }
+  let normalized = 0, deduped = 0
+  let backupRoot = null
+  const bk = async () => { if (!backupRoot) { backupRoot = join(home, 'sessions-dedupe-backup-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)); await fsP.mkdir(backupRoot, { recursive: true }) } return backupRoot }
+  const hasAuthCopy = async (id) => {
+    for (const d of authDirs) { try { await fsP.access(join(sessionsRoot, d, id, 'session.v4.jsonl.zstd')); return d } catch {} }
+    return null
+  }
   for (const ws of wsNames) {
+    if (authDirs.has(ws)) continue   // 本机权威目录不动
     let sess = []
     try { sess = (await fsP.readdir(join(sessionsRoot, ws), { withFileTypes: true })).filter((d) => d.isDirectory()) } catch { continue }
     for (const s of sess) {
-      try { await fsP.access(join(sessionsRoot, ws, s.name, 'session.v4.jsonl.zstd')) } catch { continue }
-      if (!idDirs.has(s.name)) idDirs.set(s.name, [])
-      idDirs.get(s.name).push(ws)
-    }
-  }
-  let removed = 0
-  let backupRoot = null
-  for (const [id, dirs] of idDirs) {
-    if (dirs.length < 2) continue
-    const keep = dirs.find((d) => authDirs.has(d)) ?? dirs[0]
-    for (const d of dirs) {
-      if (d === keep) continue
+      const srcFile = join(sessionsRoot, ws, s.name, 'session.v4.jsonl.zstd')
+      let buf = null, frameEnd = 0, header = null
       try {
-        if (!backupRoot) { backupRoot = join(home, 'sessions-dedupe-backup-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)); await fsP.mkdir(backupRoot, { recursive: true }) }
-        await fsP.rename(join(sessionsRoot, d, id), join(backupRoot, d + '__' + id))
-        removed++
-      } catch { /* 占用等失败跳过，下次再清 */ }
+        buf = await fsP.readFile(srcFile)
+        const idx = scanZstdFrames(buf)
+        if (idx.length < 2) continue
+        frameEnd = idx[1]
+        header = JSON.parse(zlib.zstdDecompressSync(buf.subarray(0, frameEnd)).toString('utf8'))
+      } catch { continue }
+      // 本机权威目录已有同 id → 本机那份 cwd 已正确，外来副本入备份
+      const existing = await hasAuthCopy(s.name)
+      if (existing) {
+        try { await fsP.rename(join(sessionsRoot, ws, s.name), join(await bk(), ws + '__' + s.name)); deduped++ } catch {}
+        continue
+      }
+      // 手机独有 → 归一化：cwd 改本机路径、搬进本机目录
+      const folder = String(header?.cwd ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      const localPath = wsByFolder.get(folder)
+      if (!localPath) continue   // 无对应本地 workspace，跳过
+      header.cwd = localPath
+      const newHeader = zlib.zstdCompressSync(Buffer.from(JSON.stringify(header) + '\n', 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
+      const newBuf = Buffer.concat([newHeader, buf.subarray(frameEnd)])
+      const destDir = join(sessionsRoot, encodeWorkspaceDir(localPath), s.name)
+      try {
+        await fsP.mkdir(destDir, { recursive: true })
+        await fsP.writeFile(join(destDir, 'session.v4.jsonl.zstd'), newBuf)
+        await fsP.rename(join(sessionsRoot, ws, s.name), join(await bk(), ws + '__' + s.name + '.moved'))
+        normalized++
+      } catch { /* 失败跳过 */ }
     }
+    try { if ((await fsP.readdir(join(sessionsRoot, ws))).length === 0) await fsP.rename(join(sessionsRoot, ws), join(await bk(), 'EMPTY__' + ws)) } catch {}
   }
-  return { removed }
+  return { normalized, deduped }
 }
 
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
@@ -2463,15 +2499,16 @@ module.exports = {
           }
         } catch (e) { try { ctx.logger?.warn?.('dsh-sync: workspace order: ' + (e && e.message)) } catch {} }
       }
-      // 下载后去重：跨设备路径键导致同一会话多目录，宿主拒绝加载。保留权威目录那份。
+      // 下载后归一化+去重：把外来（跨设备）会话的 cwd 改本机路径、搬进本机目录，
+      // 同一会话无论哪台设备推的都落同一目录 → 覆盖生效、无重复（宿主不再报 duplicate）。
       try {
-        const dd = await dedupeSessionDirs(dshHome())
-        if (dd.removed > 0) {
-          applied.push(`session-dedup（移除 ${dd.removed} 个跨设备重复会话目录）`)
-          try { ctx.logger?.info?.(`dsh-sync: session-dedup removed ${dd.removed}`) } catch {}
+        const dd = await normalizeDownloadedSessions(dshHome())
+        if (dd.normalized > 0 || dd.deduped > 0) {
+          applied.push(`session-normalize（归一化 ${dd.normalized} 个、去重 ${dd.deduped} 个跨设备会话）`)
+          try { ctx.logger?.info?.(`dsh-sync: session-normalize normalized=${dd.normalized} deduped=${dd.deduped}`) } catch {}
           try { ctx.inject(['sessions'], async (svcs) => { if (typeof svcs?.sessions?.refresh === 'function') await svcs.sessions.refresh() }) } catch {}
         }
-      } catch (e) { try { ctx.logger?.warn?.('dsh-sync: session-dedup: ' + (e && e.message)) } catch {} }
+      } catch (e) { try { ctx.logger?.warn?.('dsh-sync: session-normalize: ' + (e && e.message)) } catch {} }
       state.lastSyncAt = new Date().toISOString()
       await saveState()
       return { downloaded: true, applied, skipped }
