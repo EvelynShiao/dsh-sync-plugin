@@ -851,6 +851,48 @@ async function applyWorkspaceOrder(order) {
   return { ok: true, changed: true, sessions: sessReordered }
 }
 
+// ── 下载后按会话 id 去重 ──
+// 跨设备路径键会让同一会话在云端存成两个不同项目目录（PC 的 --C-Users-... 与手机的
+// --root-...），merge 策略只增不删 → 每次下载都拉回重复 → 宿主报
+// "duplicate JSONL session id in multiple project directories" 拒绝加载。
+// 这里下载收尾扫一遍：同一 id 出现在多个项目目录时，保留「匹配本地 workspace 路径」
+// 的那份（权威），其余移入备份（可恢复，不硬删）。
+async function dedupeSessionDirs(home) {
+  const sessionsRoot = join(home, 'sessions')
+  const authDirs = new Set()
+  try {
+    const doc = JSON.parse(await fsP.readFile(join(home, 'storages', 'workspace.json'), 'utf8'))
+    for (const w of Object.values(doc?.tables?.workspaces ?? {})) if (w?.path) authDirs.add(encodeWorkspaceDir(w.path))
+  } catch { /* 读不到就只保留第一个目录，保守 */ }
+  const idDirs = new Map()
+  let wsNames = []
+  try { wsNames = (await fsP.readdir(sessionsRoot, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name) } catch { return { removed: 0 } }
+  for (const ws of wsNames) {
+    let sess = []
+    try { sess = (await fsP.readdir(join(sessionsRoot, ws), { withFileTypes: true })).filter((d) => d.isDirectory()) } catch { continue }
+    for (const s of sess) {
+      try { await fsP.access(join(sessionsRoot, ws, s.name, 'session.v4.jsonl.zstd')) } catch { continue }
+      if (!idDirs.has(s.name)) idDirs.set(s.name, [])
+      idDirs.get(s.name).push(ws)
+    }
+  }
+  let removed = 0
+  let backupRoot = null
+  for (const [id, dirs] of idDirs) {
+    if (dirs.length < 2) continue
+    const keep = dirs.find((d) => authDirs.has(d)) ?? dirs[0]
+    for (const d of dirs) {
+      if (d === keep) continue
+      try {
+        if (!backupRoot) { backupRoot = join(home, 'sessions-dedupe-backup-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)); await fsP.mkdir(backupRoot, { recursive: true }) }
+        await fsP.rename(join(sessionsRoot, d, id), join(backupRoot, d + '__' + id))
+        removed++
+      } catch { /* 占用等失败跳过，下次再清 */ }
+    }
+  }
+  return { removed }
+}
+
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
   const remote = await ensureShadowRepo(binary, eff, repoDir)
   const spec = syncSpec(eff, roots, instanceId)
@@ -2421,6 +2463,15 @@ module.exports = {
           }
         } catch (e) { try { ctx.logger?.warn?.('dsh-sync: workspace order: ' + (e && e.message)) } catch {} }
       }
+      // 下载后去重：跨设备路径键导致同一会话多目录，宿主拒绝加载。保留权威目录那份。
+      try {
+        const dd = await dedupeSessionDirs(dshHome())
+        if (dd.removed > 0) {
+          applied.push(`session-dedup（移除 ${dd.removed} 个跨设备重复会话目录）`)
+          try { ctx.logger?.info?.(`dsh-sync: session-dedup removed ${dd.removed}`) } catch {}
+          try { ctx.inject(['sessions'], async (svcs) => { if (typeof svcs?.sessions?.refresh === 'function') await svcs.sessions.refresh() }) } catch {}
+        }
+      } catch (e) { try { ctx.logger?.warn?.('dsh-sync: session-dedup: ' + (e && e.message)) } catch {} }
       state.lastSyncAt = new Date().toISOString()
       await saveState()
       return { downloaded: true, applied, skipped }
