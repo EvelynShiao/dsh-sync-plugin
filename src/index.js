@@ -796,6 +796,9 @@ async function readWorkspaceOrder() {
   if (!table || typeof table !== 'object') return null
   const wsIds = Array.isArray(doc?.global?.workspaceIds) ? doc.global.workspaceIds : []
   const order = { version: 1, workspaces: [], sessions: {} }
+  // 归档/置顶标记也同步（会话 id 可跨设备移植），让一台设备归档/置顶能带到其他设备
+  order.archived = Array.isArray(doc?.global?.archivedSessionIds) ? doc.global.archivedSessionIds.filter((s) => typeof s === 'string') : []
+  order.pinned = Array.isArray(doc?.global?.pinnedSessionIds) ? doc.global.pinnedSessionIds.filter((s) => typeof s === 'string') : []
   const byTitle = new Set()
   // 先按 workspaceIds 顺序收（这就是显示顺序）
   for (const id of wsIds) {
@@ -856,6 +859,18 @@ async function applyWorkspaceOrder(order) {
       changed = true
     }
   }
+  // 归档/置顶标记：与云端并集（一台归档/置顶能带到其他设备），但只保留本机真实存在的
+  // 会话 id（避免给不存在的会话引入幽灵墓碑——那会让宿主报 duplicate/加载失败）。
+  const allLocalIds = new Set()
+  for (const w of Object.values(table)) if (Array.isArray(w?.sessionIds)) for (const s of w.sessionIds) allLocalIds.add(s)
+  const mergeFlagList = (key, remoteArr) => {
+    if (!Array.isArray(remoteArr) || !remoteArr.length) return
+    const cur = Array.isArray(doc.global[key]) ? doc.global[key] : []
+    const merged = [...new Set([...cur, ...remoteArr])].filter((id) => allLocalIds.has(id))
+    if (merged.length !== cur.length || merged.some((v, i) => v !== cur[i])) { doc.global[key] = merged; changed = true }
+  }
+  mergeFlagList('archivedSessionIds', order.archived)
+  mergeFlagList('pinnedSessionIds', order.pinned)
   if (!changed) return { ok: true, changed: false }
   try {
     await fsP.copyFile(wsPath, wsPath + '.bak-order')
