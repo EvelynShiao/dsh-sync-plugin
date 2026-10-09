@@ -547,26 +547,29 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
     const pluginsTo = pluginsStrategy === 'standalone' ? backup('plugins') : 'plugins'
     groups.push({
       name: 'plugins', strategy: pluginsStrategy,
-      sources: [
-        {
-          from: roots.profiles, to: pluginsTo,
-          // 只存声明：package.json / patch / 锁文件。node_modules 按机重装，
-          // .dsh-market 是市场缓存，cordis.yml 是 loader 产物（可重建）
-          includeFiles: new Set(['package.json', 'cordis.patch.yml', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']),
-          excludeDirs: new Set(['node_modules', '.dsh-market']),
-          excludeNames: new Set(['cordis.yml']),
-        },
-        // Lite 预设的提示词版本（persona + workshop:extra 生成区）写在插件自带的
-        // cordis.patch.yml 里，而它在 node_modules 下被上面 excludeDirs 排除 → 提示词
-        // 不同步。单独把这一个文件纳入同步，让提示词版本跨设备一致。
-        {
-          from: join(roots.profiles, 'web', 'node_modules', 'dsh-preset-lite', 'cordis.patch.yml'),
-          to: pluginsTo + '/web/node_modules/dsh-preset-lite/cordis.patch.yml',
-          file: true,
-        },
-      ],
+      sources: [{
+        from: roots.profiles, to: pluginsTo,
+        // 只存声明：package.json / patch / 锁文件。node_modules 按机重装，
+        // .dsh-market 是市场缓存，cordis.yml 是 loader 产物（可重建）
+        includeFiles: new Set(['package.json', 'cordis.patch.yml', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']),
+        excludeDirs: new Set(['node_modules', '.dsh-market']),
+        excludeNames: new Set(['cordis.yml']),
+      }],
     })
   }
+  // 提示词（Lite 预设 persona + workshop:extra 生成区）：**必须独立成 merge 共享组**。
+  // 教训（2026-10-09）：曾挂进 plugins 组，而 pluginsStrategy=standalone（各机独立备份）
+  // → 文件被存进 backup/<本机实例>/plugins/...，手机的备份路径是 backup/<手机实例>/...
+  // 两个目录永不相交 → 提示词从来没到过手机。standalone 是刻意的（package.json 等确实
+  // 该各机独立），所以提示词单独一组走共享路径 prompts/，谁上传谁的版本即为云端真源。
+  if (eff.syncPlugins) groups.push({
+    name: 'prompts', strategy: 'merge',
+    sources: [{
+      from: join(roots.profiles, 'web', 'node_modules', 'dsh-preset-lite', 'cordis.patch.yml'),
+      to: 'prompts/preset-lite-cordis.patch.yml',
+      file: true,
+    }],
+  })
   // 知识库：单文件、按整文件比对。SQLite 是二进制，两侧都改会走冲突流程
   // （conflictMode: ai 由对齐步骤处理，失败则人工选边）；日常单端写入不会触发。
   if (eff.syncMemory) groups.push({
