@@ -815,7 +815,15 @@ async function readPromptBindings(home, titleToPath) {
       if (title && typeof preset === 'string') out[title] = preset
     }
     return Object.keys(out).length ? out : null
-  } catch { return null }
+  } catch (e) {
+    // 诊断：绑定读取失败原因（同步跑在宿主进程里，异常被吞就永远查不到）
+    try {
+      const fsx = require('node:fs')
+      const logp = join(dshHome(), 'logs', 'dsh-sync-init.log')
+      fsx.appendFileSync(logp, `${new Date().toISOString()} readPromptBindings FAILED: ${String(e && e.message || e)}\n`)
+    } catch {}
+    return null
+  }
 }
 
 async function applyPromptBindings(home, bindings, titleToPath) {
@@ -862,6 +870,11 @@ async function readWorkspaceOrder() {
     for (const w of Object.values(table)) if (w?.title && w.path) titleToPath.set(w.title, w.path)
     const bindings = await readPromptBindings(dshHome(), titleToPath)
     if (bindings) order.promptBindings = bindings
+    try {
+      const fsx = require('node:fs')
+      const logp = join(dshHome(), 'logs', 'dsh-sync-init.log')
+      fsx.appendFileSync(logp, `${new Date().toISOString()} readWorkspaceOrder promptBindings=${bindings ? Object.keys(bindings).length : 'null'}\n`)
+    } catch {}
   }
   const byTitle = new Set()
   // 先按 workspaceIds 顺序收（这就是显示顺序）
