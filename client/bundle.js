@@ -912,7 +912,7 @@ window.__ModuleLoader__.load({
                           h('span', { className: 'sk-spacer' }),
                           h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore')),
                       h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRename(s.name) }, t('snapshotRename')),
-                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doDelete(s.name) }, t('snapshotDelete')))))))),
+                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doDelete(s.name) }, t('snapshotDelete'))))))),
               h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                 h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
                 h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
