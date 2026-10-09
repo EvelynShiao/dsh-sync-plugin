@@ -965,6 +965,12 @@ async function readWorkspaceOrder() {
     order.workspaces.push(w.title)
     order.sessions[w.title] = Array.isArray(w.sessionIds) ? w.sessionIds.filter(s => typeof s === 'string') : []
   }
+  // 手动排序桥接：session-kit 客户端把浏览器 localStorage（官方不同步的手动顺序）
+  // 落在 $DSH_HOME/manual-order.json——嵌进 order 文件带上云，对端下载回写。
+  try {
+    const mo = JSON.parse(await fsP.readFile(join(dshHome(), 'manual-order.json'), 'utf8'))
+    if (mo && typeof mo === 'object' && mo.orderBy === 'manual') order.manualOrder = mo
+  } catch { /* 没有手动顺序文件=没桥接过，跳过 */ }
   return order
 }
 
@@ -1035,6 +1041,10 @@ async function applyWorkspaceOrder(order) {
     for (const w of Object.values(table)) if (w?.title && w.path) titleToPath.set(w.title, w.path)
     const br = await applyPromptBindings(dshHome(), order.promptBindings, titleToPath)
     if (br?.ok) bindingsChanged = br.changed || 0
+  }
+  // 手动排序桥接回写：云端顺序落成本机文件，session-kit 客户端下次加载种进浏览器
+  if (order.manualOrder && typeof order.manualOrder === 'object' && order.manualOrder.orderBy === 'manual') {
+    try { await atomicWriteFile(join(dshHome(), 'manual-order.json'), JSON.stringify(order.manualOrder)) } catch {}
   }
   if (!changed && bindingsChanged === 0) return { ok: true, changed: false }
   if (changed) {
