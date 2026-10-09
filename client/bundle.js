@@ -910,7 +910,7 @@ window.__ModuleLoader__.load({
                           h('span', { style: { fontSize: 12.5 } }, s.name),
                           h(Tag, { tone: s.inCloud ? 'accent' : undefined }, s.inCloud ? t('snapshotInCloud') : t('snapshotLocalOnly')),
                           h('span', { className: 'sk-spacer' }),
-                          h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore'),
+                          h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore')),
                       h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRename(s.name) }, t('snapshotRename')),
                       h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doDelete(s.name) }, t('snapshotDelete')))))))),
               h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
