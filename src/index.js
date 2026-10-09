@@ -1142,7 +1142,9 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     let baseBuf = null
     try { baseBuf = await gitShowBuf(binary, `${fileBase}:${p}`, repoDir) } catch { baseBuf = Buffer.alloc(0) }
     const untouched = liveBuf === null ? (baseBuf.length === 0) : Buffer.compare(liveBuf, baseBuf) === 0
-    if (!untouched) {
+    // prompts/（提示词文件）：云端为真源，下载无条件覆盖本地——用户要「下载即覆盖」。
+    // 本地改了没上传也会被云端版本盖掉（所以改完提示词记得先上传）。
+    if (!untouched && !p.startsWith('prompts/')) {
       // 本地动过 → 留给对齐/下个 push；基线按文件记账
       if (!state.pendingBoth[p]) state.pendingBoth[p] = fileBase
       skipped++
