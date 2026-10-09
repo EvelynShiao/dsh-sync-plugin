@@ -3061,9 +3061,12 @@ module.exports = {
               } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }); return }
               finally { release() }
             }
-            // 恢复前给当前状态拍安全快照
-            const safetyName = `pre-restore-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
-            await createLocalSnapshot(eff, safetyName)
+            // 恢复前给当前状态拍安全快照（opt-in：snapshotSafety===true 才建，用户不要自动快照）
+            let safetyName
+            if (eff.snapshotSafety === true) {
+              safetyName = `pre-restore-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
+              try { await createLocalSnapshot(eff, safetyName) } catch {}
+            }
             // 反向写回 live（快照里有哪些组就恢复哪些）
             const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
             const restored = []
