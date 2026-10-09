@@ -2310,6 +2310,14 @@ module.exports = {
           }
         }
       }
+      // 排序/绑定导出：上传按钮走本处理器（非 runPush），必须在此也重写 order 文件——
+      // 否则上传的是影子仓库里的陈旧版本（缺 promptBindings 等新字段，实测 2026-10-09）。
+      if (eff.syncOrder !== false) {
+        try {
+          const orderUp = await readWorkspaceOrder()
+          if (orderUp && orderUp.workspaces.length) await atomicWriteFile(join(repoDir, ORDER_FILE), JSON.stringify(orderUp, null, 2))
+        } catch (e) { try { ctx.logger?.warn?.('dsh-sync: order export(upload): ' + (e && e.message)) } catch {} }
+      }
       await gitExec(eff.gitBinary, ['add', '-A'], repoDir)
       let commitOk = false
       try {
