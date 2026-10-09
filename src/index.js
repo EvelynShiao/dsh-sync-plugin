@@ -791,6 +791,60 @@ async function ensureShadowRepo(binary, eff, repoDir) {
 // 应用时只重排数组、绝不增删条目、绝不碰标题/绑定/墓碑。
 const ORDER_FILE = 'workspace-order.json'
 
+/* 提示词工作区绑定（workspacePresets）同步。
+   存储真相：memory.sqlite → memory_settings → key='promptWorkshop' → JSON.workspacePresets。
+   键是各设备绝对路径（PC: C:\...\work\学习；手机: /root/.dsh/work/学习）→ 直接同步永远
+   匹配不上（同会话项目目录的跨设备路径键问题）。所以导出时把路径翻译成工作区标题
+   （可移植），下载时再翻译回本机路径写进本机 memory.sqlite。
+   session-kit 把绑定缓存在内存（只开机读一次 memory.sqlite）→ 写完文件需重启才生效。 */
+const memorySqlitePath = (home) => join(home, 'profiles', 'web', '.dsh-session-kit', 'memory.sqlite')
+const titleFromPath = (p) => String(p ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || null
+
+async function readPromptBindings(home, titleToPath) {
+  try {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(memorySqlitePath(home), { readOnly: true })
+    let row = null
+    try { row = db.prepare("SELECT value FROM memory_settings WHERE key = 'promptWorkshop'").get() } finally { db.close() }
+    if (!row?.value) return null
+    const wp = JSON.parse(row.value)?.workspacePresets
+    if (!wp || typeof wp !== 'object') return null
+    const out = {}
+    for (const [path, preset] of Object.entries(wp)) {
+      const title = titleFromPath(path)
+      if (title && typeof preset === 'string') out[title] = preset
+    }
+    return Object.keys(out).length ? out : null
+  } catch { return null }
+}
+
+async function applyPromptBindings(home, bindings, titleToPath) {
+  if (!bindings || typeof bindings !== 'object') return { ok: true, changed: 0 }
+  let changed = 0
+  try {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(memorySqlitePath(home))
+    try {
+      let row = null
+      try { row = db.prepare("SELECT value FROM memory_settings WHERE key = 'promptWorkshop'").get() } catch {}
+      const j = row?.value ? JSON.parse(row.value) : {}
+      const wp = { ...(j.workspacePresets ?? {}) }
+      for (const [title, preset] of Object.entries(bindings)) {
+        const localPath = titleToPath.get(title)
+        if (!localPath || typeof preset !== 'string') continue
+        if (wp[localPath] !== preset) { wp[localPath] = preset; changed++ }
+      }
+      if (changed > 0) {
+        j.workspacePresets = wp
+        db.prepare("INSERT INTO memory_settings (key, value, updated_at) VALUES ('promptWorkshop', ?, ?) " +
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+          .run(JSON.stringify(j), Date.now())
+      }
+    } finally { db.close() }
+  } catch { return { ok: false, changed: 0 } }
+  return { ok: true, changed }
+}
+
 async function readWorkspaceOrder() {
   const wsPath = join(dshHome(), 'storages', 'workspace.json')
   let doc
@@ -802,6 +856,13 @@ async function readWorkspaceOrder() {
   // 归档/置顶标记也同步（会话 id 可跨设备移植），让一台设备归档/置顶能带到其他设备
   order.archived = Array.isArray(doc?.global?.archivedSessionIds) ? doc.global.archivedSessionIds.filter((s) => typeof s === 'string') : []
   order.pinned = Array.isArray(doc?.global?.pinnedSessionIds) ? doc.global.pinnedSessionIds.filter((s) => typeof s === 'string') : []
+  // 提示词工作区绑定：路径键 → 标题键（跨设备可移植）
+  {
+    const titleToPath = new Map()
+    for (const w of Object.values(table)) if (w?.title && w.path) titleToPath.set(w.title, w.path)
+    const bindings = await readPromptBindings(dshHome(), titleToPath)
+    if (bindings) order.promptBindings = bindings
+  }
   const byTitle = new Set()
   // 先按 workspaceIds 顺序收（这就是显示顺序）
   for (const id of wsIds) {
@@ -874,12 +935,23 @@ async function applyWorkspaceOrder(order) {
   }
   mergeFlagList('archivedSessionIds', order.archived)
   mergeFlagList('pinnedSessionIds', order.pinned)
-  if (!changed) return { ok: true, changed: false }
-  try {
-    await fsP.copyFile(wsPath, wsPath + '.bak-order')
-    await atomicWriteFile(wsPath, JSON.stringify(doc, null, 2))
-  } catch (e) { return { ok: false, error: 'write-failed: ' + String(e?.message ?? e) } }
-  return { ok: true, changed: true, sessions: sessReordered }
+  // 提示词工作区绑定：标题键 → 本机路径键，写进本机 memory.sqlite（session-kit 缓存在
+  // 内存，需重启才生效——这是宿主设计，文件层面已同步到位）
+  let bindingsChanged = 0
+  if (order.promptBindings && typeof order.promptBindings === 'object') {
+    const titleToPath = new Map()
+    for (const w of Object.values(table)) if (w?.title && w.path) titleToPath.set(w.title, w.path)
+    const br = await applyPromptBindings(dshHome(), order.promptBindings, titleToPath)
+    if (br?.ok) bindingsChanged = br.changed || 0
+  }
+  if (!changed && bindingsChanged === 0) return { ok: true, changed: false }
+  if (changed) {
+    try {
+      await fsP.copyFile(wsPath, wsPath + '.bak-order')
+      await atomicWriteFile(wsPath, JSON.stringify(doc, null, 2))
+    } catch (e) { return { ok: false, error: 'write-failed: ' + String(e?.message ?? e) } }
+  }
+  return { ok: true, changed: true, sessions: sessReordered, bindings: bindingsChanged }
 }
 
 // ── 清残留 git index.lock ──
