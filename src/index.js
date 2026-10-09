@@ -1920,7 +1920,11 @@ module.exports = {
     const createLocalSnapshot = async (eff, name) => {
       const spec = snapshotMirrorSpec(eff, defaultRoots(), state.instanceId, name)
       await mirrorLiveToShadow(spec, syncDir)
-      return join(syncDir, 'snapshots', name)
+      // 写一份时间戳元数据：列表读它显示创建时间，不依赖文件系统 birthtime
+      //（birthtime 在拷贝/同步后会变，跨设备也不一致）。
+      const snapDir = join(syncDir, 'snapshots', name)
+      try { await fsP.writeFile(join(snapDir, '.snap-created'), new Date().toISOString(), 'utf8') } catch { /* 元数据失败不影响快照 */ }
+      return snapDir
     }
 
     // ── Sync run: lock → push → pull → save ──
@@ -1981,7 +1985,9 @@ module.exports = {
             }
           }
           // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）
-          if (eff.snapshotAuto !== false) {
+          // opt-in：只有显式 snapshotAuto===true 才跑。原来 `!== false` 会把
+          // undefined（配置没持久化）也当开 → 删快照/任何同步都冒出 auto 快照。
+          if (eff.snapshotAuto === true) {
             const today = new Date().toISOString().slice(0, 10)
             if (state.lastAutoSnapshotDate !== today) {
               try {
@@ -2837,11 +2843,22 @@ module.exports = {
             await stateLoaded
             const dir = join(syncDir, 'snapshots')
             const local = []
+            // 创建时间：①元数据文件（创建时写，最可靠）②名字里内嵌的 ISO 时间戳
+            // ③目录 mtime。不用 birthtime——拷贝/同步后会变，跨设备不一致。
+            const tsFromName = (n) => {
+              const m = String(n).match(/(\d{4}-\d{2}-\d{2})[T_](\d{2})[-:](\d{2})[-:](\d{2})/)
+              if (m) { const d = new Date(`${m[1]}T${m[2]}:${m[3]}:${m[4]}`); if (!isNaN(d)) return d.toISOString() }
+              const d2 = String(n).match(/(\d{4}-\d{2}-\d{2})/)
+              if (d2) { const d = new Date(`${d2[1]}T00:00:00`); if (!isNaN(d)) return d.toISOString() }
+              return undefined
+            }
             try {
               for (const ent of await fsP.readdir(dir, { withFileTypes: true })) {
                 if (!ent.isDirectory()) continue
                 let created = undefined
-                try { created = (await fsP.stat(join(dir, ent.name))).birthtime.toISOString() } catch {}
+                try { created = (await fsP.readFile(join(dir, ent.name, '.snap-created'), 'utf8')).trim() || undefined } catch {}
+                if (!created || isNaN(new Date(created))) created = tsFromName(ent.name)
+                if (!created) { try { created = (await fsP.stat(join(dir, ent.name))).mtime.toISOString() } catch {} }
                 local.push({ name: ent.name, created, inCloud: (state.cloudSnapshots || []).includes(ent.name) })
               }
             } catch {}
