@@ -965,11 +965,20 @@ async function readWorkspaceOrder() {
     order.workspaces.push(w.title)
     order.sessions[w.title] = Array.isArray(w.sessionIds) ? w.sessionIds.filter(s => typeof s === 'string') : []
   }
-  // 手动排序桥接：session-kit 客户端把浏览器 localStorage（官方不同步的手动顺序）
-  // 落在 $DSH_HOME/manual-order.json——嵌进 order 文件带上云，对端下载回写。
+  // 手动排序桥接：嵌 order 文件带上云。两处关键（2026-10-10 手机实测）：
+  // ① 文件新形状是 {savedAt,value}，老读法取不到 orderBy 会静默不导出；
+  // ② 组键是各设备工作区 UUID（PC 的 db0b60f9 = 手机的 022195f6，同工作区不同键！）
+  //    原样拷贝对端永远匹配不上——导出时翻译成标题（可移植），对端下载时翻回本机 id。
   try {
     const mo = JSON.parse(await fsP.readFile(join(dshHome(), 'manual-order.json'), 'utf8'))
-    if (mo && typeof mo === 'object' && mo.orderBy === 'manual') order.manualOrder = mo
+    const raw = mo && typeof mo === 'object' && mo.value !== undefined ? mo.value : mo
+    if (raw && typeof raw === 'object' && raw.orderBy === 'manual' && raw.sessionOrderByAccount) {
+      const id2t = new Map()
+      for (const id of (doc?.global?.workspaceIds ?? [])) { const t = table?.[id]?.title; if (t) id2t.set(id, t) }
+      const translated = {}
+      for (const [k, arr] of Object.entries(raw.sessionOrderByAccount)) translated[id2t.get(k) ?? k] = arr
+      order.manualOrder = { ...raw, sessionOrderByAccount: translated }
+    }
   } catch { /* 没有手动顺序文件=没桥接过，跳过 */ }
   return order
 }
@@ -1042,12 +1051,13 @@ async function applyWorkspaceOrder(order, ctx) {
   // 直接改 workspace.json 文件宿主永远看不见（还会被它的下次 setState 用旧内存盖掉）——
   // 这就是「文件对了但界面要重启才同步」的根因。走 registry 正规写入（内存+文件
   // 原子生效、事件推送客户端即时刷新），失败才降级老的文件直写。
+  let viaRegistry = null
   if (ctx && typeof ctx.inject === 'function') {
     try {
       let reg = null
       await ctx.inject(['workspaceRegistry'], async (svcs) => { reg = svcs?.workspaceRegistry ?? null })
       if (reg && typeof reg.list === 'function' && typeof reg.setState === 'function') {
-        return await applyWorkspaceOrderViaRegistry(reg, order)
+        viaRegistry = await applyWorkspaceOrderViaRegistry(reg, order)
       }
     } catch (e) { try { ctx.logger?.warn?.('dsh-sync: order via registry 失败，降级文件写: ' + (e && e.message)) } catch {} }
   }
@@ -1120,7 +1130,17 @@ async function applyWorkspaceOrder(order, ctx) {
   // 手动排序桥接回写：云端顺序落成本机文件，session-kit 客户端按「savedAt 新者胜」种进浏览器。
   // savedAt=下载时刻（比两台设备各自的上次推送都新）→ 对端浏览器下次加载必然采纳。
   if (order.manualOrder && typeof order.manualOrder === 'object' && order.manualOrder.orderBy === 'manual') {
-    try { await atomicWriteFile(join(dshHome(), 'manual-order.json'), JSON.stringify({ savedAt: Date.now(), value: order.manualOrder })) } catch {}
+    try {
+      const t2id = new Map()
+      for (const [id, w] of Object.entries(table ?? {})) if (w?.title) t2id.set(w.title, id)
+      const sess2 = {}
+      for (const [k, arr] of Object.entries(order.manualOrder.sessionOrderByAccount ?? {})) sess2[t2id.get(k) ?? k] = arr
+      const value = { ...order.manualOrder, sessionOrderByAccount: sess2 }
+      await atomicWriteFile(join(dshHome(), 'manual-order.json'), JSON.stringify({ savedAt: Date.now(), value }))
+    } catch {}
+  }
+  if (viaRegistry && viaRegistry.ok) {
+    return { ...viaRegistry, bindings: bindingsChanged }
   }
   if (!changed && bindingsChanged === 0) return { ok: true, changed: false }
   if (changed) {
