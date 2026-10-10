@@ -974,8 +974,72 @@ async function readWorkspaceOrder() {
   return order
 }
 
-async function applyWorkspaceOrder(order) {
+/** 经 registry 应用顺序：global（workspaceIds/archived/pinned）一次 setState，
+ *  每个工作区 sessionIds 走 entity.mutate（官方表写，带 sessionPath 过滤语义）。 */
+async function applyWorkspaceOrderViaRegistry(reg, order) {
+  const state = reg.requireState()
+  // 工作区顺序
+  const idByTitle = new Map()
+  for (const id of state.workspaceIds) {
+    const ent = reg.get(id)
+    const t = ent?.title
+    if (typeof t === 'string' && !idByTitle.has(t)) idByTitle.set(t, id)
+  }
+  const orderedIds = []
+  for (const t of order.workspaces) { const id = idByTitle.get(t); if (id && !orderedIds.includes(id)) orderedIds.push(id) }
+  const newWsIds = [...orderedIds, ...state.workspaceIds.filter((id) => !orderedIds.includes(id))]
+  const wsChanged = newWsIds.length === state.workspaceIds.length && newWsIds.some((v, i) => v !== state.workspaceIds[i])
+  // 归档/置顶：并集 + 只保留本机确实存在的（sessionKnown 权威判定，防幽灵）
+  const localKnown = (id) => { try { return typeof reg.sessionKnown === 'function' ? reg.sessionKnown(id) === true : false } catch { return false } }
+  const mergeFlag = (key) => {
+    const remote = order[key]
+    if (!Array.isArray(remote) || remote.length === 0) return state[key]
+    const cur = Array.isArray(state[key]) ? state[key] : []
+    const merged = [...new Set([...cur, ...remote])].filter((id) => cur.includes(id) || localKnown(id))
+    return merged.length === cur.length && merged.every((v, i) => v === cur[i]) ? cur : merged
+  }
+  const newArchived = mergeFlag('archived')
+  const newPinned = mergeFlag('pinned')
+  const flagChanged = newArchived !== state.archivedSessionIds || newPinned !== state.pinnedSessionIds
+  if (wsChanged || flagChanged) {
+    await reg.enqueueOperation(() => reg.setState({ ...state, workspaceIds: newWsIds, archivedSessionIds: newArchived, pinnedSessionIds: newPinned }))
+  }
+  // 会话顺序（每个工作区一次表写）
+  let sessReordered = 0
+  for (const id of newWsIds) {
+    const ent = reg.get(id)
+    if (!ent) continue
+    const want = order.sessions?.[ent.title]
+    if (!Array.isArray(want)) continue
+    const cur = ent.sessionIds
+    const known = want.filter((s) => cur.includes(s))
+    if (!known.length) continue
+    const rest = cur.filter((s) => !known.includes(s))
+    const newS = [...known, ...rest]
+    if (newS.length === cur.length && newS.every((v, i) => v === cur[i])) continue
+    await ent.mutate((record) => record.sessionIds.length === newS.length && record.sessionIds.every((v, i) => v === newS[i])
+      ? record
+      : { ...record, sessionIds: newS })
+    sessReordered++
+  }
+  return { ok: true, changed: wsChanged || flagChanged || sessReordered > 0, sessions: sessReordered, via: 'registry' }
+}
+
+async function applyWorkspaceOrder(order, ctx) {
   if (!order || !Array.isArray(order.workspaces) || typeof order.sessions !== 'object') return { ok: false, error: 'invalid-order' }
+  // ── registry 快路径（2026-10-10 手机实测定案）：存储层是纯内存读、写才落盘，
+  // 直接改 workspace.json 文件宿主永远看不见（还会被它的下次 setState 用旧内存盖掉）——
+  // 这就是「文件对了但界面要重启才同步」的根因。走 registry 正规写入（内存+文件
+  // 原子生效、事件推送客户端即时刷新），失败才降级老的文件直写。
+  if (ctx && typeof ctx.inject === 'function') {
+    try {
+      let reg = null
+      await ctx.inject(['workspaceRegistry'], async (svcs) => { reg = svcs?.workspaceRegistry ?? null })
+      if (reg && typeof reg.list === 'function' && typeof reg.setState === 'function') {
+        return await applyWorkspaceOrderViaRegistry(reg, order)
+      }
+    } catch (e) { try { ctx.logger?.warn?.('dsh-sync: order via registry 失败，降级文件写: ' + (e && e.message)) } catch {} }
+  }
   const wsPath = join(dshHome(), 'storages', 'workspace.json')
   let doc
   try { doc = JSON.parse(await fsP.readFile(wsPath, 'utf8')) } catch { return { ok: false, error: 'workspace.json-unreadable' } }
@@ -2724,7 +2788,7 @@ module.exports = {
         try {
           const orderBuf = await fsP.readFile(join(repoDir, ORDER_FILE)).catch(() => null)
           if (orderBuf) {
-            const orderRes = await applyWorkspaceOrder(JSON.parse(orderBuf.toString('utf8')))
+            const orderRes = await applyWorkspaceOrder(JSON.parse(orderBuf.toString('utf8')), ctx)
             if (orderRes?.ok && orderRes.changed) {
               applied.push(`workspace-order（重排 ${orderRes.sessions} 个工作区的会话顺序）`)
               try { ctx.logger?.info?.('dsh-sync: workspace order applied') } catch {}
