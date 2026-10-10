@@ -990,16 +990,22 @@ async function applyWorkspaceOrderViaRegistry(reg, order) {
   const newWsIds = [...orderedIds, ...state.workspaceIds.filter((id) => !orderedIds.includes(id))]
   const wsChanged = newWsIds.length === state.workspaceIds.length && newWsIds.some((v, i) => v !== state.workspaceIds[i])
   // 归档/置顶：并集 + 只保留本机确实存在的（sessionKnown 权威判定，防幽灵）
-  const localKnown = (id) => { try { return typeof reg.sessionKnown === 'function' ? reg.sessionKnown(id) === true : false } catch { return false } }
-  const mergeFlag = (key) => {
+  const localKnownCache = new Set(Array.isArray(state.archivedSessionIds) ? state.archivedSessionIds : [])
+  const localKnown = async (id) => {
+    if (localKnownCache.has(id)) return true
+    try { return typeof reg.sessionKnown === 'function' ? (await reg.sessionKnown(id)) === true : false } catch { return false }
+  }
+  const mergeFlag = async (key) => {
     const remote = order[key]
     if (!Array.isArray(remote) || remote.length === 0) return state[key]
     const cur = Array.isArray(state[key]) ? state[key] : []
-    const merged = [...new Set([...cur, ...remote])].filter((id) => cur.includes(id) || localKnown(id))
+    const keep = []
+    for (const id of new Set([...cur, ...remote])) keep.push(cur.includes(id) || (await localKnown(id)) ? id : null)
+    const merged = keep.filter((id) => id !== null)
     return merged.length === cur.length && merged.every((v, i) => v === cur[i]) ? cur : merged
   }
-  const newArchived = mergeFlag('archived')
-  const newPinned = mergeFlag('pinned')
+  const newArchived = await mergeFlag('archived')
+  const newPinned = await mergeFlag('pinned')
   const flagChanged = newArchived !== state.archivedSessionIds || newPinned !== state.pinnedSessionIds
   if (wsChanged || flagChanged) {
     await reg.enqueueOperation(() => reg.setState({ ...state, workspaceIds: newWsIds, archivedSessionIds: newArchived, pinnedSessionIds: newPinned }))
@@ -1022,7 +1028,12 @@ async function applyWorkspaceOrderViaRegistry(reg, order) {
       : { ...record, sessionIds: newS })
     sessReordered++
   }
-  return { ok: true, changed: wsChanged || flagChanged || sessReordered > 0, sessions: sessReordered, via: 'registry' }
+  const result = { ok: true, changed: wsChanged || flagChanged || sessReordered > 0, sessions: sessReordered, via: 'registry', wsChanged, flagChanged }
+  try {
+    const fsx = await import('node:fs')
+    fsx.appendFileSync(dshHome() + '/logs/dsh-sync-init.log', new Date().toISOString() + ' orderViaRegistry ws=' + wsChanged + ' sess=' + sessReordered + ' flag=' + flagChanged + '\n')
+  } catch {}
+  return result
 }
 
 async function applyWorkspaceOrder(order, ctx) {
@@ -1106,9 +1117,10 @@ async function applyWorkspaceOrder(order, ctx) {
     const br = await applyPromptBindings(dshHome(), order.promptBindings, titleToPath)
     if (br?.ok) bindingsChanged = br.changed || 0
   }
-  // 手动排序桥接回写：云端顺序落成本机文件，session-kit 客户端下次加载种进浏览器
+  // 手动排序桥接回写：云端顺序落成本机文件，session-kit 客户端按「savedAt 新者胜」种进浏览器。
+  // savedAt=下载时刻（比两台设备各自的上次推送都新）→ 对端浏览器下次加载必然采纳。
   if (order.manualOrder && typeof order.manualOrder === 'object' && order.manualOrder.orderBy === 'manual') {
-    try { await atomicWriteFile(join(dshHome(), 'manual-order.json'), JSON.stringify(order.manualOrder)) } catch {}
+    try { await atomicWriteFile(join(dshHome(), 'manual-order.json'), JSON.stringify({ savedAt: Date.now(), value: order.manualOrder })) } catch {}
   }
   if (!changed && bindingsChanged === 0) return { ok: true, changed: false }
   if (changed) {
