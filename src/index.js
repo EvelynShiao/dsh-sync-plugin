@@ -1177,6 +1177,58 @@ function scanZstdFrames(buf) {
   idx.push(buf.length)
   return idx
 }
+
+// ── 会话落地完整性门（2026-10-11 4ce9464e 缺口事故复盘）──────────────────
+// 远端会话字节写进 live 之前，先按宿主 gateway 的两条硬规则验一遍：
+//   ① seq 必须自 0 起密集连续（缺一条即 "released v2 row has seq gap"）
+//   ② assistant/attempt|assistant/message 的 settlement（turn/step 整数 + stream 数组）齐全
+//      （缺一条即 "seed assistant/attempt has invalid settlement fields"）
+// 两条各对应一次真实事故（34da settlement、4ce seq 断口）。坏文件不拒收也不盖权威：
+// 落进 sessions/--quarantine--/（未分组形态，宿主不会加载），附 .why.json 记病因，
+// 本机权威副本分毫不动，病样本照样到达本机供排查。返回 true=放行，false=已隔离。
+async function gateSessionPayload(livePath, buf, logger) {
+  if (!livePath.endsWith('session.v4.jsonl.zstd')) return true
+  const problems = []
+  try {
+    const zlib = require('node:zlib')
+    const idx = scanZstdFrames(buf)
+    if (idx.length < 2) { problems.push('不是多帧 zstd 会话文件') } else {
+      const lines = []
+      for (let i = 0; i < idx.length - 1 && problems.length < 5; i++) {
+        try { lines.push(...zlib.zstdDecompressSync(buf.subarray(idx[i], idx[i + 1])).toString('utf8').split('\n').filter(Boolean)) }
+        catch (e) { problems.push('帧' + i + '解压失败: ' + String(e && e.message)) }
+      }
+      const evs = []
+      for (const l of lines) {
+        let e = null
+        try { e = JSON.parse(l) } catch { problems.push('存在非 JSON 行'); break }
+        if (e && e.type === 'session' && e.seq === undefined) continue   // 头行不参与 seq 序列
+        evs.push(e)
+      }
+      for (let i = 0; i < evs.length && problems.length < 5; i++) {
+        const e = evs[i]
+        if (!e || typeof e.seq !== 'number' || e.seq !== i) problems.push('seq 断口@行位 ' + i + ': ' + (e && e.seq))
+        else if (e.type === 'assistant/attempt' || e.type === 'assistant/message') {
+          const d = e.data || {}
+          if (!Number.isInteger(d.turn) || !Number.isInteger(d.step) || !Array.isArray(d.stream)) problems.push(e.type + '@' + e.seq + ' settlement 不全')
+        }
+      }
+    }
+  } catch (e) { problems.push('校验异常: ' + String(e && e.message)) }
+  if (problems.length === 0) return true
+  try {
+    const tail = livePath.replace(/[\\/]session\.v4\.jsonl\.zstd$/, '')
+    const wsDir = tail.slice(0, tail.lastIndexOf(sep))
+    const sessionsRoot = wsDir.slice(0, wsDir.lastIndexOf(sep))
+    const qPath = join(sessionsRoot, '--quarantine--', relative(sessionsRoot, livePath))
+    await fsP.mkdir(join(qPath, '..'), { recursive: true })
+    await fsP.writeFile(qPath, buf)
+    await fsP.writeFile(qPath + '.why.json', JSON.stringify({ at: new Date().toISOString(), from: livePath, problems }, null, 2))
+  } catch (e) { problems.push('隔离写入失败: ' + String(e && e.message)) }
+  try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] integrity gate: 隔离 ' + livePath + ' → ' + problems[0]) } catch {}
+  return false
+}
+
 async function normalizeDownloadedSessions(home) {
   const zlib = require('node:zlib')
   const sessionsRoot = join(home, 'sessions')
@@ -1202,6 +1254,7 @@ async function normalizeDownloadedSessions(home) {
   }
   for (const ws of wsNames) {
     if (authDirs.has(ws)) continue   // 本机权威目录不动
+    if (ws === '--quarantine--') continue   // 完整性门隔离区永不再晋升（病样本只进不出）
     let sess = []
     try { sess = (await fsP.readdir(join(sessionsRoot, ws), { withFileTypes: true })).filter((d) => d.isDirectory()) } catch { continue }
     for (const s of sess) {
@@ -1228,6 +1281,11 @@ async function normalizeDownloadedSessions(home) {
       const newHeader = zlib.zstdCompressSync(Buffer.from(JSON.stringify(header) + '\n', 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
       const newBuf = Buffer.concat([newHeader, buf.subarray(frameEnd)])
       const destDir = join(sessionsRoot, encodeWorkspaceDir(localPath), s.name)
+      // 晋升前同样过门：外来会话改写 cwd 后就是权威文件，坏字节在这里落会直接顶掉本机真身
+      if (!await gateSessionPayload(join(destDir, 'session.v4.jsonl.zstd'), newBuf)) {
+        try { await fsP.rename(join(sessionsRoot, ws, s.name), join(await bk(), ws + '__' + s.name + '.bad')) } catch {}
+        continue
+      }
       try {
         await fsP.mkdir(destDir, { recursive: true })
         await fsP.writeFile(join(destDir, 'session.v4.jsonl.zstd'), newBuf)
@@ -1421,6 +1479,7 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       continue
     }
     delete state.pendingBoth[p]
+    if (!await gateSessionPayload(livePath, remoteBuf, logger)) { skipped++; continue }
     try {
       await atomicWriteFile(livePath, remoteBuf)
       applied++
@@ -1541,7 +1600,9 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
     // 覆盖·远端为准：无条件镜像远端（含本地改过的文件），不进冲突流程
     if (strategy === 'remote') {
       delete state.pendingBoth[p]
-      try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
+      if (await gateSessionPayload(livePath, remoteBuf, logger)) {
+        try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
+      }
       continue
     }
     // 未解决文件的基线固定在首次发现冲突时的 commit，其余文件跟随 lastSynced
@@ -1560,6 +1621,7 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
       continue
     }
     delete state.pendingBoth[p]
+    if (!await gateSessionPayload(livePath, remoteBuf, logger)) continue
     try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
   }
   // 长期挂着的销账清理：不在本轮变更集里且 live 已与远端一致
@@ -1889,6 +1951,7 @@ async function applyRemotePullPlan(binary, eff, { repoDir, state, roots }, plan)
       const remoteBuf = await gitShowBuf(binary, `${BROWSE_REF}:${p.remotePath}`, repoDir)
       const livePath = resolveLivePath(spec, p.logicalPath)
       if (!livePath) { failed.push({ path: p.remotePath, error: '无法映射到 live 路径' }); continue }
+      if (!await gateSessionPayload(livePath, remoteBuf)) { failed.push({ path: p.remotePath, error: '完整性门隔离（见 sessions/--quarantine--/）' }); continue }
       await atomicWriteFile(livePath, remoteBuf)
       applied.push(p.remotePath)
     } catch (e) { failed.push({ path: p.remotePath, error: String(e && e.message) }) }
@@ -2187,6 +2250,8 @@ module.exports = {
   __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
+    // 完整性门（导出供测试：好/坏样本回归）
+    gateSessionPayload, scanZstdFrames,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
