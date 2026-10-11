@@ -1,109 +1,54 @@
-# dsh-sync（带知识库同步补丁）
+# dsh-sync-plugin（多设备同步，深度改造版）
 
-这是 `@weibaohui/dsh-sync` 的分叉版，在原版基础上新增第 5 个同步组：知识库 `knowledge.sqlite`。
+给 DSH 做 PC ↔ 手机（DSHA）数据同步的插件。本仓库是自用深度改造版，**不是原作者版本的镜像**——原作者的骨架还在，但行为按"下载即覆盖、跨设备兼容"重写过多轮。以下全部是本版的机制，忘光了看这里就行。
 
-## 为什么需要它
+## 仓库地址
 
-原版只同步四类：`syncSkills` / `syncSessions` / `syncSettings` / `syncPlugins`，
-**知识库不在其中** —— 电脑上整理好的知识库传不到手机。
+- GitCode（主用）：`gitcode.com/gcw_wXIDw07q/dsh-sync-plugin`
+- GitHub：`github.com/EvelynShiao/dsh-sync-plugin`
 
-## 补丁清单（7 处，全部在 `src/index.js`）
+## 同步哪些东西
 
-| # | 位置 | 改动 |
-|---|---|---|
-| 1 | 默认设置 | 新增 `syncKnowledge: true` |
-| 2 | 默认设置 | 新增 `knowledgeStrategy: 'merge'` |
-| 3 | 设置 schema | 新增 `syncKnowledge` 与 `knowledgeStrategy` 两个字段 |
-| 4 | `defaultRoots()` | 新增 knowledge 路径指向 DSH_HOME 下的 knowledge.sqlite |
-| 5 | `syncSpec()` | 新增 knowledgeStrategy 策略解析 |
-| 6 | `syncSpec()` | 新增第 5 个同步组（单文件模式） |
-| 7 | 配置层 | `cordis.patch.yml` 需加 `syncKnowledge: true` |
+按"组"组织，每组独立开关与策略：
 
-生成的同步组：
+- **skills**：`~/.agents/skills` + 锁文件，standalone（各机独立备份）
+- **sessions**：会话文件（merge 共享），**只传真会话**（目录名带 `session-` 前缀的才上传，子代理会话目录不带前缀、不同步）
+- **settings.yaml**：standalone
+- **plugins**：只存声明文件（package.json / cordis.patch.yml / pnpm-lock.yaml），**不含 node_modules**（按机重装），standalone
+- **prompts**：`dsh-preset-lite/cordis.patch.yml`（提示词版本的真身）单独一组走 merge 共享路径——它在 node_modules 下、被 plugins 组排除，不单拎出来手机永远收不到提示词
+- **memory**：session-kit 的 `memory.sqlite`（记忆 + 提示词版本/绑定，见下），merge
+- **knowledge**：`knowledge.sqlite`，merge
 
-```
-组 [knowledge] 策略=merge
-     <DSH_HOME>/knowledge.sqlite  ->  knowledge/knowledge.sqlite   (单文件)
-```
+## 本版重写过的核心行为（为什么和原版不一样）
 
-## 为什么用 merge 而不是 standalone
+**1. 上传 = 覆盖云端、下载 = 覆盖本地（配置类）**
+原版是"增量合并"，本地改过的文件下载时跳过留冲突。本版给 skills/settings/plugins/prompts 四组加了 `overwriteOnDownload`：下载时整组强制镜像（`reset --hard FETCH_HEAD` 后按远端为准删改），云端是真源。会话组仍 merge（正在写的对话不能被覆盖）；memory/knowledge 仍 merge（SQLite 有打开句柄，硬覆盖会坏库）。上传方向本就是全量镜像（`mirrorLiveToShadow` 先删影子再拷）。**代价：改完提示词/配置要先上传，再下载别的，否则没传的改动会被云端盖掉。**
 
-- `merge` → 顶层共享路径 `knowledge/knowledge.sqlite`，两端都能读
-- `standalone` → `backup/<设备实例>/...`，各机各存各的，手机读不到
+**2. 跨设备路径键归一化（手机能用的关键）**
+会话项目目录由 `header.cwd` 派生，而 cwd 是各设备绝对路径：PC 的 `--C-Users-...` 与手机的 `--root-...` 是两个目录 → 同一会话在云端存成两份 → 宿主报 `duplicate JSONL session id` 拒绝加载。本版下载收尾做了归一化：外来会话按 cwd 的文件夹名匹配本地 workspace，把 header.cwd 改写成本机路径、搬进本机目录（zstd 多帧文件只重写帧 0，事件不动）；本机已有同 id 的，外来副本入备份。另有 `dedupeSessionDirs` 兜底。
 
-## 已知限制
+**3. 提示词版本 + 工作区绑定 + 手动排序的同步**
+- 真相在 `memory.sqlite` 的 `memory_settings` 表 key=`promptWorkshop`（versions + workspacePresets + autoApply）。preset 文件只是投影（session-kit 开机按 versions 重写它），只同步文件永远没用——版本列表必须跟着走。
+- 绑定的键是各设备绝对路径 → 导出时翻译成工作区**标题**（可移植），下载时翻回本机路径写进 memory.sqlite。**重启后 session-kit 生效**（它开机读一次）。
+- 手动排序：官方 UI 的手动顺序只存浏览器 localStorage（`dsh.workspace.view.v5`），官方从不跨设备同步。本版由 session-kit 客户端桥接（钩 setItem 防抖上传 + 无序时从服务端种子），sync 把 `$DSH_HOME/manual-order.json` 嵌进 `workspace-order.json`（order 文件字段：workspaces 顺序、各工作区 sessions 顺序、archived/pinned、promptBindings、promptWorkshop、manualOrder）带上云。
 
-1. **SQLite 是二进制**，两端同时改会进入冲突流程（`conflictMode: ai` 由对齐步骤处理，失败则人工选边）。日常单端写入不会触发。
-2. 库是 `journal_mode = delete`（非 WAL），单文件拷贝安全 —— 这是本补丁成立的前提。
-3. 必须在 `cordis.patch.yml` 的 config.sync 下加 `syncKnowledge: true` 才生效。
+**4. 快照不再自动乱建**
+原版每次下载建 `pre-download-` 安全快照、每次恢复建 `pre-restore-`，越积越多。本版三种安全快照（pre-download / pre-restore / pre-remote-pull）+ 每日自动快照全部 **opt-in**（配置 `snapshotSafety: true` 才建）。快照时间戳改用 `.snap-created` 元数据 + 名字解析（按 UTC，UI 转本地显示），不再用文件系统 birthtime（拷贝后会变）。快照列表带重命名/删除按钮。
 
-## 版本
+**5. 健壮性修补**
+- 上传按钮走的是独立函数（非 runPush），开头清残留 `index.lock`（上次上传被强杀会留下锁，之后 git add 必报错）——自动恢复，不用手动删文件
+- 上传处理器的 `git add -A` 前重写 order 文件（否则传的是影子仓库里的陈旧版本）
+- 下载完成后**无条件刷新会话列表**（新会话不用重启就能看到）+ 触发投影预热
+- sessions 组上传前按"总字节数:文件数"签名跳过未变组（skills 76MB 收益最大）
+- 会话归档标记（archivedSessionIds / pinnedSessionIds）也随 order 文件并集同步（只保留本机真实存在的 id，防幽灵墓碑）
 
-`9999999.9.9` —— 故意写死，让更新检查器认为已是最新，**不要用原版覆盖掉这个补丁**。
+## 配置速查（cordis.patch.yml 里 dsh-sync 段）
 
-## 上游
+`repoUrl` / `token` / `branch` / 各组 syncXxx 开关 / 各组 Strategy（standalone=各机独立备份、merge=共享）/ `syncOrder`（顺序文件开关）/ `snapshotAuto` / `snapshotSafety` / `snapshotLocalKeep` / `uploadOverwrite`
 
-npm: `@weibaohui/dsh-sync` · 原作者 MIT 许可。本分叉只改同步组，不改冲突处理与快照机制。
+## 踩坑备忘
 
-
-## 2026-09-30 修复（第二批）
-
-起因：手机端点「下载」提示成功，实际影子仓库没更新，知识库没落地；同时新装插件被关。
-
-| # | 缺陷 | 修复 |
-|---|---|---|
-| 1 | 上次被强杀留下的 `index.lock` 导致 `reset --hard` 失败，而失败被 `.catch(()=>{})` 吞掉 | **下载入口先自检残留锁**（超 5 分钟自动清理并告警，未超时则抛出可读错误） |
-| 2 | `reset` / `checkout` 失败静默 → 界面照报「下载完成」 | **失败改为上抛**，错误信息带原因 |
-| 3 | `if (!haveSource) continue` 分不清「本机没装」和「仓库没拉到」 | **改为写入 `skipped[]` 并随返回值上抛**，界面能看到被跳过项 |
-| 4 | `plugins`/`settings`/`skills`（standalone）下载时拿**本机自己的旧备份**覆盖 live → 新装插件消失 | **standalone 组下载时跳过**（路径以 `backup/` 开头的一律不覆盖），恢复走快照还原或「远端浏览 → 远端对齐」 |
-
-修复后下载只应用**云端共享内容**（`sessions/`、`knowledge/`），不再碰各机独立配置。
-
-返回值新增 `skipped` 字段，例如：
-
-```
-backup/pc/plugins（本机备份，下载不覆盖）
-knowledge/knowledge.sqlite（影子仓库缺失，可能未拉取成功）
-```
-
-### 仍未修（已知）
-
-PR 合并、预推送对账等**辅助流程**里仍有 `.catch(()=>{})` 吞错（`src/index.js` 约 575/609/632/699/816 行）。
-它们的根因同样是残留锁——下载入口的锁自检会先把锁清掉，因此目前不会被触发。
-
-## 2026-09-30 修复（第三批 / final）
-
-**向后兼容：旧版插件不用更新也能配合使用。** 三项改动全部只影响本机行为，不改任何跨端数据结构。
-
-| 标记 | 改动 | 谁受益 |
-|---|---|---|
-| `final-A` | 上传时跳过**子代理会话**（目录名不带 `session-` 前缀）| 电脑 —— 那 30 个 85~131K 的隐形会话不再上传，仓库省约 3.5 MB |
-| `final-B` | 下载时同样跳过 | 电脑 —— 云端残留的也不会落地 |
-| `final-C` | 预推送对账的 `reset --hard` 失败改为**上抛**（原来吞掉后照样记 `lastSyncedCommit`）| 电脑 —— 状态不再与真实 HEAD 脱节 |
-
-### 判定规则
-
-DSH 真会话目录一律叫 `session-<uuid>`；子代理会话是裸 `<uuid>`。这个判据与下载分支里已有的
-`oe.name.startsWith("session-")` 写法一致。
-
-```
-keep  session-245cd6f0-x  session-6107eaca-y
-drop  8c7a084d-abc       f3126274-zzz
-```
-
-### 兼容性
-
-- 手机端仍是旧版也能正常收发：新增的 `skipped` 字段是额外返回值，旧代码忽略即可
-- 没有改动任何同步组路径、策略名或状态字段结构
-- 旧版手机端下载时**仍会**把子代理会话拉下来（要等它更新才享受 final-B）
-
-## 2026-10-30 size-skip（第四批）
-
-| 改动 | 说明 |
-|---|---|
-| `syncSkills` 默认 `false` | 技能组默认忽略（12,941 文件 / 76 MB）|
-| 新增 `treeSignature()` | 目录「总字节数:文件数」签名 |
-| 上传前比对签名 | 体积未变 → **整组跳过，不删不拷** |
-
-> 单看时间戳会「只改时间误判」和「改内容漏传」；**体积+文件数双匹配**的误判面窄得多，
-> 且 git 层仍有 SHA-1 内容哈希兜底。
+- 云端仓库（`dsh-sync.git`）是**私有**的，装着聊天记录本体——别公开
+- 下载即覆盖语义下，"改了没上传就下载"= 丢改动。规矩：改完先上传
+- 手机端插件装在 `plugin-src/`（`profiles/web/node_modules` 是指回它的符号链接），本版所有路径计算都兼容两种布局
+- 重装手机插件：`mv 旧目录 && git clone --depth 1 <GitCode地址> 新目录 && rm -rf 新目录/.git`，link: 按路径解析会自动接上
