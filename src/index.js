@@ -1817,6 +1817,16 @@ function pullSafety(category, isMine, liveExists) {
     if (isMine) return { action: 'apply' }
     return { action: 'apply', warn: 'settings.yaml 含机器专属凭证与模型配置，整文件替换可能打挂配置；建议改用「AI 智能对齐」逐键合并' }
   }
+  /* 2026-10-13 修复：prompts 组此前落到下面兜底分支被**静默 block**。
+     症状：提示词（preset-lite 的 cordis.patch.yml）上传得到、下载永远拉不回本机。
+     因为 categoryForLogical 对 prompts/preset-lite-cordis.patch.yml 返回 'prompts'，
+     而本函数只认 skills/sessions/plugins/settings 四类，其余一律
+     { action:'block', reason:'未识别的路径类别，不处理' }。
+     结果：对端更新过的 persona/预设，本机永远停在旧版（真机实测本机 11749B vs
+     云端 19972B，差 197 行「作文批改」预设 + 扩写版 persona）。
+     该组本身是 strategy:'merge' + file:true，语义上就应双向；补 apply，
+     与 plugins 同类（都是配置文本，冲突仍走 AI 对齐/冲突 PR）。 */
+  if (category === 'prompts') return { action: 'apply', warn: '提示词/预设文件（来自另一台机器）' }
   return { action: 'block', reason: '未识别的路径类别，不处理' }
 }
 
