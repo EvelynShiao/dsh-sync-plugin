@@ -2733,13 +2733,11 @@ module.exports = {
       for (const group of spec) {
         for (const src of group.sources) {
           const source = join(repoDir, src.to)
-          // [fix-3] standalone 组的影子路径恒为 backup/<本机实例>/... —— 那是「你自己的备份」。
-          // 下载时拿它覆盖 live 等于拿旧配置盖新配置（装的插件会因此消失）。
-          // 恢复请走快照还原或「远端浏览 → 远端对齐」，那条路才是跨机取配置。
-          if (String(src.to).split(sep).join('/').startsWith('backup/')) {
-            skipped.push(src.to + '（本机备份，下载不覆盖）')
-            continue
-          }
+          // [fix-3 已按用户要求解除 · 2026-10-14]：settings/skills/plugins 是 standalone 组，
+          // 影子路径 backup/<本机实例>/…（本机自己的云端备份）——现在**下载也真覆盖**，
+          // 「上传和下载都要真覆盖，仅工作区例外」。上传端差量镜像会维护这份备份的新鲜度，
+          // 所以顺序上先上传再下载 = 云端即本机最新配置。
+          // 边界仍在 fix-2：云端没有的组自然跳过（首次同步无备份时不会拿空覆盖）。
           const haveSource = await fsP.access(source).then(() => true).catch(() => false)
           if (!haveSource) {
             // [fix-2] 老代码直接 continue 且不吭声，于是「远端有但仓库没拉到」
