@@ -1909,6 +1909,14 @@ function pullSafety(category, isMine, liveExists) {
      该组本身是 strategy:'merge' + file:true，语义上就应双向；补 apply，
      与 plugins 同类（都是配置文本，冲突仍走 AI 对齐/冲突 PR）。 */
   if (category === 'prompts') return { action: 'apply', warn: '提示词/预设文件（来自另一台机器）' }
+  /* 2026-10-14 同款修复：knowledge / memory 此前也落进下面的 block 兜底 ——
+     categoryForLogical 对 knowledge/… 与 memory/… 返回 'knowledge'/'memory'，
+     而本函数不认识 → 远端浏览/拉取把知识库与记忆库判成 block，永远拉不回本机
+     （与 prompts 完全同病：上传得到、下载不来）。
+     这两组在 syncSpec 里是 strategy:'merge' + file:true 单文件，语义上就应双向；
+     SQLite 双方都改过时由调和路径处理（冲突回滚保本机），此处只保证「能拉」。 */
+  if (category === 'knowledge') return { action: 'apply', warn: '知识库 knowledge.sqlite（来自另一台机器）' }
+  if (category === 'memory') return { action: 'apply', warn: '记忆库 memory.sqlite（来自另一台机器）' }
   return { action: 'block', reason: '未识别的路径类别，不处理' }
 }
 
