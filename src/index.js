@@ -2798,17 +2798,11 @@ module.exports = {
                 return b === cloudBase || w.title === cloudBase
               })
               if (!targetWs) {
-                /* 2026-10-14 工作区融合（下载方向）：云端独有工作区原来直接 SKIP，
-                   「工作区对不上时才融合」就永远合不出来。现在在本机 work 根下建同名
-                   工作区；下方 byWorkspace→workspace.json 登记段本就支持新建条目，
-                   walkFix 会把会话头 cwd 改写成本机路径。 */
-                const workRoot = localWorkspaces.length > 0 && localWorkspaces[0].path
-                  ? String(localWorkspaces[0].path).replace(/[\\/]+$/, '').split(/[\\/]/).slice(0, -1).join(sep)
-                  : join(dshHome(), 'work')
-                const freshPath = join(workRoot, cloudBase)
-                await fsP.mkdir(freshPath, { recursive: true }).catch(() => {})
-                targetWs = { id: null, path: freshPath, title: cloudBase, sessionIds: [] }
-                applied.push(src.to + ' -> 创建本机缺失的工作区 ' + cloudBase)
+                /* 2026-10-14 用户钦定规格（二次澄清）：一方有、另一方没有的工作区 =
+                   **完全跳过，一个字节都不碰**——不在本机建、更不动它的内容。
+                   跨机「融合」只允许发生在顺序表（mergeOrder 追加标题），内容层绝不越界。 */
+                applied.push(src.to + ' -> SKIP ' + cloudBase + ' (本机无同名工作区，按规格完全不碰)')
+                continue
               }
               const targetWorkspacePath = targetWs.path
               const targetDirName = encodeWorkspaceDir(targetWorkspacePath)
