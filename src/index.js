@@ -2612,6 +2612,10 @@ module.exports = {
             for (const ws of wsDirsUp) {
               if (!ws.isDirectory()) continue
               const wsTarget = join(target, ws.name)
+              /* 2026-10-14 上传真覆盖：ws.name 来自本机目录列举 = 本机 lineage 的云端目录，
+                 先清再灌 —— 本机删掉的会话在云端同步消失。其他机器编码的工作区目录不经过
+                 这条循环，永远保留（= 唯一例外：工作区对不上时融合）。 */
+              await fsP.rm(wsTarget, { recursive: true, force: true }).catch(() => {})
               await fsP.mkdir(wsTarget, { recursive: true })
               let sessionsUp = []
               try { sessionsUp = await fsP.readdir(join(src.from, ws.name), { withFileTypes: true }) } catch {}
@@ -2764,6 +2768,10 @@ module.exports = {
             let cloudWsDirs = []
             try { cloudWsDirs = await fsP.readdir(source, { withFileTypes: true }) } catch {}
             const byWorkspace = {}
+            /* 2026-10-14 下载真覆盖：同一工作区在云端可能有多个目录（各机编码不同）。
+               原实现每个云端目录都先清空本机再拷 —— 第二个目录把刚拷的又清掉（末位赢）。
+               改为本机每个目录只清一次，之后各云端目录向它并集拷入。 */
+            const __clearedLocalDirs = new Set()
             for (const cws of cloudWsDirs) {
               if (!cws.isDirectory()) continue
               const cwsPath = join(source, cws.name)
@@ -2792,21 +2800,33 @@ module.exports = {
                 return b === cloudBase || w.title === cloudBase
               })
               if (!targetWs) {
-                applied.push(src.to + ' -> SKIP ' + cloudBase + ' (本机无同名工作区)')
-                continue
+                /* 2026-10-14 工作区融合（下载方向）：云端独有工作区原来直接 SKIP，
+                   「工作区对不上时才融合」就永远合不出来。现在在本机 work 根下建同名
+                   工作区；下方 byWorkspace→workspace.json 登记段本就支持新建条目，
+                   walkFix 会把会话头 cwd 改写成本机路径。 */
+                const workRoot = localWorkspaces.length > 0 && localWorkspaces[0].path
+                  ? String(localWorkspaces[0].path).replace(/[\\/]+$/, '').split(/[\\/]/).slice(0, -1).join(sep)
+                  : join(dshHome(), 'work')
+                const freshPath = join(workRoot, cloudBase)
+                await fsP.mkdir(freshPath, { recursive: true }).catch(() => {})
+                targetWs = { id: null, path: freshPath, title: cloudBase, sessionIds: [] }
+                applied.push(src.to + ' -> 创建本机缺失的工作区 ' + cloudBase)
               }
               const targetWorkspacePath = targetWs.path
               const targetDirName = encodeWorkspaceDir(targetWorkspacePath)
               const targetWsDir = join(localRoot, targetDirName)
               await fsP.mkdir(targetWsDir, { recursive: true })
-              try {
-                const olds = await fsP.readdir(targetWsDir, { withFileTypes: true })
-                for (const oe of olds) {
-                  if (oe.isDirectory() && oe.name.startsWith('session-')) {
-                    await fsP.rm(join(targetWsDir, oe.name), { recursive: true, force: true }).catch(() => {})
+              if (!__clearedLocalDirs.has(targetWsDir)) {
+                __clearedLocalDirs.add(targetWsDir)
+                try {
+                  const olds = await fsP.readdir(targetWsDir, { withFileTypes: true })
+                  for (const oe of olds) {
+                    if (oe.isDirectory() && oe.name.startsWith('session-')) {
+                      await fsP.rm(join(targetWsDir, oe.name), { recursive: true, force: true }).catch(() => {})
+                    }
                   }
-                }
-              } catch {}
+                } catch {}
+              }
               const cwsSessionIds = []
               for (const se of sessionsList) {
                 if (!se.isDirectory()) continue
