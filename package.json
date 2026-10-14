@@ -1,6 +1,6 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "9999.9.10",
+  "version": "9999.9.11",
   "description": "dsh-sync custom build",
   "license": "MIT",
   "main": "src/index.js",

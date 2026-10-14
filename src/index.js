@@ -725,7 +725,14 @@ async function mirrorLiveToShadow(spec, shadowDir) {
           await fsP.copyFile(src.from, target)
         } catch { try { await fsP.unlink(target) } catch {} }
       } else {
-        await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
+        /* 2026-10-14 合并式上传：sessions 组**不再整目录删重建**。
+           原实现先 rm(target) 再只拷本机 → 云端其他机器上传的会话（如手机的
+           「手机专属」工作区及其全部对话）在 PC 一次上传后整组消失（真机复现）。
+           改为：本机有的按文件覆盖（copyTree 是纯增量，不删多余），云端独有的保留。
+           skills/plugins/settings 等组保持原全量镜像语义（它们按目录整体属于本机配置）。 */
+        if (group.name !== 'sessions') {
+          await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
+        }
         await copyTree(src.from, target, {
           includeFiles: src.includeFiles,
           excludeDirs: src.excludeDirs,
@@ -913,6 +920,75 @@ async function applyPromptWorkshopState(home, state2, titleToPath) {
     } catch {}
     return { ok: false, changed: 0 }
   }
+}
+
+/**
+ * 顺序文件合并（2026-10-14）：上传前把云端已有 order 并进来，**本机顺序为准、
+ * 云端独有的工作区/会话追加在尾部**。
+ *
+ * 原实现是整文件覆盖：PC 上传后云端 order 里手机的「手机专属」工作区 title 与
+ * 它的 sessionIds 全部消失（真机复现）。而 applyWorkspaceOrder 是「只重排不增删」，
+ * title 没了就永远排不回来 —— 顺序文件是共享资产，不能单侧独占。
+ *
+ * 语义（与用户「简单覆盖」期望一致）：
+ *   - 本机存在的 → 本机顺序赢（覆盖）
+ *   - 云端独有、本机没有的 → 追加保留（不影响本机，只是不抹掉对方）
+ */
+function mergeOrder(local, cloud) {
+  if (!cloud || typeof cloud !== 'object') return local
+  const out = JSON.parse(JSON.stringify(local))
+  // 工作区标题：本机在前，云端独有追加
+  const wsSeen = new Set()
+  const ws = []
+  for (const t of Array.isArray(out.workspaces) ? out.workspaces : []) {
+    if (typeof t === 'string' && !wsSeen.has(t)) { ws.push(t); wsSeen.add(t) }
+  }
+  for (const t of Array.isArray(cloud.workspaces) ? cloud.workspaces : []) {
+    if (typeof t === 'string' && !wsSeen.has(t)) { ws.push(t); wsSeen.add(t) }
+  }
+  out.workspaces = ws
+  // 各工作区会话顺序：同上（本机在前、云端独有 id 追加）
+  const sessions = { ...(out.sessions || {}) }
+  for (const [title, ids] of Object.entries(cloud.sessions || {})) {
+    if (!Array.isArray(ids)) continue
+    const mine = Array.isArray(sessions[title]) ? sessions[title].filter((x) => typeof x === 'string') : []
+    const seen = new Set(mine)
+    for (const id of ids) if (typeof id === 'string' && !seen.has(id)) { mine.push(id); seen.add(id) }
+    sessions[title] = mine
+  }
+  out.sessions = sessions
+  // 归档/置顶：并集（本机在前）
+  for (const key of ['archived', 'pinned']) {
+    const mine = Array.isArray(out[key]) ? out[key] : []
+    const seen = new Set(mine)
+    for (const id of Array.isArray(cloud[key]) ? cloud[key] : []) {
+      if (typeof id === 'string' && !seen.has(id)) { mine.push(id); seen.add(id) }
+    }
+    out[key] = mine
+  }
+  // 手动顺序（sessionOrderByAccount 等）：逐工作区并集，本机在前；其余键本机赢
+  if (cloud.manualOrder && typeof cloud.manualOrder === 'object') {
+    const mo = { ...(out.manualOrder || {}) }
+    if (cloud.manualOrder.sessionOrderByAccount && typeof cloud.manualOrder.sessionOrderByAccount === 'object') {
+      const acc = { ...(mo.sessionOrderByAccount || {}) }
+      for (const [key, ids] of Object.entries(cloud.manualOrder.sessionOrderByAccount)) {
+        if (!Array.isArray(ids)) continue
+        const mine = Array.isArray(acc[key]) ? acc[key].filter((x) => typeof x === 'string') : []
+        const seen = new Set(mine)
+        for (const id of ids) if (typeof id === 'string' && !seen.has(id)) { mine.push(id); seen.add(id) }
+        acc[key] = mine
+      }
+      mo.sessionOrderByAccount = acc
+    }
+    out.manualOrder = mo
+  }
+  // 提示词绑定/工坊：键并集（本机同键覆盖、云端独有键保留）
+  for (const key of ['promptBindings', 'promptWorkshop']) {
+    if (cloud[key] && typeof cloud[key] === 'object' && out[key] && typeof out[key] === 'object') {
+      out[key] = { ...cloud[key], ...out[key] }
+    }
+  }
+  return out
 }
 
 async function readWorkspaceOrder() {
@@ -1365,7 +1441,13 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   if (eff.syncOrder !== false) {
     try {
       const order = await readWorkspaceOrder()
-      if (order && order.workspaces.length) await atomicWriteFile(join(repoDir, ORDER_FILE), JSON.stringify(order, null, 2))
+      if (order && order.workspaces.length) {
+        // 2026-10-14 合并而非覆盖：保住云端独有的工作区/会话顺序（否则手机的
+        // 「手机专属」工作区 title 会被 PC 一次上传从 order 里抹掉）。
+        let cloudOrder = null
+        try { cloudOrder = JSON.parse(await fsP.readFile(join(repoDir, ORDER_FILE), 'utf8')) } catch { /* 首同步无此文件 */ }
+        await atomicWriteFile(join(repoDir, ORDER_FILE), JSON.stringify(mergeOrder(order, cloudOrder), null, 2))
+      }
     } catch { /* 排序导出失败不阻断推送 */ }
   }
 
@@ -2499,7 +2581,11 @@ module.exports = {
       for (const group of spec) {
         for (const src of group.sources) {
           const target = join(repoDir, src.to)
-          if (group.name === 'sessions') {
+          /* 2026-10-14 合并式上传：这里原来无条件 rm(target) —— sessions 组的 target
+             是共享的 `sessions/`，一删就把云端其他机器的会话（如手机「手机专属」工作区
+             及其全部对话）整组抹掉。现在只删**本机实例独有**的 backup/<instance>/…，
+             共享路径走合并（下面分支里 standalone 才 rm，merge 只增不删）。 */
+          if (group.name === 'sessions' && group.strategy === 'standalone') {
             await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
           }
           if (src.file) {
@@ -2565,7 +2651,12 @@ module.exports = {
       if (eff.syncOrder !== false) {
         try {
           const orderUp = await readWorkspaceOrder()
-          if (orderUp && orderUp.workspaces.length) await atomicWriteFile(join(repoDir, ORDER_FILE), JSON.stringify(orderUp, null, 2))
+          if (orderUp && orderUp.workspaces.length) {
+            // 2026-10-14 合并而非覆盖（同 runPush：保住云端独有工作区/会话顺序）
+            let cloudOrderUp = null
+            try { cloudOrderUp = JSON.parse(await fsP.readFile(join(repoDir, ORDER_FILE), 'utf8')) } catch { /* 首同步无此文件 */ }
+            await atomicWriteFile(join(repoDir, ORDER_FILE), JSON.stringify(mergeOrder(orderUp, cloudOrderUp), null, 2))
+          }
         } catch (e) { try { ctx.logger?.warn?.('dsh-sync: order export(upload): ' + (e && e.message)) } catch {} }
       }
       await gitExec(eff.gitBinary, ['add', '-A'], repoDir)
