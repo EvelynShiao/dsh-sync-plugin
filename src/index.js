@@ -714,6 +714,22 @@ async function copyTree(from, to, opts) {
 }
 
 /** Push a live snapshot into the shadow tree (shadow = live after this). */
+/* 上传前的提示词文件合法性校验（2026-10-17 新增）。
+   为什么：prompts 组的上传源是 `node_modules/dsh-preset-lite/cordis.patch.yml`，
+   而它只是 session-kit 从 memory.sqlite **投影生成**的产物 —— 库坏、插件重装、
+   开机重写中断，都可能让它变成空文件/丢标记的半成品。旧实现无条件 copyFile，
+   于是本机的坏文件会覆盖云端的好版本（对端下次下载就拿到残废提示词，人设直接消失）。
+   这里只做**最低限度**的结构校验：不猜内容对错，只挡「明显不是一份可用预设」的文件。 */
+function validatePresetLitePatch(fileText) {
+  if (typeof fileText !== 'string') return { ok: false, reason: 'not-text' }
+  if (fileText.length < 512) return { ok: false, reason: `too-small(${fileText.length}B)` }
+  if (!fileText.includes('# >>> workshop:dafeyu >>>')) return { ok: false, reason: 'missing-open-marker' }
+  if (!fileText.includes('# <<< workshop:dafeyu <<<')) return { ok: false, reason: 'missing-close-marker' }
+  if (!/(^|\n)\s*-?\s*id:\s*preset-lite\b/.test(fileText)) return { ok: false, reason: 'missing-preset-lite' }
+  if (!/(^|\n)\s*-?\s*id:\s*persona\b/.test(fileText)) return { ok: false, reason: 'missing-persona' }
+  return { ok: true }
+}
+
 async function mirrorLiveToShadow(spec, shadowDir) {
   for (const group of spec) {
     for (const src of group.sources) {
@@ -721,6 +737,42 @@ async function mirrorLiveToShadow(spec, shadowDir) {
       if (src.file) {
         try {
           await fsP.access(src.from)
+        } catch {
+          /* 本机没有这个文件。对 prompts 组**保留云端版本**：提示词是共享资产，
+             本机没装/没生成不等于要把它从云端删掉（旧实现会 unlink 云端）。 */
+          if (group.name === 'prompts') {
+            try {
+              const fsx = require('node:fs')
+              fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+                `${new Date().toISOString()} prompts: 本机缺 ${src.from}，保留云端版本不删除\n`)
+            } catch {}
+            continue
+          }
+          try { await fsP.unlink(target) } catch {}
+          continue
+        }
+        if (group.name === 'prompts') {
+          let text = null
+          try { text = await fsP.readFile(src.from, 'utf8') } catch (e) {
+            text = null
+            try {
+              const fsx = require('node:fs')
+              fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+                `${new Date().toISOString()} prompts: 读取失败 ${src.from}: ${String((e && e.message) || e)}，保留云端版本\n`)
+            } catch {}
+          }
+          if (text === null) continue
+          const verdict = validatePresetLitePatch(text)
+          if (!verdict.ok) {
+            try {
+              const fsx = require('node:fs')
+              fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+                `${new Date().toISOString()} prompts: 本机文件不合法(${verdict.reason})，**跳过上传**并保留云端版本 ${src.from}\n`)
+            } catch {}
+            continue
+          }
+        }
+        try {
           await fsP.mkdir(join(target, '..'), { recursive: true })
           await fsP.copyFile(src.from, target)
         } catch { try { await fsP.unlink(target) } catch {} }
@@ -807,6 +859,28 @@ const ORDER_FILE = 'workspace-order.json'
 const memorySqlitePath = (home) => join(home, 'profiles', 'web', '.dsh-session-kit', 'memory.sqlite')
 const titleFromPath = (p) => String(p ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || null
 
+/* memory.sqlite 健康探测（2026-10-17 新增）。
+   为什么需要它：提示词绑定的真相在这个 SQLite 里，而它是**二进制单文件**，
+   宿主被杀/断电/写一半就可能截断（实测：文件头声明 662 页、实际只有 597 页，
+   末尾 266KB 蒸发 → 之后每次读都是 'database disk image is malformed'）。
+   此前所有读函数 catch 后返回 null，上层无法区分「库坏了」和「库里本来没数据」，
+   于是把「读不到」当成「本机确实没有」写进云端，静默抹掉共享配置。
+   现在把这两种情况分开：quick_check 不过 → 明确标记为不可信，调用方保留云端值。 */
+function memoryDbHealth(home) {
+  try {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(memorySqlitePath(home), { readOnly: true })
+    try {
+      const row = db.prepare('PRAGMA quick_check').get()
+      const verdict = row ? String(Object.values(row)[0] ?? '') : ''
+      if (verdict.toLowerCase() !== 'ok') return { ok: false, reason: verdict || 'quick_check-empty' }
+      return { ok: true }
+    } finally { db.close() }
+  } catch (e) {
+    return { ok: false, reason: String((e && e.message) || e) }
+  }
+}
+
 async function readPromptBindings(home, titleToPath) {
   try {
     const { DatabaseSync } = require('node:sqlite')
@@ -875,7 +949,16 @@ async function applyPromptBindings(home, bindings, titleToPath) {
           .run(JSON.stringify(j), Date.now())
       }
     } finally { db.close() }
-  } catch { return { ok: false, changed: 0 } }
+  } catch (e) {
+    /* 原实现是裸 catch 返回 {ok:false} —— 上层只看 ok 不看原因，库坏了就是
+       「同步显示成功但绑定没写进去」，永远查不到。这里补日志（2026-10-17）。 */
+    try {
+      const fsx = require('node:fs')
+      fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+        `${new Date().toISOString()} applyPromptBindings FAILED: ${String((e && e.message) || e)}\n`)
+    } catch {}
+    return { ok: false, changed: 0, error: String((e && e.message) || e) }
+  }
   return { ok: true, changed }
 }
 
@@ -982,11 +1065,51 @@ function mergeOrder(local, cloud) {
     }
     out.manualOrder = mo
   }
-  // 提示词绑定/工坊：键并集（本机同键覆盖、云端独有键保留）
+  /* 提示词绑定/工坊（2026-10-17 修复：此前会**静默抹掉云端提示词配置**）。
+     原实现：`if (cloud[key] && out[key]) out[key] = { ...cloud[key], ...out[key] }`
+     —— 只要本机 out[key] 是 undefined 就整段跳过，云端值随之消失。而 out[key]
+     为 undefined 的真实场景正是「本机 memory.sqlite 损坏」：
+       readPromptBindings 读库失败 → 返回 null → order 上根本没有 promptBindings 字段
+       → mergeOrder 跳过 → 上传的 workspace-order.json 里没有提示词块 → 覆盖云端
+       → 另一台机器下载拿不到绑定 → 提示词同步彻底失效（真机复现：日志
+       'readPromptBindings FAILED: database disk image is malformed'，此后云端
+       order 的 promptBindings 永久为空）。
+     修复原则：**本机读不到 ≠ 本机要删掉**。读不到就保留云端值，绝不因本地故障
+     丢共享资产。只有本机「明确读到」才允许覆盖对应键。 */
+  const localPromptUnreadable = local && local._promptUnreadable === true
   for (const key of ['promptBindings', 'promptWorkshop']) {
-    if (cloud[key] && typeof cloud[key] === 'object' && out[key] && typeof out[key] === 'object') {
-      out[key] = { ...cloud[key], ...out[key] }
+    const cloudVal = cloud && cloud[key]
+    if (!cloudVal || typeof cloudVal !== 'object') continue
+    const localVal = out[key]
+    // 本机读库失败，或本机压根没有该字段 → 云端值原样保留
+    if (localPromptUnreadable || localVal === undefined || localVal === null || typeof localVal !== 'object') {
+      out[key] = JSON.parse(JSON.stringify(cloudVal))
+      continue
     }
+    // 两边都有：键并集（本机同键覆盖、云端独有键保留）
+    if (key === 'promptBindings') {
+      out[key] = { ...cloudVal, ...localVal }
+      continue
+    }
+    /* promptWorkshop 是**嵌套结构**（versions 数组 + bindings 对象 + autoApply），
+       浅合并会让本机的空 versions 覆盖云端的真实版本列表 —— 那等于把「普通节约/
+       作文批改/Learning」三个自建预设从云端删掉（session-kit 下次开机按 versions
+       重写 cordis.patch.yml，文件里的 workshop:extra 区就被清空）。
+       所以逐字段合并，且 versions 用「非空者赢」。 */
+    const localVersions = Array.isArray(localVal.versions) ? localVal.versions : []
+    const cloudVersions = Array.isArray(cloudVal.versions) ? cloudVal.versions : []
+    const merged = { ...cloudVal, ...localVal }
+    merged.versions = localVersions.length > 0 ? localVersions : cloudVersions
+    if (cloudVal.bindings && typeof cloudVal.bindings === 'object') {
+      merged.bindings = {
+        ...cloudVal.bindings,
+        ...(localVal.bindings && typeof localVal.bindings === 'object' ? localVal.bindings : {}),
+      }
+    }
+    if (typeof localVal.autoApply !== 'boolean' && typeof cloudVal.autoApply === 'boolean') {
+      merged.autoApply = cloudVal.autoApply
+    }
+    out[key] = merged
   }
   return out
 }
@@ -1005,11 +1128,19 @@ async function readWorkspaceOrder() {
   // 提示词工作区绑定+版本：路径键 → 标题键（跨设备可移植）。版本也必须同步——
   // cordis.patch.yml 只是投影，session-kit 从 memory.sqlite 的 versions 重写它。
   {
+    /* 先探测库健康：读失败时**不能**让 order 看起来像「本机没有提示词配置」，
+       否则 mergeOrder 会把云端值当成「对端已删除」而丢弃（2026-10-17 真机根因）。
+       健康检查不过 → 打不可枚举标记（JSON.stringify 不会写进云端文件），
+       由 mergeOrder 判定「本机状态不可信 → 原样保留云端」。 */
+    const health = memoryDbHealth(dshHome())
+    if (!health.ok) {
+      Object.defineProperty(order, '_promptUnreadable', { value: true, enumerable: false })
+    }
     const titleToPath = new Map()
     for (const w of Object.values(table)) if (w?.title && w.path) titleToPath.set(w.title, w.path)
-    const bindings = await readPromptBindings(dshHome(), titleToPath)
+    const bindings = health.ok ? await readPromptBindings(dshHome(), titleToPath) : null
     if (bindings) order.promptBindings = bindings
-    const wsState = await readPromptWorkshopState(dshHome())
+    const wsState = health.ok ? await readPromptWorkshopState(dshHome()) : null
     if (wsState) {
       // workspacePresets 键翻译成标题
       const tp = {}
@@ -1022,7 +1153,8 @@ async function readWorkspaceOrder() {
     try {
       const fsx = require('node:fs')
       const logp = join(dshHome(), 'logs', 'dsh-sync-init.log')
-      fsx.appendFileSync(logp, `${new Date().toISOString()} readWorkspaceOrder promptBindings=${bindings ? Object.keys(bindings).length : 'null'} versions=${order.promptWorkshop?.versions?.length ?? 'null'}\n`)
+      const healthNote = health.ok ? 'ok' : `UNREADABLE(${health.reason})→保留云端提示词配置`
+      fsx.appendFileSync(logp, `${new Date().toISOString()} readWorkspaceOrder db=${healthNote} promptBindings=${bindings ? Object.keys(bindings).length : 'null'} versions=${order.promptWorkshop?.versions?.length ?? 'null'}\n`)
     } catch {}
   }
   const byTitle = new Set()
@@ -1561,6 +1693,23 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       continue
     }
     delete state.pendingBoth[p]
+    /* prompts/ 组下载侧校验（2026-10-17）：云端为真源、无条件覆盖本地，但「真源」
+       也可能被某台机器的坏投影污染过（见 validatePresetLitePatch 的说明）。
+       云端这份如果结构不合法，就**不覆盖本机**——保留本机可用的提示词，
+       让下次上传把好的版本推回云端。宁可这一轮不同步，也不要人设直接消失。 */
+    if (p.startsWith('prompts/')) {
+      const remoteText = remoteBuf.toString('utf8')
+      const verdict = validatePresetLitePatch(remoteText)
+      if (!verdict.ok) {
+        try {
+          const fsx = require('node:fs')
+          fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+            `${new Date().toISOString()} prompts: 云端 ${p} 不合法(${verdict.reason})，跳过覆盖本机\n`)
+        } catch {}
+        skipped++
+        continue
+      }
+    }
     if (!await gateSessionPayload(livePath, remoteBuf, logger)) { skipped++; continue }
     try {
       await atomicWriteFile(livePath, remoteBuf)
@@ -1579,6 +1728,25 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       const haveShadow = await fsP.access(shadowDir).then(() => true).catch(() => false)
       if (!haveShadow) continue
       if (src.file) {
+        /* prompts 组是 overwriteOnDownload:true 的**强制镜像**，会绕过上面所有
+           untouched/冲突判断直接 copyFile —— 也就是云端一旦被污染，本机必被覆盖。
+           这里补一道结构校验（2026-10-17）：云端这份不像一份可用预设时，保留本机版本，
+           等下次上传把好的推回去。宁可这一轮不收敛，也不能让人设凭空消失。 */
+        if (group.name === 'prompts') {
+          let shadowText = null
+          try { shadowText = await fsP.readFile(shadowDir, 'utf8') } catch { shadowText = null }
+          const verdict = shadowText === null
+            ? { ok: false, reason: 'shadow-unreadable' }
+            : validatePresetLitePatch(shadowText)
+          if (!verdict.ok) {
+            try {
+              const fsx = require('node:fs')
+              fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+                `${new Date().toISOString()} prompts: 强制镜像时云端不合法(${verdict.reason})，保留本机 ${src.from}\n`)
+            } catch {}
+            continue
+          }
+        }
         try { await fsP.mkdir(join(src.from, '..'), { recursive: true }); await fsP.copyFile(shadowDir, src.from); applied++ } catch {}
         continue
       }
@@ -1703,6 +1871,18 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
       continue
     }
     delete state.pendingBoth[p]
+    // 与 pull 侧同一道闸：云端提示词结构不合法就不覆盖本机（2026-10-17）
+    if (p.startsWith('prompts/')) {
+      const verdict = validatePresetLitePatch(remoteBuf.toString('utf8'))
+      if (!verdict.ok) {
+        try {
+          const fsx = require('node:fs')
+          fsx.appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'),
+            `${new Date().toISOString()} prompts: 云端 ${p} 不合法(${verdict.reason})，对账时跳过覆盖本机\n`)
+        } catch {}
+        continue
+      }
+    }
     if (!await gateSessionPayload(livePath, remoteBuf, logger)) continue
     try { await atomicWriteFile(livePath, remoteBuf); applied.push(p) } catch {}
   }
