@@ -25,6 +25,7 @@
     "src",
     "client",
     "docs",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "test"
   ]
 }
