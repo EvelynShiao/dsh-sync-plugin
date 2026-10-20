@@ -218,15 +218,45 @@ function writeProfileFileSync(effIn, clearToken) {
   try { raw = fsx.readFileSync(cpPath, "utf8") }
   catch (e) { throw new Error('读不到 cordis.patch.yml: ' + String((e && e.message) || e)) }
   const eol = raw.indexOf('\r\n') >= 0 ? '\r\n' : '\n'
-  const lines = raw.split(/\r?\n/)
+  let lines = raw.split(/\r?\n/)
   let start = -1
   for (let i = 0; i < lines.length; i++) if (/^-\s+id:\s*dsh-sync\s*$/.test(lines[i])) { start = i; break }
-  if (start < 0) throw new Error('找不到 - id: dsh-sync 条目')
+  // [自愈 2026-10-20] profile patch 里从来没有过 dsh-sync 条目（插件靠 bundle patch
+  // 的 - insert: 进组合），旧实现在这里直接抛「找不到条目」→ 设置保存两层全断
+  // （settings.update 被 host 侧 Config=null 竞态挡死，直写又找不到锚点）。
+  // 改为：缺条目就在文件末尾追加完整骨架（id/name/config/sync），宿主按 id 应用，
+  // 多出的条目无害；下次保存复用同一路径正常改写。
+  if (start < 0) {
+    const tail = []
+    if (lines.length && lines[lines.length - 1].trim() !== '') tail.push('')
+    tail.push('# dsh-sync settings persistence (auto-appended by plugin, 2026-10-20)')
+    tail.push('- id: dsh-sync')
+    tail.push("  name: '@weibaohui/dsh-sync'")
+    tail.push('  config:')
+    tail.push('    sync:')
+    tail.push('      repoUrl: null')
+    lines = lines.concat(tail)
+    start = lines.length - 6   // 指向刚追加的 '- id: dsh-sync' 行
+  }
   let end = start + 1
   while (end < lines.length && !/^-\s+id:/.test(lines[end])) end++
   let syncIdx = -1
   for (let i = start; i < end; i++) if (/^\s*sync:\s*$/.test(lines[i])) { syncIdx = i; break }
-  if (syncIdx < 0) throw new Error('找不到 config.sync 段')
+  // [自愈②] 有条目但没有 config.sync 段 → 在 config: 下补插（连 config: 都缺则一并
+  // 补 config:+sync:），否则同样会抛「找不到 config.sync 段」。
+  if (syncIdx < 0) {
+    let configIdx = -1
+    for (let i = start; i < end; i++) if (/^\s*config:\s*$/.test(lines[i])) { configIdx = i; break }
+    if (configIdx < 0) {
+      lines.splice(end, 0, '  config:', '    sync:')
+      syncIdx = end + 1
+    } else {
+      const cfgIndent = (lines[configIdx].match(/^ */) || [''])[0]
+      lines.splice(configIdx + 1, 0, cfgIndent + '  sync:')
+      syncIdx = configIdx + 1
+    }
+    end += 2
+  }
   const baseIndent = (lines[syncIdx].match(/^ */) || [''])[0]
   let blockEnd = syncIdx + 1
   while (blockEnd < end) {
@@ -1506,6 +1536,103 @@ async function normalizeDownloadedSessions(home) {
   return { normalized, deduped }
 }
 
+// ── 上传侧云端收敛（2026-10-20 根治并存）──────────────────────────────────
+// 病根：云端 sessions/ 下按机器路径编码存目录（--root-* 手机系 / --C-Users-* 电脑系），
+// 每台机器只写自己的 lineage，下载侧 normalize 只救本地、云端从不收敛 →
+// 两套目录长期并存，同 ID 会话在云端各有一份，账目越滚越乱。
+// 根治：每次上传时把云端「非本机 lineage」的目录就地归一——
+//   ① 解会话头帧取 cwd，按文件夹名映射到本机权威工作区；
+//   ② 映射上的目录：同 ID 已在本机/云端 canonical → 删冗余；本机缺此 ID →
+//      救回本机权威目录（改写 cwd + 过完整性门，不改云端字节）并写进云端 canonical；
+//   ③ 映射不上的（如「手机专用」在电脑上无对应工作区）整目录保留，绝不删；
+//   ④ 目录里所有会话都处置完后，空的异 lineage 目录整个移除。
+// 前提：调用点在本机目录镜像（rm+重灌）**之后**，本机 lineage 的云端目录已是
+// 本机真源；canonical 与本机 lineage 同名（encodeWorkspaceDir 一致）时天然跳过。
+async function convergeCloudSessions(home, repoDir, logger) {
+  const zlib = require('node:zlib')
+  const shadowSess = join(repoDir, 'sessions')
+  const liveSess = join(home, 'sessions')
+  const wsByFolder = new Map()
+  const authDirs = new Set()
+  try {
+    const doc = JSON.parse(await fsP.readFile(join(home, 'storages', 'workspace.json'), 'utf8'))
+    for (const w of Object.values(doc?.tables?.workspaces ?? {})) {
+      if (!w?.path) continue
+      authDirs.add(encodeWorkspaceDir(w.path))
+      const folder = String(w.path).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      wsByFolder.set(folder, w.path)
+    }
+  } catch { return { converged: 0, rescued: 0, kept: 0 } }
+  // 云端 canonical 目标目录集合（本机权威工作区名）+ 本机已有会话 ID 集合
+  const cloudCanonical = new Set()
+  let cloudDirs = []
+  try { cloudDirs = (await fsP.readdir(shadowSess, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name) } catch { return { converged: 0, rescued: 0, kept: 0 } }
+  for (const d of cloudDirs) if (authDirs.has(d)) cloudCanonical.add(d)
+  const localIds = new Set()
+  try {
+    for (const ws of (await fsP.readdir(liveSess, { withFileTypes: true })).filter((d) => d.isDirectory())) {
+      try { for (const s of await fsP.readdir(join(liveSess, ws.name), { withFileTypes: true })) if (s.isDirectory()) localIds.add(s.name) } catch {}
+    }
+  } catch {}
+  let converged = 0, rescued = 0, kept = 0
+  for (const cloudDir of cloudDirs) {
+    if (authDirs.has(cloudDir)) continue          // 本机 lineage 的云端目录：镜像阶段已写真源，跳过
+    if (cloudDir === '--quarantine--') continue   // 隔离区永不处理
+    let sess = []
+    try { sess = (await fsP.readdir(join(shadowSess, cloudDir), { withFileTypes: true })).filter((d) => d.isDirectory()) } catch { continue }
+    let dirEmpty = true
+    for (const s of sess) {
+      const srcFile = join(shadowSess, cloudDir, s.name, 'session.v4.jsonl.zstd')
+      let buf = null, frameEnd = 0, header = null
+      try {
+        buf = await fsP.readFile(srcFile)
+        const idx = scanZstdFrames(buf)
+        if (idx.length < 2) { dirEmpty = false; kept++; continue }   // 结构不明，留证据
+        frameEnd = idx[1]
+        header = JSON.parse(zlib.zstdDecompressSync(buf.subarray(0, frameEnd)).toString('utf8'))
+      } catch { dirEmpty = false; kept++; continue }
+      const folder = String(header?.cwd ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      const localPath = wsByFolder.get(folder)
+      if (!localPath) { dirEmpty = false; kept++; continue }   // 映射不上（如手机专用）→ 保留
+      const canonicalDir = encodeWorkspaceDir(localPath)
+      // ②a 本机权威已有同 ID（云端 canonical 也必有，镜像刚灌过）→ 异 lineage 副本就是冗余
+      if (localIds.has(s.name)) {
+        try { await fsP.rm(join(shadowSess, cloudDir, s.name), { recursive: true, force: true }); converged++ } catch { dirEmpty = false }
+        continue
+      }
+      // ②b 本机缺此 ID → 救回本机权威目录（cwd 改写 + 完整性门），再写云端 canonical。
+      //    救回的是会话内容本身，云端异 lineage 字节原样保留至救回成功后才删。
+      header.cwd = localPath
+      const newHeader = zlib.zstdCompressSync(Buffer.from(JSON.stringify(header) + '\n', 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
+      const newBuf = Buffer.concat([newHeader, buf.subarray(frameEnd)])
+      const destDir = join(liveSess, encodeWorkspaceDir(localPath), s.name)
+      if (!await gateSessionPayload(join(destDir, 'session.v4.jsonl.zstd'), newBuf, logger)) {
+        dirEmpty = false; kept++; continue          // 完整性不过：不动本机，云端副本保留
+      }
+      try {
+        await fsP.mkdir(destDir, { recursive: true })
+        await fsP.writeFile(join(destDir, 'session.v4.jsonl.zstd'), newBuf)
+        localIds.add(s.name)
+        // 同步写进云端 canonical（本机目录刚镜像过，此刻 canonical 里还没有它）
+        const cloudDest = join(shadowSess, canonicalDir, s.name)
+        await fsP.mkdir(cloudDest, { recursive: true })
+        await fsP.writeFile(join(cloudDest, 'session.v4.jsonl.zstd'), newBuf)
+        await fsP.rm(join(shadowSess, cloudDir, s.name), { recursive: true, force: true })
+        rescued++
+      } catch (e) {
+        dirEmpty = false
+        try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] converge: 救回 ' + s.name + ' 失败: ' + String((e && e.message) || e)) } catch {}
+      }
+    }
+    // ④ 空了的异 lineage 目录整个移除
+    try {
+      const rest = await fsP.readdir(join(shadowSess, cloudDir))
+      if (rest.length === 0) await fsP.rm(join(shadowSess, cloudDir), { recursive: true, force: true })
+    } catch {}
+  }
+  return { converged, rescued, kept }
+}
+
 async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots, preserve }) {
   await clearStaleGitLock(repoDir)   // 上次中断的 index.lock 会让 git add 报"手动删除"
   const remote = await ensureShadowRepo(binary, eff, repoDir)
@@ -1529,6 +1656,13 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   // 3. overlay live snapshot onto the baseline: shadow now = baseline + local deltas
   // remote（覆盖·远端为准）组本地是只读镜像：不推送本机版本
   await mirrorLiveToShadow(spec.filter(g => g.strategy !== 'remote'), repoDir)
+  // 3.2 云端收敛（2026-10-20）：sessions 共享组镜像后，把云端异 lineage 目录就地
+  // 归一（冗余删、缺失救回本机并写 canonical、映射不上保留），根治两套目录并存。
+  let convergeR = { converged: 0, rescued: 0, kept: 0 }
+  if (eff.syncSessions && eff.sessionsStrategy !== 'standalone') {
+    try { convergeR = await convergeCloudSessions(dshHome(), repoDir, logger) }
+    catch (e) { try { logger?.warn?.('dsh-sync: converge: ' + String((e && e.message) || e)) } catch {} }
+  }
 
   if (firstJoin && hasRemote) {
     // 首次接入 = 并集加入。全量快照覆盖会把"远端有、本机没有"的文件当作本地删除
@@ -2814,6 +2948,15 @@ module.exports = {
                 if (!st || st.size < 1024) continue
                 await copyTree(sPath, join(wsTarget, s.name), {})
               }
+            }
+            // [converge 2026-10-20] 本机目录镜像完、云端 canonical 就位后，就地收敛
+            // 云端异 lineage 目录：冗余删 / 缺失救回 / 映射不上保留。返回值进 skipped
+            // 列表，UI 与日志都能看到本次收敛账目。
+            let convergeUp = { converged: 0, rescued: 0, kept: 0 }
+            try { convergeUp = await convergeCloudSessions(dshHome(), repoDir, ctx.logger) }
+            catch (e) { try { ctx.logger?.warn?.('dsh-sync: converge(upload): ' + String((e && e.message) || e)) } catch {} }
+            if (convergeUp.converged || convergeUp.rescued || convergeUp.kept) {
+              skipped.push(`云端收敛：删冗余 ${convergeUp.converged}、救回 ${convergeUp.rescued}、保留 ${convergeUp.kept}`)
             }
           } else {
              // [size-skip] 源与影子的「总字节数:文件数」一致 → 整组跳过（不删不拷）。
