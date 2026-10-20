@@ -2884,6 +2884,12 @@ module.exports = {
 
     // ── 上传：本地 → 云（单向） ──
     const runUpload = async (eff) => {
+      // [converge 2026-10-20] 上传的收敛账目（sessions 组收敛时写入，返回给 UI）
+      let convergeNote = null
+      // [fix 2026-10-20] size-skip 分支（else 侧）裸用 skipped.push —— 该变量
+      // 只在 runDownload 里定义，这里从未声明过，签名完全相同时上传直接
+      // ReferenceError（同款病灶，今天在 converge 注入处先炸了一次）。
+      const skipped = []
       // 残留 index.lock 清理：上传按钮走本函数（非 runPush），上次上传被强杀会留下锁，
       // 之后 git add 必报 "remove the file manually"（手机 2026-10-09 复现）。
       // 本函数被调用前已持有 sync .lock，此刻的 git 锁必是残留，安全删。
@@ -2950,13 +2956,16 @@ module.exports = {
               }
             }
             // [converge 2026-10-20] 本机目录镜像完、云端 canonical 就位后，就地收敛
-            // 云端异 lineage 目录：冗余删 / 缺失救回 / 映射不上保留。返回值进 skipped
-            // 列表，UI 与日志都能看到本次收敛账目。
+            // 云端异 lineage 目录：冗余删 / 缺失救回 / 映射不上保留。
+            // 账目记日志 + 并进返回值（runUpload 无 skipped 列表——那是 runDownload
+            // 的变量，这里误用会在收敛非零时抛 ReferenceError，2026-10-20 实测翻车）。
             let convergeUp = { converged: 0, rescued: 0, kept: 0 }
             try { convergeUp = await convergeCloudSessions(dshHome(), repoDir, ctx.logger) }
             catch (e) { try { ctx.logger?.warn?.('dsh-sync: converge(upload): ' + String((e && e.message) || e)) } catch {} }
             if (convergeUp.converged || convergeUp.rescued || convergeUp.kept) {
-              skipped.push(`云端收敛：删冗余 ${convergeUp.converged}、救回 ${convergeUp.rescued}、保留 ${convergeUp.kept}`)
+              const line = `云端收敛：删冗余 ${convergeUp.converged}、救回 ${convergeUp.rescued}、保留 ${convergeUp.kept}`
+              try { ctx.logger?.info?.('dsh-sync: ' + line) } catch {}
+              convergeNote = line
             }
           } else {
              // [size-skip] 源与影子的「总字节数:文件数」一致 → 整组跳过（不删不拷）。
@@ -3008,7 +3017,7 @@ module.exports = {
       // 无条件清理：原来 prune 只在 snapshotAuto !== false 的分支里，
       // 用户关掉每日自动快照后日常同步就永远不清理 → 上限形同虚设（曾堆到 16 份）。
       try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
-      return { uploaded: true }
+      return { uploaded: true, converge: convergeNote, skipped }
     }
 
     // ── 下载：云 → 本地（单向，覆盖本地） ──
