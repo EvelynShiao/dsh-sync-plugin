@@ -2932,13 +2932,15 @@ module.exports = {
             for (const ws of wsDirsUp) {
               if (!ws.isDirectory()) continue
               const wsTarget = join(target, ws.name)
-              /* 2026-10-14 上传真覆盖：ws.name 来自本机目录列举 = 本机 lineage 的云端目录，
-                 先清再灌 —— 本机删掉的会话在云端同步消失。其他机器编码的工作区目录不经过
+              /* 2026-10-14 上传真覆盖：ws.name 来自本机目录列举 = 本机 lineage 的云端目录。
+                 [E线增量 2026-10-25] 工作区级 rm 改为「先建后并」：不再整目录清空，
+                 会话级增删改在下面的循环里逐会话处理（无变化的跳过、改动的重灌、
+                 云端多余的对账删除走 converge）。其他机器编码的工作区目录不经过
                  这条循环，永远保留（= 唯一例外：工作区对不上时融合）。 */
-              await fsP.rm(wsTarget, { recursive: true, force: true }).catch(() => {})
               await fsP.mkdir(wsTarget, { recursive: true })
               let sessionsUp = []
               try { sessionsUp = await fsP.readdir(join(src.from, ws.name), { withFileTypes: true }) } catch {}
+              const uploadedIds = new Set()
               for (const s of sessionsUp) {
                 if (!s.isDirectory()) continue
                 // [final-A] 子代理会话目录不带 "session-" 前缀（DSH 真会话一律带），
@@ -2952,7 +2954,29 @@ module.exports = {
                 let st = null
                 try { st = await fsP.stat(join(sPath, zst)) } catch {}
                 if (!st || st.size < 1024) continue
-                await copyTree(sPath, join(wsTarget, s.name), {})
+                uploadedIds.add(s.name)
+                /* [E线增量 2026-10-25] 会话粒度字节对比：云端同会话 zstd 的
+                   (size,mtime) 与本地一致 → 整个会话跳过（不删不拷）。
+                   无变化上传从「重拷全部会话」降为「stat 全部会话」——
+                   本地 IO 与 git blob 双省。不一致才 rm+copyTree 重灌。 */
+                const cloudSess = join(wsTarget, s.name)
+                const cloudFile = join(cloudSess, zst)
+                let cloudSt = null
+                try { cloudSt = await fsP.stat(cloudFile) } catch {}
+                if (cloudSt && cloudSt.size === st.size && cloudSt.mtimeMs === st.mtimeMs) continue
+                await fsP.rm(cloudSess, { recursive: true, force: true }).catch(() => {})
+                await copyTree(sPath, cloudSess, {})
+              }
+              /* [E线增量] 云端同工作区目录里、本地已不存在（且本轮没上传过）的会话：
+                 真覆盖语义——本机删了的会话在云端同步消失。这里保留 2026-10-14 的
+                 删除语义，只是从「先清空再灌」改为「灌完后对账删除」。 */
+              let cloudOnly = []
+              try { cloudOnly = await fsP.readdir(wsTarget, { withFileTypes: true }) } catch {}
+              for (const c of cloudOnly) {
+                if (!c.isDirectory()) continue
+                if (!c.name.startsWith('session-')) continue
+                if (uploadedIds.has(c.name)) continue
+                await fsP.rm(join(wsTarget, c.name), { recursive: true, force: true }).catch(() => {})
               }
             }
             // [converge 2026-10-20] 本机目录镜像完、云端 canonical 就位后，就地收敛
@@ -3157,6 +3181,26 @@ module.exports = {
                 // [final-B] 同理：子代理会话不落地
                 if (!se.name.startsWith('session-')) continue
                 const dstSession = join(targetWsDir, se.name)
+                /* [E线增量 2026-10-25] 下载侧同样会话粒度字节对比：本地同会话
+                   (size,mtime) 与云端一致 → 跳过（不 rm 不拷，projcache 也不用清）。
+                   ⚠️ 下载后会跑 walkFix2 重写 header cwd——跳过的会话若 cwd 不符
+                   不会被修；但 cwd 修复属一次性迁移（早跑过），常态数据 mtime
+                   一致即内容一致。不一致才走原 rm+copyTree。 */
+                let seFiles = []
+                try { seFiles = await fsP.readdir(join(cwsPath, se.name)) } catch {}
+                const seZst = seFiles.find(x => x.endsWith('.zstd'))
+                if (seZst) {
+                  let cloudZstSt = null
+                  try { cloudZstSt = await fsP.stat(join(cwsPath, se.name, seZst)) } catch {}
+                  let localZstSt = null
+                  try { localZstSt = await fsP.stat(join(dstSession, seZst)) } catch {}
+                  if (cloudZstSt && localZstSt && cloudZstSt.size === localZstSt.size && cloudZstSt.mtimeMs === localZstSt.mtimeMs) {
+                    cwsSessionIds.push(se.name)
+                    if (!downloadedSessionIds.includes(se.name)) downloadedSessionIds.push(se.name)
+                    if (!allDownloadedSessionIds.includes(se.name)) allDownloadedSessionIds.push(se.name)
+                    continue
+                  }
+                }
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
                 await copyTree(join(cwsPath, se.name), dstSession, {})
                 cwsSessionIds.push(se.name)
