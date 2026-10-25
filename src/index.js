@@ -3038,6 +3038,31 @@ module.exports = {
       state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
       state.lastSyncAt = new Date().toISOString()
       await saveState()
+      /* [自动瘦身 2026-10-25] 用户死命令「不再产生那么多历史垃圾」——git 对二进制
+         无 delta，每次同步都是整份新 blob；提交数就是垃圾堆积的进度条。
+         上传成功后数提交：超过 AUTO_SQUASH_THRESHOLD（40）就把影子仓重写成
+         单提交基线并 force push。等价于「每次上传都从干净基线出发」——云端
+         永远只有最新快照 + 最多 40 份近期历史，配额不再无限膨胀。
+         安全性：squash 的是**已推送**的提交（远端与本地一致时才动）；失败自动
+         跳过（下轮再试），绝不丢数据——工作区内容在 squash 前后逐字节不变。 */
+      try {
+        const countOut = await gitExec(eff.gitBinary, ['rev-list', '--count', 'HEAD'], repoDir)
+        const commitCount = Number(String(countOut && countOut.stdout || '').trim())
+        if (Number.isFinite(commitCount) && commitCount > 40) {
+          ctx.logger?.info?.(`dsh-sync: auto-squash: 提交数 ${commitCount} > 40，重写单提交基线…`)
+          await gitExec(eff.gitBinary, ['checkout', '--orphan', '__autosquash__'], repoDir)
+          await gitExec(eff.gitBinary, ['add', '-A'], repoDir)
+          await gitExec(eff.gitBinary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `auto-squash: 单提交基线（原 ${commitCount} 份历史快照已合并，内容不变）`], repoDir)
+          await gitExec(eff.gitBinary, ['branch', '-D', eff.branch], repoDir)
+          await gitExec(eff.gitBinary, ['branch', '-M', eff.branch], repoDir)
+          await gitExec(eff.gitBinary, ['push', '-f', remote, `HEAD:${eff.branch}`], repoDir)
+          state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
+          await saveState()
+          ctx.logger?.info?.(`dsh-sync: auto-squash 完成：${commitCount} → 1 份基线，已 force push`)
+        }
+      } catch (e) {
+        ctx.logger?.warn?.(`dsh-sync: auto-squash 跳过（不影响本次上传）：` + String((e && e.message) || e))
+      }
       // 无条件清理：原来 prune 只在 snapshotAuto !== false 的分支里，
       // 用户关掉每日自动快照后日常同步就永远不清理 → 上限形同虚设（曾堆到 16 份）。
       try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
