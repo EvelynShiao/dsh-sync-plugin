@@ -2896,6 +2896,66 @@ module.exports = {
       await clearStaleGitLock(repoDir)
       const remote = await ensureShadowRepo(eff.gitBinary, eff, repoDir)
       const spec = syncSpec(eff, defaultRoots(), state.instanceId)
+      /* [极速短路 2026-10-26] 手机实测20秒拆解：git fetch 2s + reset 7s + add 4s + status 4s
+         ——「无变化上传」的 15s 全花在 git 层全仓碾压 13195 文件（手机存储慢，电脑 NVMe 无感）。
+         修法：git 对齐之前先做纯文件系统对比，一致则整个 git 层跳过（fetch/reset/add/commit/push
+         全免），直接报「无变化」。
+         ⚠️ 第一版的雷（实测抓出）：直接用 treeSignature 对比 sessions 组——它把本机的
+         【子代理会话目录】（无 session- 前缀）和 .sessions-trash 也算进签名，而这些
+         上传过滤器（final-A）从不传 → 影子仓永远少一截 → 签名永不相等 → 短路永不触发。
+         修法 v2：sessions 组用【上传同口径】的专用对比——只比 session- 前缀目录下的
+         zstd 文件（size,mtime）指纹；子代理/trash/备份杂物一律不计（它们不上云）。
+         其他组（skills/knowledge/memory/plugins）无此过滤，继续用 treeSignature。
+         ⚠️ 诚实边界：多机并发时另一端可能推了新东西而本机 sessions 恰好没变 → 本轮跳过后
+         云端新内容要等下一轮「本机有变化」时才对齐——下载永远不受影响（它有自己的流程），
+         上传语义本来就是「以本机为准」，晚一轮对齐无害。 */
+      try {
+        const sessionsSignatureForUpload = async (root) => {
+          /* 与上传循环完全同口径：sessions/<工作区>/<session-*>/session.v4.jsonl.zstd。
+             返回 bytes:files 指纹（与 treeSignature 同形状）；目录不存在返回 null。 */
+          const { readdirSync, statSync: statSync2 } = require('node:fs')
+          let bytes = 0, files = 0, exists = false
+          const listWs = () => { try { return readdirSync(root, { withFileTypes: true }) } catch { return null } }
+          const wsDirs = listWs()
+          if (wsDirs === null) return null
+          for (const ws of wsDirs) {
+            if (!ws.isDirectory()) continue
+            const wsPath = join(root, ws.name)
+            let sessDirs = null
+            try { sessDirs = readdirSync(wsPath, { withFileTypes: true }) } catch { continue }
+            for (const s of sessDirs) {
+              if (!s.isDirectory() || !s.name.startsWith('session-')) continue
+              const zst = join(wsPath, s.name, 'session.v4.jsonl.zstd')
+              try { const st = statSync2(zst); if (st.size >= 1024) { bytes += st.size; files += 1; exists = true } } catch {}
+            }
+          }
+          return exists || true ? `${bytes}:${files}` : null
+        }
+        let allUnchanged = true
+        for (const group of spec) {
+          for (const src of group.sources) {
+            if (src.file) continue // 单文件组（order/设置）体积小，git 层无感，不短路
+            const target = join(repoDir, src.to)
+            try {
+              if (group.name === 'sessions') {
+                const sigA = await sessionsSignatureForUpload(src.from)
+                const sigB = await sessionsSignatureForUpload(target)
+                if (sigA !== sigB) { allUnchanged = false; break }
+              } else {
+                const sigOpts = { includeFiles: src.includeFiles, excludeDirs: src.excludeDirs, excludeNames: src.excludeNames, followSymlinks: src.followSymlinks }
+                const sigA = await treeSignature(src.from, sigOpts)
+                const sigB = await treeSignature(target, sigOpts)
+                if (sigA === null || sigB === null || sigA !== sigB) { allUnchanged = false; break }
+              }
+            } catch { allUnchanged = false; break }
+          }
+          if (!allUnchanged) break
+        }
+        if (allUnchanged) {
+          ctx.logger?.info?.('dsh-sync: 极速短路——本机与影子仓完全一致，跳过 git 层（无变化）')
+          return { uploaded: false, nothingToCommit: true, fastPath: true }
+        }
+      } catch { /* 短路判定失败 → 照常走全流程 */ }
       try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
         if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
       }
