@@ -2965,7 +2965,13 @@ module.exports = {
                 try { cloudSt = await fsP.stat(cloudFile) } catch {}
                 if (cloudSt && cloudSt.size === st.size && cloudSt.mtimeMs === st.mtimeMs) continue
                 await fsP.rm(cloudSess, { recursive: true, force: true }).catch(() => {})
-                await copyTree(sPath, cloudSess, {})
+                /* [2026-10-26 副本泄漏修复] 会话目录只允许 .zstd 主文件 + session.lock
+                   上云——.bak 手术备份 / 杂物绝不传（昨晚 8 次同步把 5 个 .bak 和
+                   手术副本全传上去过，白吃配额）。白名单制，新增文件类型必须显式加。 */
+                await fsP.mkdir(cloudSess, { recursive: true })
+                await fsP.copyFile(join(sPath, zst), cloudFile)
+                const lockFile = join(sPath, 'session.lock')
+                try { await fsP.copyFile(lockFile, join(cloudSess, 'session.lock')) } catch {}
               }
               /* [E线增量] 云端同工作区目录里、本地已不存在（且本轮没上传过）的会话：
                  真覆盖语义——本机删了的会话在云端同步消失。这里保留 2026-10-14 的
