@@ -3051,8 +3051,11 @@ module.exports = {
          安全性不变：squash 的是已推送提交；失败自动跳过下轮再试；
          工作区内容 squash 前后逐字节不变；本地磁盘才是真源，云端零历史无回滚损失。 */
       try {
+        /* 🔥 gitExec 返回字符串本身（String(stdout)），不是 {stdout} 对象——
+           上一版 countOut.stdout 恒 undefined → commitCount NaN → squash 永不触发。
+           双端三次上传实测零 squash 的真因（2026-10-26 复盘）。 */
         const countOut = await gitExec(eff.gitBinary, ['rev-list', '--count', 'HEAD'], repoDir)
-        const commitCount = Number(String(countOut && countOut.stdout || '').trim())
+        const commitCount = Number(String(countOut ?? '').trim())
         if (Number.isFinite(commitCount) && commitCount > 1) {
           ctx.logger?.info?.(`dsh-sync: auto-squash: 提交数 ${commitCount} > 1，重写单提交基线…`)
           await gitExec(eff.gitBinary, ['checkout', '--orphan', '__autosquash__'], repoDir)
