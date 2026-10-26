@@ -2959,6 +2959,16 @@ module.exports = {
       try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
         if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
       }
+      /* [skills 退役 2026-10-26] syncSkills=false 后 spec 无 skills 组，但影子仓/云端
+         仍躺着历史 skills（手机曾以 true 灌过 200MB）。git add -A 会永远背着它。
+         修：上传前清理【本机实例】的 skills 目标目录（幂等；云端随下次 squash 归 1
+         从 tree 里自然消失）。放短路之后：短路时不碰（零变化不该有磁盘动作）。 */
+      if (eff.syncSkills !== true) {
+        try {
+          const ownSkills = join(repoDir, `backup/${state.instanceId}/skills`)
+          await fsP.rm(ownSkills, { recursive: true, force: true }).catch(() => {})
+        } catch { /* 清理失败不拦上传 */ }
+      }
       const hasRemote = await gitExec(eff.gitBinary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
       if (hasRemote) {
         await gitExec(eff.gitBinary, ['checkout', eff.branch], repoDir).catch(() => {})
