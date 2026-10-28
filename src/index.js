@@ -143,14 +143,14 @@ function syncSettingsSchema(S) {
     token: S.string(),
   })
 }
-let Config = null
+let Config = undefined
 let configError = null
 try {
   Config = Schema
     ? Schema.object({
       sync: syncSettingsSchema(Schema).volatile(),
     })
-    : null
+    : undefined
 } catch (e) { configError = String((e && e.message) || e) }
 // 兜底链：主路径失败不能让 Config 停在 null —— null 会让 settings.update 抛
 // "Cannot use 'in' operator to search for 'toJSON' in null"，设置只进内存、重启即丢。
