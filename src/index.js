@@ -713,7 +713,13 @@ async function treeSignature(dir, opts) {
                 if (excludeNames && excludeNames.has(ent.name)) continue
                 if (includeFiles && !includeFiles.has(ent.name)) continue
                 try {
-                    const st = followSymlinks ? await fsP.stat(p) : ent
+                    /* [2026-10-31 NaN 修复] 原写法 followSymlinks 关时 st=Dirent，
+                       而 Dirent 没有 .size → bytes += undefined = NaN → 签名恒为
+                       "NaN:文件数"，所有文件数不变的组被 size-skip 永久跳过
+                       （plugins/skills/prompts 上传自「极速短路 v2」上线起实际死亡，
+                       云端停在最后一次全量同步）。stat/lstat 都返回带 size 的
+                       Stats 对象：跟链接用 stat，不跟用 lstat。 */
+                    const st = followSymlinks ? await fsP.stat(p) : await fsP.lstat(p)
                     if (st && st.isFile()) { bytes += st.size; files++ }
                 } catch { }
             }
@@ -721,6 +727,57 @@ async function treeSignature(dir, opts) {
     }
     await walk(dir)
     return exists ? (bytes + ':' + files) : null
+}
+
+/* [2026-10-31 字节巧合陷阱修复] 小树内容签名：逐文件 SHA-1（相对路径 + 内容）。
+   为什么要有它：treeSignature 只看「总字节数:文件数」，当某组内容变了但总字节数
+   恰好不变（实测：patch.yml 追加一个 465B 的配置块，本地与影子仓总字节双双 4660B），
+   size-skip 会把整组静默跳过 → 云端永远收不到新版 → 下载端 overwriteOnDownload
+   再把旧版灌回本机 = 用户看到的「设置被下载冲掉」。
+   只用于小组（文件数 ≤ limit）；大组（skills 12,941 文件）算 hash 太贵，
+   且字节总和撞车概率随文件数指数下降，维持字节签名。 */
+const SMALL_TREE_CONTENT_LIMIT = 64
+/* 字节上限：小树的第二道门（总字节超过就别做内容 hash 了）。 */
+const SMALL_TREE_CONTENT_BYTES = 4 * 1024 * 1024
+async function contentSignature(dir, opts, limit) {
+    try {
+        const { createHash } = require('node:crypto')
+        const { includeFiles, excludeDirs, excludeNames, followSymlinks } = opts || {}
+        const files = []
+        let exists = false
+        let bytes = 0
+        const walk = async (d, rel) => {
+            let entries
+            try { entries = await fsP.readdir(d, { withFileTypes: true }) } catch { return }
+            exists = true
+            for (const ent of entries) {
+                if (ent.name === '.git') continue
+                const p = join(d, ent.name)
+                const r = rel ? rel + '/' + ent.name : ent.name
+                if (ent.isDirectory()) {
+                    if (excludeDirs && excludeDirs.has(ent.name)) continue
+                    await walk(p, r)
+                } else {
+                    if (excludeNames && excludeNames.has(ent.name)) continue
+                    if (includeFiles && !includeFiles.has(ent.name)) continue
+                    try {
+                        const st = followSymlinks ? await fsP.stat(p) : await fsP.lstat(p)
+                        if (st && st.isFile()) { bytes += st.size; files.push([r, p]) }
+                    } catch { }
+                }
+            }
+        }
+        await walk(dir, '')
+        if (!exists || files.length > limit || bytes > SMALL_TREE_CONTENT_BYTES) return null
+        files.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+        const agg = createHash('sha1')
+        for (const [rel, p] of files) {
+            agg.update(rel + '\0')
+            agg.update(await fsP.readFile(p))
+            agg.update('\0')
+        }
+        return 'c1:' + agg.digest('hex')
+    } catch { return null }
 }
 async function copyTree(from, to, opts) {
   const { includeFiles, excludeDirs, excludeNames, followSymlinks } = opts || {}
@@ -2661,7 +2718,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
@@ -3071,13 +3128,41 @@ module.exports = {
              // [size-skip] 源与影子的「总字节数:文件数」一致 → 整组跳过（不删不拷）。
              // 对 skills（12,941 文件 / 76MB）收益最大；体积+文件数双匹配，
              // 误判面远窄于单看时间戳；git 层仍有内容哈希兜底。
+             // [2026-10-31 修正] 上面「git 层兜底」的说法不成立：mirror 没拷贝时
+             // 影子仓根本没有变化，git 无东西可提交。「总字节数:文件数」签名在
+             // 内容变化但总字节数恰好相等时会误判（同日实测：patch.yml +465B 配置块
+             // 使本地与影子仓总字节双双 4660B，plugins 组被静默跳过 → 云端停在旧版
+             // → 下载端 overwriteOnDownload 把旧版灌回 = 「设置被下载冲掉」）。
+             // 因此：小组（≤SMALL_TREE_CONTENT_LIMIT 文件）在字节签名一致时，
+             // 再用内容 hash 复核；hash 不同 → 整组重灌（小组文件少，代价可忽略）；
+             // hash 也一致才真正跳过。大组维持字节签名（性能不变）。
              const sigOpts = { includeFiles: src.includeFiles, excludeDirs: src.excludeDirs, excludeNames: src.excludeNames, followSymlinks: src.followSymlinks }
              try {
                const sigA = await treeSignature(src.from, sigOpts)
                const sigB = await treeSignature(target, sigOpts)
                if (sigA !== null && sigB !== null && sigA === sigB) {
-                 skipped.push(src.to + ' (体积未变，跳过)')
-                 continue
+                 const groupFileCount = Number(String(sigA).split(':')[1] || '0')
+                 let trulyUnchanged = true
+                 if (groupFileCount > 0 && groupFileCount <= SMALL_TREE_CONTENT_LIMIT) {
+                   const hA = await contentSignature(src.from, sigOpts, SMALL_TREE_CONTENT_LIMIT)
+                   const hB = await contentSignature(target, sigOpts, SMALL_TREE_CONTENT_LIMIT)
+                   if (hA !== null && hB !== null && hA !== hB) {
+                     trulyUnchanged = false
+                     if (group.name !== 'sessions') {
+                       await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
+                     }
+                     await copyTree(src.from, target, {
+                       includeFiles: src.includeFiles,
+                       excludeDirs: src.excludeDirs,
+                       excludeNames: src.excludeNames,
+                       followSymlinks: src.followSymlinks,
+                     })
+                   }
+                 }
+                 if (trulyUnchanged) {
+                   skipped.push(src.to + ' (体积未变，跳过)')
+                   continue
+                 }
                }
              } catch { /* 签名失败 → 照常拷贝 */ }
             // [differential] 整组签名不同 → 逐级下钻，只拷有差异的文件，不再全量重拷
