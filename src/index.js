@@ -3,30 +3,40 @@
 /**
  * dsh-plugin-dsh-sync — Host half
  *
- * A small git-based sync system for multiple dsh replicas. Each instance
- * mirrors its skills / sessions / settings / plugins into a private GitCode
- * repository through a branch → PR → merge flow, so two replicas that both
- * touch the same file surface as a pull request instead of a silent
- * overwrite. Deterministic work (fetch / branch / commit / push) is done by
- * the git CLI directly; only the conflict step — which needs semantic
- * judgement — hands off to an in-process agent (same channel skills-management
- * share uses). Token is write-only through the host settings service and
- * never travels to the client in cleartext.
+ * ── 同步策略现状总纲（2026-10-31 定稿；2026-11-01 增补 sqlite 下载门）──────────
+ * 多个 AI 曾按下方旧 Architecture 注释把整个插件误读成「旧的 Merge 策略」，在此钉死：
  *
- * Architecture: a shadow working tree at $DSH_HOME/dsh-sync/repo mirrors
- * selected live roots. Push = fetch origin/main → reset shadow to origin/main
- * → overlay live snapshot → branch → commit → push → create PR → mergeable?
- * merge (+ delete the sync branch) : surface a conflict action. Files both
- * sides changed (bothModified) are NOT pushed with the snapshot — the remote
- * version stays on main and the local version stays in live, and with
- * conflictMode=ai an in-process agent semantically merges them (same channel
- * skills-management share uses). First join (no common baseline) is a union:
- * remote-only files are restored instead of being deleted by the snapshot,
- * and a differing remote settings.yaml wins until an align merges per-key.
- * Pull = fetch → for files remote changed since lastSyncedCommit, write the
- * remote version back to live only when the local copy is untouched (three-
- * way; locally-modified files wait for the next push). Conflicts an agent
- * cannot auto-resolve stay open as PRs.
+ * ① 配置类组（skills/settings/plugins/prompts）：overwriteOnDownload: true，
+ *    云端为真源，下载即整组覆盖本地（2026-10-09 用户定案，不是 bug）。
+ *    事故：10-31 深夜手机端点下载 → 云端 backup 覆盖 →「旧设置盖新设置」。
+ *    该设计手机事故后是否重审【由用户拍板】，改前先问，别替他决定。
+ * ② 数据类组（sessions/knowledge/memory）：strategy 名义 merge，
+ *    但 knowledge/memory 实质是【文件级 apply 整文件覆盖】（memory.sqlite /
+ *    knowledge.sqlite 整文件搬）；sessions 走专用对账（stat+copyFile）。
+ * ③ 上传侧：各组走 size-skip（treeSignature 字节签名；NaN bug 已修，a8257ba）
+ *    + 小组 contentSignature hash 复核；无变化极速短路（秒级）。日常直推 main
+ *    并周期性 auto-squash 单提交基线；branch→PR→merge 仅在 bothModified 冲突时启用。
+ * ④ 下载侧两道完整性门（事故驱动，别删）：
+ *    - sessions：gateSessionPayload——zstd 多帧/seq 断口/settlement 校验，
+ *      坏文件进 sessions/--quarantine--/，本机权威分毫不动。
+ *    - knowledge/memory 的 .sqlite：gateSqlitePayload（2026-11-01 新增）——
+ *      云端副本 integrity_check 不 ok → 进 dsh-sync/quarantine/ 拒绝覆盖；
+ *      本地 -wal 非空（宿主正在写库）→ 拒绝覆盖并提示退出 DSH；
+ *      放行前本地三件套快照进 dsh-sync/pre-apply-backup/<时间戳>/。
+ *    为什么：PC memory.sqlite 于 10-22~10-26 间二次损坏并被多次上传，10-31 深夜
+ *    手机下载即中招；且 WAL 未合并时覆盖主库 = 新旧页错位（10-22/10-26 两次 PC
+ *    坏库同款配方）。「名义 merge 实为文件覆盖」的名实相符改造是独立课题，未做。
+ * ⑤ 冲突：conflictMode=ai 时 bothModified 文件由 in-process agent 语义合并。
+ *
+ * Architecture（仍然真实的部分）：shadow working tree at $DSH_HOME/dsh-sync/repo
+ * mirrors selected live roots. Push = fetch origin/main → reset shadow → overlay
+ * live snapshot → commit → push. Pull = fetch → for files remote changed since
+ * lastSyncedCommit, write remote version back to live only when the local copy
+ * is untouched (three-way)——外加上面两道完整性门。Token is write-only through
+ * the host settings service and never travels to the client in cleartext.
+ *
+ * 【注释维护铁律】每处改动必须带日期 + 一句「为什么」。注释与行为不同步比没注释更害人
+ * （本文件头部就是受害者）。
  */
 
 const { execFile } = require('node:child_process')
@@ -546,6 +556,12 @@ function defaultRoots() {
   }
 }
 
+// ── 同步策略速查（2026-10-31 现状；详见文件头总纲）────────────────────────
+// 配置类（skills/settings/plugins/prompts）：overwriteOnDownload: true，云端为真源、
+//   下载即覆盖（2026-10-09 用户定案；10-31 手机事故后是否重审等用户拍板）。
+// 数据类（sessions/knowledge/memory）：名义 merge；sessions 专用对账，
+//   knowledge/memory 实为文件级 apply 整文件覆盖，覆盖安全由 sqlite 下载门兜底（2026-11-01）。
+// 上传：size-skip（treeSignature）+ 小组 contentSignature hash 复核（a8257ba）+ 无变化短路。
 function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
   const backup = (to) => `backup/${instanceId}/${to}`
   const groups = []
@@ -602,8 +618,12 @@ function syncSpec(eff, roots = defaultRoots(), instanceId = 'instance') {
   })
   // 知识库：单文件、按整文件比对。SQLite 是二进制，两侧都改会走冲突流程
   // （conflictMode: ai 由对齐步骤处理，失败则人工选边）；日常单端写入不会触发。
+  // 2026-11-01 注：下载侧必须过 gateSqlitePayload（integrity + WAL 配套 + 快照），
+  // 否则就是 10-31 手机端坏库事故的复刻路径。
   if (eff.syncMemory) groups.push({
     name: 'memory', strategy: memoryStrategy,
+    // 2026-11-01 注：memory.sqlite 名义 merge、实为文件级 apply。别把它当真 merge；
+    // 整文件覆盖对 DSH 正在写的库是危险动作，安全网在 gateSqlitePayload。
     sources: [{ from: roots.sessionKitMemory, to: memoryStrategy === 'standalone' ? backup('memory/memory.sqlite') : 'memory/memory.sqlite', file: true }],
   })
   if (eff.syncKnowledge) groups.push({
@@ -1524,6 +1544,74 @@ async function gateSessionPayload(livePath, buf, logger) {
   return false
 }
 
+// ── 2026-11-01 SQLite 下载门（gateSqlitePayload，3.2 止血，事故驱动，别删）─────
+// 事故链：PC memory.sqlite 于 10-22~10-26 间二次损坏（B-tree 坏页）并被多次上传，
+// 10-31 深夜手机端点下载 → 云端坏库整文件覆盖手机本地 → 手机库毁（"库坏了修了一些"）。
+// 另一配方：本地 WAL 未合并时覆盖主库 = 新旧页错位（10-22 与 10-26 两次 PC 坏库同款）。
+// 门对 *.sqlite 的下载 apply 做三件事：
+//   ① 云端副本落临时文件跑 PRAGMA integrity_check（机器无 sqlite3 CLI，用 node:sqlite），
+//     不 ok → 副本进 dsh-sync/quarantine/ 隔离（学 sessions --quarantine-- 范式），拒绝覆盖；
+//   ② 本地主库旁存在非空 -wal（宿主正在写库）→ 拒绝覆盖，提示退出 DSH 后重试；
+//     为什么不直接删 wal：宿主连接还开着，删 wal 是未定义行为；拒绝+提示才是安全语义。
+//   ③ 放行前把本地主库 + wal + shm 三件套快照进 dsh-sync/pre-apply-backup/<时间戳>/
+//     （10-20 手工救命快照 snapshots/manual-* 的自动化版；快照失败不阻断但尽量落盘）。
+// 返回 { ok: true } 或 { ok: false, reason }——reason 进下载回执 failed[].error，失败可见（红线）。
+async function gateSqlitePayload(livePath, buf, logger, stamp) {
+  if (!livePath.toLowerCase().endsWith('.sqlite')) return { ok: true }
+  const home = dshHome()
+  const problems = []
+  // ① 云端副本完整性
+  const tmpPath = join(home, 'dsh-sync', `gate-tmp-${randomUUID()}.sqlite`)
+  try {
+    await fsP.mkdir(join(tmpPath, '..'), { recursive: true })
+    await fsP.writeFile(tmpPath, buf)
+    const { DatabaseSync } = require('node:sqlite')
+    let db = null
+    try {
+      db = new DatabaseSync(tmpPath, { readOnly: true })
+      for (const r of db.prepare('PRAGMA integrity_check').all()) {
+        if (r.integrity_check !== 'ok') problems.push('云端副本 ' + r.integrity_check)
+      }
+    } finally { try { if (db) db.close() } catch {} }
+  } catch (e) { problems.push('云端副本无法校验: ' + String(e && e.message)) }
+  finally { try { await fsP.rm(tmpPath, { force: true }) } catch {} }
+  if (problems.length > 0) {
+    try {
+      const qDir = join(home, 'dsh-sync', 'quarantine')
+      await fsP.mkdir(qDir, { recursive: true })
+      const qPath = join(qDir, stamp + '-' + livePath.split(/[\\/]/).pop())
+      await fsP.writeFile(qPath, buf)
+      await fsP.writeFile(qPath + '.why.json', JSON.stringify({ at: new Date().toISOString(), livePath, problems }, null, 2))
+    } catch {}
+    try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] sqlite 下载门: 隔离云端副本 ' + livePath + ' → ' + problems[0]) } catch {}
+    return { ok: false, reason: 'sqlite 下载门：云端副本 integrity 不通过（' + problems[0] + '），副本已隔离到 dsh-sync/quarantine/，本地未动' }
+  }
+  // ② 本地 WAL 未合并 → 拒绝（退出 DSH 后 wal 清空/合并，届时放行）
+  try {
+    const walStat = await fsP.stat(livePath + '-wal')
+    if (walStat.size > 0) {
+      const msg = '本地 ' + livePath + ' 存在未合并 WAL（' + walStat.size + 'B，DSH 正在写库）：此时覆盖主库会新旧页错位（10-22/10-26 两次坏库配方），已拒绝。请完全退出 DSH 后再点下载。'
+      try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] sqlite 下载门: ' + msg) } catch {}
+      return { ok: false, reason: msg }
+    }
+  } catch { /* 本地无库或无 wal（新机拉取），放行 */ }
+  // ③ 覆盖前快照本地三件套
+  try {
+    const snapDir = join(home, 'dsh-sync', 'pre-apply-backup', stamp)
+    await fsP.mkdir(snapDir, { recursive: true })
+    const base = livePath.split(/[\\/]/).pop()
+    for (const ext of ['', '-wal', '-shm']) {
+      try {
+        const b = await fsP.readFile(livePath + ext)
+        if (b && b.length) await fsP.writeFile(join(snapDir, base + ext), b)
+      } catch { /* 单件缺失属正常 */ }
+    }
+  } catch (e) {
+    try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] sqlite 下载门: 快照失败（继续，但失去回滚点）: ' + String(e && e.message)) } catch {}
+  }
+  return { ok: true }
+}
+
 async function normalizeDownloadedSessions(home) {
   const zlib = require('node:zlib')
   const sessionsRoot = join(home, 'sessions')
@@ -2286,6 +2374,9 @@ function pullSafety(category, isMine, liveExists) {
      （与 prompts 完全同病：上传得到、下载不来）。
      这两组在 syncSpec 里是 strategy:'merge' + file:true 单文件，语义上就应双向；
      SQLite 双方都改过时由调和路径处理（冲突回滚保本机），此处只保证「能拉」。 */
+  // 2026-11-01 注：knowledge/memory 的 apply = 整文件覆盖（名义 merge 名实不符）。
+  // 覆盖安全由 sqlite 下载门（gateSqlitePayload：integrity + WAL 配套 + 快照）兜底。
+  // 别在此改成真 merge——名实相符改造是独立课题，先做止血。
   if (category === 'knowledge') return { action: 'apply', warn: '知识库 knowledge.sqlite（来自另一台机器）' }
   if (category === 'memory') return { action: 'apply', warn: '记忆库 memory.sqlite（来自另一台机器）' }
   return { action: 'block', reason: '未识别的路径类别，不处理' }
@@ -2417,13 +2508,27 @@ async function applyRemotePullPlan(binary, eff, { repoDir, state, roots }, plan)
   const spec = logicalSpec(eff, roots)
   const applicable = plan.filter(p => p.action === 'apply')
   const applied = [], failed = []
+  // 2026-11-01 sqlite 门：同一次 pull 的快照/隔离区共用一个时间戳目录
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
   for (const p of applicable) {
     try {
       const remoteBuf = await gitShowBuf(binary, `${BROWSE_REF}:${p.remotePath}`, repoDir)
       const livePath = resolveLivePath(spec, p.logicalPath)
       if (!livePath) { failed.push({ path: p.remotePath, error: '无法映射到 live 路径' }); continue }
       if (!await gateSessionPayload(livePath, remoteBuf)) { failed.push({ path: p.remotePath, error: '完整性门隔离（见 sessions/--quarantine--/）' }); continue }
+      // 2026-11-01 3.2 止血：.sqlite 走下载门（云端 integrity + 本地 WAL 配套 + 覆盖前快照）
+      const isSqlite = livePath.toLowerCase().endsWith('.sqlite')
+      if (isSqlite) {
+        const gate = await gateSqlitePayload(livePath, remoteBuf, eff && eff.logger, stamp)
+        if (!gate.ok) { failed.push({ path: p.remotePath, error: gate.reason }); continue }
+      }
       await atomicWriteFile(livePath, remoteBuf)
+      if (isSqlite) {
+        // 走到这里 wal 必为空或不存在（门②已拦非空）；清残留 shm/wal 防跨版本错位。
+        // Windows 下宿主还开着文件时 rm 会失败——忽略（空 wal 无害，宿主 recovery 会重建）。
+        try { await fsP.rm(livePath + '-shm', { force: true }) } catch {}
+        try { await fsP.rm(livePath + '-wal', { force: true }) } catch {}
+      }
       applied.push(p.remotePath)
     } catch (e) { failed.push({ path: p.remotePath, error: String(e && e.message) }) }
   }
@@ -2718,7 +2823,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
