@@ -3415,10 +3415,73 @@ module.exports = {
             let cloudWsDirs = []
             try { cloudWsDirs = await fsP.readdir(source, { withFileTypes: true }) } catch {}
             const byWorkspace = {}
-            /* 2026-10-14 下载真覆盖：同一工作区在云端可能有多个目录（各机编码不同）。
-               原实现每个云端目录都先清空本机再拷 —— 第二个目录把刚拷的又清掉（末位赢）。
-               改为本机每个目录只清一次，之后各云端目录向它并集拷入。 */
-            const __clearedLocalDirs = new Set()
+            /* 2026-11-02 会话下载重写：多机同 id 会话「新者赢」（事故根治）。
+               事故：同一工作区在云端有 PC 目录 + 手机目录（--root-...），同 id 会话
+               双线各自演化。旧实现按目录字母序「清空本机+重灌」——手机目录排在 PC
+               目录之后，同 id 会话 rm+copyTree 把刚落地的 PC 新版盖成手机旧版
+               （实测：PC 端聊到 488 行的会话被回退成手机端 202 行，用户「上传→下载
+               →还是被冲」）。原「并集拷入」注释对同 id 会话是假的：copyTree 遇到
+               同名目录就是整目录覆盖。
+               新语义（三版本取最新）：
+               ① 收集每个会话 id 的全部云端副本（各机目录），解压取最大事件时间；
+               ② 与本机现有版本比 maxTime，最新者落地；并列优先本机（免无谓写）；
+               ③ 本机有、云端无任何副本 → 保留不动（本机独有会话不再被整目录清空蒸发）；
+               ④ 云端有、本机无 → 拷入最新副本（新会话下载照旧）；
+               ⑤ 单副本且与本机 size 相同 → 快路径跳过（免解压）；
+               ⑥ 云端胜出要覆盖前过完整性门（gateSessionPayload），坏副本不落地；
+                  解压失败的副本 maxTime=0 永不赢；本机解压失败按 0（让云端健康版救回）。 */
+            const fixCwd = async (dir, wsPath) => {
+              let ents = []
+              try { ents = await fsP.readdir(dir, { withFileTypes: true }) } catch { return }
+              for (const ent of ents) {
+                const full = join(dir, ent.name)
+                if (ent.isDirectory()) { await fixCwd(full, wsPath); continue }
+                if (!ent.name.endsWith('.zstd')) continue
+                try {
+                  const buf = await fsP.readFile(full)
+                  const positions = []
+                  for (let k = 0; k <= buf.length - 4; k++) {
+                    if (buf[k] === 0x28 && buf[k+1] === 0xB5 && buf[k+2] === 0x2F && buf[k+3] === 0xFD) positions.push(k)
+                  }
+                  if (positions.length === 0) continue
+                  const firstFrameEnd = positions.length > 1 ? positions[1] : buf.length
+                  const headerFrame = buf.slice(0, firstFrameEnd)
+                  const restFrames = positions.length > 1 ? buf.slice(firstFrameEnd) : Buffer.alloc(0)
+                  const text = zlib2.zstdDecompressSync(headerFrame).toString('utf8')
+                  const lines = text.split('\n')
+                  if (!lines[0]) continue
+                  const obj = JSON.parse(lines[0])
+                  if (obj.cwd === wsPath) continue
+                  obj.cwd = wsPath
+                  lines[0] = JSON.stringify(obj)
+                  const newHeaderFrame = zlib2.zstdCompressSync(Buffer.from(lines.join('\n'), 'utf8'))
+                  const out = Buffer.concat([newHeaderFrame, restFrames])
+                  await fsP.writeFile(full, out)
+                } catch {}
+              }
+            }
+            const sessionMaxTime = async (zstPath) => {
+              try {
+                const buf = await fsP.readFile(zstPath)
+                const positions = []
+                for (let k = 0; k <= buf.length - 4; k++) {
+                  if (buf[k] === 0x28 && buf[k+1] === 0xB5 && buf[k+2] === 0x2F && buf[k+3] === 0xFD) positions.push(k)
+                }
+                positions.push(buf.length)
+                let mx = 0
+                for (let i = 0; i < positions.length - 1; i++) {
+                  let text = ''
+                  try { text = zlib2.zstdDecompressSync(buf.subarray(positions[i], positions[i + 1])).toString('utf8') } catch { continue }
+                  for (const line of text.split('\n')) {
+                    if (!line.trim()) continue
+                    try { const ev = JSON.parse(line); if (typeof ev.time === 'number' && ev.time > mx) mx = ev.time } catch {}
+                  }
+                }
+                return mx
+              } catch { return 0 }
+            }
+            // 阶段一：收集所有云端目录 → cloudBase → 本机工作区；会话 id → 副本清单
+            const wsGroups = new Map()   // targetWsDir -> { targetWs, copies: Map<id, [...]> }
             for (const cws of cloudWsDirs) {
               if (!cws.isDirectory()) continue
               const cwsPath = join(source, cws.name)
@@ -3453,99 +3516,87 @@ module.exports = {
                 applied.push(src.to + ' -> SKIP ' + cloudBase + ' (本机无同名工作区，按规格完全不碰)')
                 continue
               }
-              const targetWorkspacePath = targetWs.path
-              const targetDirName = encodeWorkspaceDir(targetWorkspacePath)
+              const targetDirName = encodeWorkspaceDir(targetWs.path)
               const targetWsDir = join(localRoot, targetDirName)
               await fsP.mkdir(targetWsDir, { recursive: true })
-              if (!__clearedLocalDirs.has(targetWsDir)) {
-                __clearedLocalDirs.add(targetWsDir)
-                try {
-                  const olds = await fsP.readdir(targetWsDir, { withFileTypes: true })
-                  for (const oe of olds) {
-                    if (oe.isDirectory() && oe.name.startsWith('session-')) {
-                      await fsP.rm(join(targetWsDir, oe.name), { recursive: true, force: true }).catch(() => {})
-                    }
-                  }
-                } catch {}
+              let grp = wsGroups.get(targetWsDir)
+              if (!grp) {
+                grp = { targetWs, targetDirName, cloudBases: [], copies: new Map() }
+                wsGroups.set(targetWsDir, grp)
               }
-              const cwsSessionIds = []
+              grp.cloudBases.push(cloudBase)
               for (const se of sessionsList) {
-                if (!se.isDirectory()) continue
-                // [final-B] 同理：子代理会话不落地
-                if (!se.name.startsWith('session-')) continue
-                const dstSession = join(targetWsDir, se.name)
-                /* [E线增量 2026-10-25] 下载侧同样会话粒度字节对比：本地同会话
-                   (size,mtime) 与云端一致 → 跳过（不 rm 不拷，projcache 也不用清）。
-                   ⚠️ 下载后会跑 walkFix2 重写 header cwd——跳过的会话若 cwd 不符
-                   不会被修；但 cwd 修复属一次性迁移（早跑过），常态数据 mtime
-                   一致即内容一致。不一致才走原 rm+copyTree。 */
+                if (!se.isDirectory() || !se.name.startsWith('session-')) continue   // [final-B] 子代理会话不落地
                 let seFiles = []
                 try { seFiles = await fsP.readdir(join(cwsPath, se.name)) } catch {}
                 const seZst = seFiles.find(x => x.endsWith('.zstd'))
-                if (seZst) {
-                  let cloudZstSt = null
-                  try { cloudZstSt = await fsP.stat(join(cwsPath, se.name, seZst)) } catch {}
-                  let localZstSt = null
-                  try { localZstSt = await fsP.stat(join(dstSession, seZst)) } catch {}
-                  if (cloudZstSt && localZstSt && cloudZstSt.size === localZstSt.size && cloudZstSt.mtimeMs === localZstSt.mtimeMs) {
-                    cwsSessionIds.push(se.name)
-                    if (!downloadedSessionIds.includes(se.name)) downloadedSessionIds.push(se.name)
-                    if (!allDownloadedSessionIds.includes(se.name)) allDownloadedSessionIds.push(se.name)
+                if (!seZst) continue
+                let size = 0
+                try { size = (await fsP.stat(join(cwsPath, se.name, seZst))).size } catch {}
+                const list = grp.copies.get(se.name) || []
+                list.push({ dirName: cws.name, sessionDir: join(cwsPath, se.name), zstName: seZst, size, maxTime: null })
+                grp.copies.set(se.name, list)
+              }
+            }
+            // 阶段二：逐工作区落地（新者赢；本机独有保留）
+            for (const grp of wsGroups.values()) {
+              const targetWsDir = join(localRoot, grp.targetDirName)
+              const targetWorkspacePath = grp.targetWs.path
+              let wrote = false
+              const cwsSessionIds = []
+              for (const [sid, copies] of grp.copies) {
+                const dstSession = join(targetWsDir, sid)
+                const localZst = join(dstSession, copies[0].zstName)
+                let localSt = null
+                try { localSt = await fsP.stat(localZst) } catch {}
+                if (copies.length === 1 && localSt && copies[0].size === localSt.size) {
+                  cwsSessionIds.push(sid)
+                  if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                  if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
+                  continue
+                }
+                for (const cp of copies) {
+                  if (cp.maxTime === null) cp.maxTime = await sessionMaxTime(join(cp.sessionDir, cp.zstName))
+                }
+                const localMaxTime = localSt ? await sessionMaxTime(localZst) : -1
+                const best = copies.reduce((a, b) => (b.maxTime > a.maxTime ? b : a), copies[0])
+                if (localSt && localMaxTime >= best.maxTime) {
+                  cwsSessionIds.push(sid)   // 本机最新（或并列）→ 保留本机
+                  if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                  if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
+                  continue
+                }
+                // 云端胜出 → 过完整性门后覆盖本机
+                try {
+                  const candBuf = await fsP.readFile(join(best.sessionDir, best.zstName))
+                  if (!await gateSessionPayload(join(dstSession, best.zstName), candBuf, ctx.logger)) {
+                    applied.push(src.to + ' -> SKIP ' + sid + ' (完整性门隔离：' + best.dirName + ')')
                     continue
                   }
-                }
+                } catch {}
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
-                await copyTree(join(cwsPath, se.name), dstSession, {})
-                cwsSessionIds.push(se.name)
-                if (!downloadedSessionIds.includes(se.name)) downloadedSessionIds.push(se.name)
-                if (!allDownloadedSessionIds.includes(se.name)) allDownloadedSessionIds.push(se.name)
+                await copyTree(best.sessionDir, dstSession, {})
+                wrote = true
+                cwsSessionIds.push(sid)
+                if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
               }
-              try {
-                const walkFix2 = async (dir) => {
-                  let ents = []
-                  try { ents = await fsP.readdir(dir, { withFileTypes: true }) } catch { return }
-                  for (const ent of ents) {
-                    const full = join(dir, ent.name)
-                    if (ent.isDirectory()) { await walkFix2(full); continue }
-                    if (!ent.name.endsWith('.zstd')) continue
-                    try {
-                      const buf = await fsP.readFile(full)
-                      const positions = []
-                      for (let k = 0; k <= buf.length - 4; k++) {
-                        if (buf[k] === 0x28 && buf[k+1] === 0xB5 && buf[k+2] === 0x2F && buf[k+3] === 0xFD) positions.push(k)
-                      }
-                      if (positions.length === 0) continue
-                      const firstFrameEnd = positions.length > 1 ? positions[1] : buf.length
-                      const headerFrame = buf.slice(0, firstFrameEnd)
-                      const restFrames = positions.length > 1 ? buf.slice(firstFrameEnd) : Buffer.alloc(0)
-                      const text = zlib2.zstdDecompressSync(headerFrame).toString('utf8')
-                      const lines = text.split('\n')
-                      if (!lines[0]) continue
-                      const obj = JSON.parse(lines[0])
-                      if (obj.cwd === targetWorkspacePath) continue
-                      obj.cwd = targetWorkspacePath
-                      lines[0] = JSON.stringify(obj)
-                      const newHeaderFrame = zlib2.zstdCompressSync(Buffer.from(lines.join('\n'), 'utf8'))
-                      const out = Buffer.concat([newHeaderFrame, restFrames])
-                      await fsP.writeFile(full, out)
-                    } catch {}
+              if (wrote) {
+                try { await fixCwd(targetWsDir, targetWorkspacePath) } catch {}
+                try {
+                  const projDir = join(dshHome(), 'storages', 'session_projcache', 'sessions')
+                  for (const sid of cwsSessionIds) {
+                    await fsP.rm(join(projDir, sid + '.json'), { force: true }).catch(() => {})
                   }
-                }
-                await walkFix2(targetWsDir)
-              } catch {}
-              try {
-                const projDir = join(dshHome(), 'storages', 'session_projcache', 'sessions')
-                for (const sid of cwsSessionIds) {
-                  await fsP.rm(join(projDir, sid + '.json'), { force: true }).catch(() => {})
-                }
-              } catch {}
+                } catch {}
+              }
               if (!finalWorkspacePath) finalWorkspacePath = targetWorkspacePath
-              const key = targetWs.id || ('__new__' + targetWorkspacePath)
-              if (!byWorkspace[key]) byWorkspace[key] = { id: targetWs.id, path: targetWorkspacePath, title: targetWs.title, sessionIds: [] }
+              const key = grp.targetWs.id || ('__new__' + targetWorkspacePath)
+              if (!byWorkspace[key]) byWorkspace[key] = { id: grp.targetWs.id, path: targetWorkspacePath, title: grp.targetWs.title, sessionIds: [] }
               for (const sid of cwsSessionIds) {
                 if (!byWorkspace[key].sessionIds.includes(sid)) byWorkspace[key].sessionIds.push(sid)
               }
-              applied.push(src.to + ' -> ' + targetDirName + ' (' + cloudBase + ', ' + cwsSessionIds.length + ')')
+              applied.push(src.to + ' -> ' + grp.targetDirName + ' (' + grp.cloudBases.join('+') + ', ' + cwsSessionIds.length + ')')
             }
             try {
               const workspaceJsonPath = join(dshHome(), 'storages', 'workspace.json')
