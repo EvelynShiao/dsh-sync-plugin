@@ -373,6 +373,53 @@ function encodeWorkspaceDir(workspacePath) {
   }
   return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
 }
+/* [2026-11-02 路径归一] 工作区 folder 名 → 云端 ws/ 目录 key。字符策略与
+   encodeWorkspaceDir 一致（安全字符原样、其余 ~XXXX）。PC 的 work/Evelyn 与手机的
+   /root/.dsh/work/Evelyn 尾段同名 → 同一 key → 云端单目录、同 id 会话单份存储。 */
+function encodeName(name) {
+  let out = ''
+  for (const ch of String(name)) {
+    const code = ch.codePointAt(0)
+    if (/^[A-Za-z0-9._-]$/.test(ch)) out += ch
+    else out += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out
+}
+async function loadWorkspaceMap() {
+  const out = []
+  try {
+    const doc = JSON.parse(await fsP.readFile(join(dshHome(), 'storages', 'workspace.json'), 'utf8'))
+    for (const w of Object.values(doc?.tables?.workspaces ?? {})) {
+      if (!w?.path) continue
+      const folder = String(w.path).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+      out.push({ dirName: encodeWorkspaceDir(w.path), folderKey: encodeName(folder), path: w.path, title: w.title })
+    }
+  } catch {}
+  return out
+}
+/* zstd 会话 buffer 的最大事件时间（0=解不出）。新者赢的判据：影子仓 checkout 会刷
+   mtime，mtime 不可信；事件流里的 time 才是内容真相。「后来居上」的安全形态就是
+   比它——谁的内容新谁算后来，而不是谁后点上传谁赢。 */
+function sessionMaxEventTimeBuf(buf) {
+  try {
+    const zlib = require('node:zlib')
+    const positions = []
+    for (let k = 0; k <= buf.length - 4; k++) {
+      if (buf[k] === 0x28 && buf[k + 1] === 0xB5 && buf[k + 2] === 0x2F && buf[k + 3] === 0xFD) positions.push(k)
+    }
+    positions.push(buf.length)
+    let mx = 0
+    for (let i = 0; i < positions.length - 1; i++) {
+      let text = ''
+      try { text = zlib.zstdDecompressSync(buf.subarray(positions[i], positions[i + 1])).toString('utf8') } catch { continue }
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue
+        try { const ev = JSON.parse(line); if (typeof ev.time === 'number' && ev.time > mx) mx = ev.time } catch {}
+      }
+    }
+    return mx
+  } catch { return 0 }
+}
 function dshHome() { return process.env.DSH_HOME ? resolve(process.env.DSH_HOME) : join(homedir(), '.dsh') }
 
 function displayPath(p) {
@@ -883,15 +930,23 @@ async function mirrorLiveToShadow(spec, shadowDir) {
           await fsP.mkdir(join(target, '..'), { recursive: true })
           await fsP.copyFile(src.from, target)
         } catch { try { await fsP.unlink(target) } catch {} }
-      } else {
-        /* 2026-10-14 合并式上传：sessions 组**不再整目录删重建**。
-           原实现先 rm(target) 再只拷本机 → 云端其他机器上传的会话（如手机的
-           「手机专属」工作区及其全部对话）在 PC 一次上传后整组消失（真机复现）。
-           改为：本机有的按文件覆盖（copyTree 是纯增量，不删多余），云端独有的保留。
-           skills/plugins/settings 等组保持原全量镜像语义（它们按目录整体属于本机配置）。 */
-        if (group.name !== 'sessions') {
-          await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
+      } else if (group.name === 'sessions') {
+        /* [2026-11-02 路径归一上传] 本机各工作区 → shadow sessions/ws/<工作区名编码>/。
+           同名工作区（PC work/Evelyn ↔ 手机 /root/.dsh/work/Evelyn）归并同一云端目录，
+           同 id 会话单份；copyTree 纯增量=本机新版覆盖云端（后来居上），云端独有
+           （他机刚传）保留不动，跨机对账交给 converge 的新者赢。2026-10-14 的
+           「不整目录删」语义由 ws/ 共享目录天然继承。 */
+        const wsMap = await loadWorkspaceMap()
+        for (const m of wsMap) {
+          const srcDir = join(src.from, m.dirName)
+          let isDir = false
+          try { isDir = (await fsP.stat(srcDir)).isDirectory() } catch {}
+          if (!isDir) continue
+          await copyTree(srcDir, join(target, 'ws', m.folderKey), {})
         }
+      } else {
+        /* 非 sessions 组保持原全量镜像语义（skills/plugins/settings 按目录整体属于本机）。 */
+        await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
         await copyTree(src.from, target, {
           includeFiles: src.includeFiles,
           excludeDirs: src.excludeDirs,
@@ -1739,10 +1794,32 @@ async function convergeCloudSessions(home, repoDir, logger) {
       const folder = String(header?.cwd ?? '').replace(/[\\/]+$/, '').split(/[\\/]/).pop()
       const localPath = wsByFolder.get(folder)
       if (!localPath) { dirEmpty = false; kept++; continue }   // 映射不上（如手机专用）→ 保留
-      const canonicalDir = encodeWorkspaceDir(localPath)
-      // ②a 本机权威已有同 ID（云端 canonical 也必有，镜像刚灌过）→ 异 lineage 副本就是冗余
+      const canonicalDir = join('ws', encodeName(folder))
+      // ②a [2026-11-02 新者赢] 异 lineage 副本不一定是冗余——它可能比本机新（另一台
+      //    机器刚聊完推上来的）。比最大事件时间：本机新/并列 → 删冗余（原语义）；
+      //    云端新 → 覆盖本机权威 + 写 ws/ canonical。「后来居上」的正确形态：
+      //    谁的内容新谁算后来，而不是谁后点上传谁赢。
       if (localIds.has(s.name)) {
-        try { await fsP.rm(join(shadowSess, cloudDir, s.name), { recursive: true, force: true }); converged++ } catch { dirEmpty = false }
+        const authFile = join(liveSess, encodeWorkspaceDir(localPath), s.name, 'session.v4.jsonl.zstd')
+        const localMx = await sessionMaxEventTimeBuf(await fsP.readFile(authFile).catch(() => Buffer.alloc(0)))
+        const cloudMx = sessionMaxEventTimeBuf(buf)
+        if (cloudMx > localMx) {
+          header.cwd = localPath
+          const nh2 = zlib.zstdCompressSync(Buffer.from(JSON.stringify(header) + '\n', 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
+          const nb2 = Buffer.concat([nh2, buf.subarray(frameEnd)])
+          if (await gateSessionPayload(authFile, nb2, logger)) {
+            try {
+              await fsP.mkdir(join(authFile, '..'), { recursive: true })
+              await fsP.writeFile(authFile, nb2)
+              const cd2 = join(shadowSess, canonicalDir, s.name)
+              await fsP.mkdir(cd2, { recursive: true })
+              await fsP.writeFile(join(cd2, 'session.v4.jsonl.zstd'), nb2)
+              rescued++
+            } catch { dirEmpty = false }
+          } else { dirEmpty = false; kept++ }
+        } else {
+          try { await fsP.rm(join(shadowSess, cloudDir, s.name), { recursive: true, force: true }); converged++ } catch { dirEmpty = false }
+        }
         continue
       }
       // ②b 本机缺此 ID → 救回本机权威目录（cwd 改写 + 完整性门），再写云端 canonical。
@@ -3158,12 +3235,12 @@ module.exports = {
             if (group.strategy === 'standalone') {
               await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
             }
-            await fsP.mkdir(target, { recursive: true })
-            let wsDirsUp = []
-            try { wsDirsUp = await fsP.readdir(src.from, { withFileTypes: true }) } catch {}
-            for (const ws of wsDirsUp) {
-              if (!ws.isDirectory()) continue
-              const wsTarget = join(target, ws.name)
+            await fsP.mkdir(join(target, 'ws'), { recursive: true })
+            /* [2026-11-02 路径归一上传] 目标 = ws/<工作区名编码>/（与 runPush 的 mirror
+               同一形态）；本机新版覆盖云端（后来居上），云端独有（他机刚传）不动。 */
+            const wsUpMap = await loadWorkspaceMap()
+            for (const ws of wsUpMap) {
+              const wsTarget = join(target, 'ws', ws.folderKey)
               /* 2026-10-14 上传真覆盖：ws.name 来自本机目录列举 = 本机 lineage 的云端目录。
                  [E线增量 2026-10-25] 工作区级 rm 改为「先建后并」：不再整目录清空，
                  会话级增删改在下面的循环里逐会话处理（无变化的跳过、改动的重灌、
@@ -3171,7 +3248,7 @@ module.exports = {
                  这条循环，永远保留（= 唯一例外：工作区对不上时融合）。 */
               await fsP.mkdir(wsTarget, { recursive: true })
               let sessionsUp = []
-              try { sessionsUp = await fsP.readdir(join(src.from, ws.name), { withFileTypes: true }) } catch {}
+              try { sessionsUp = await fsP.readdir(join(src.from, ws.dirName), { withFileTypes: true }) } catch {}
               const uploadedIds = new Set()
               for (const s of sessionsUp) {
                 if (!s.isDirectory()) continue
@@ -3205,17 +3282,10 @@ module.exports = {
                 const lockFile = join(sPath, 'session.lock')
                 try { await fsP.copyFile(lockFile, join(cloudSess, 'session.lock')) } catch {}
               }
-              /* [E线增量] 云端同工作区目录里、本地已不存在（且本轮没上传过）的会话：
-                 真覆盖语义——本机删了的会话在云端同步消失。这里保留 2026-10-14 的
-                 删除语义，只是从「先清空再灌」改为「灌完后对账删除」。 */
-              let cloudOnly = []
-              try { cloudOnly = await fsP.readdir(wsTarget, { withFileTypes: true }) } catch {}
-              for (const c of cloudOnly) {
-                if (!c.isDirectory()) continue
-                if (!c.name.startsWith('session-')) continue
-                if (uploadedIds.has(c.name)) continue
-                await fsP.rm(join(wsTarget, c.name), { recursive: true, force: true }).catch(() => {})
-              }
+              /* [2026-11-02 归一后取消对账删除] ws/<key>/ 是跨机共享目录：本机没有的
+                 会话可能是另一台机器刚传的，按「本机删了」处理会误删他机内容。
+                 会话删除从此是单机行为（云端不随本机删除而删），跨机对账由
+                 converge 的新者赢统一负责。 */
             }
             // [converge 2026-10-20] 本机目录镜像完、云端 canonical 就位后，就地收敛
             // 云端异 lineage 目录：冗余删 / 缺失救回 / 映射不上保留。
@@ -3481,34 +3551,68 @@ module.exports = {
               } catch { return 0 }
             }
             // 阶段一：收集所有云端目录 → cloudBase → 本机工作区；会话 id → 副本清单
+            /* [2026-11-02 归一] ws/<key>/ 是 canonical（key=工作区 folder 名编码）：
+               按 key 直接匹配本机工作区；旧 --* lineage 目录（他机旧版插件推的）仍按
+               header.cwd 探测 folder 作副本源，落地后整目录归并删除（阶段三）。 */
             const wsGroups = new Map()   // targetWsDir -> { targetWs, copies: Map<id, [...]> }
+            const oldLineageDirs = []
+            const localByFolderKey = new Map()
+            for (const m of await loadWorkspaceMap()) localByFolderKey.set(m.folderKey, m)
+            const expandedDirs = []
             for (const cws of cloudWsDirs) {
               if (!cws.isDirectory()) continue
+              if (cws.name === 'ws') {
+                let subs = []
+                try { subs = await fsP.readdir(join(source, 'ws'), { withFileTypes: true }) } catch {}
+                for (const sub of subs) {
+                  if (!sub.isDirectory()) continue
+                  expandedDirs.push({ name: 'ws' + sep + sub.name, wsKey: sub.name })
+                }
+              } else {
+                expandedDirs.push({ name: cws.name, wsKey: null })
+              }
+            }
+            for (const cws of expandedDirs) {
               const cwsPath = join(source, cws.name)
               let sessionsList = []
               try { sessionsList = await fsP.readdir(cwsPath, { withFileTypes: true }) } catch {}
               let cloudBase = null
-              for (const se of sessionsList) {
-                if (!se.isDirectory()) continue
-                let files = []
-                try { files = await fsP.readdir(join(cwsPath, se.name)) } catch {}
-                const zst = files.find(x => x.endsWith('.zstd'))
-                if (!zst) continue
-                try {
-                  const buf = await fsP.readFile(join(cwsPath, se.name, zst))
-                  const text = zlib2.zstdDecompressSync(buf).toString('utf8')
-                  const header = JSON.parse(text.split('\n')[0])
-                  if (header.cwd) {
-                    cloudBase = String(header.cwd).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
-                    break
-                  }
-                } catch {}
+              if (cws.wsKey) {
+                cloudBase = '__WSKEY__' + cws.wsKey
+              } else {
+                for (const se of sessionsList) {
+                  if (!se.isDirectory()) continue
+                  let files = []
+                  try { files = await fsP.readdir(join(cwsPath, se.name)) } catch {}
+                  const zst = files.find(x => x.endsWith('.zstd'))
+                  if (!zst) continue
+                  try {
+                    const buf = await fsP.readFile(join(cwsPath, se.name, zst))
+                    const text = zlib2.zstdDecompressSync(buf).toString('utf8')
+                    const header = JSON.parse(text.split('\n')[0])
+                    if (header.cwd) {
+                      cloudBase = String(header.cwd).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+                      break
+                    }
+                  } catch {}
+                }
               }
               if (!cloudBase) continue
-              let targetWs = localWorkspaces.find(w => {
-                const b = String(w.path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop()
-                return b === cloudBase || w.title === cloudBase
-              })
+              let targetWs = null
+              if (cws.wsKey) {
+                const mk = localByFolderKey.get(cws.wsKey)
+                if (mk) targetWs = localWorkspaces.find(w => w.path === mk.path) || { id: mk.id, path: mk.path, title: mk.title }
+                if (!targetWs) {
+                  applied.push(src.to + ' -> SKIP ws/' + cws.wsKey + ' (本机无同名工作区，按规格完全不碰)')
+                  continue
+                }
+              } else {
+                targetWs = localWorkspaces.find(w => {
+                  const b = String(w.path || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+                  return b === cloudBase || w.title === cloudBase
+                })
+                if (targetWs) oldLineageDirs.push(cws.name)
+              }
               if (!targetWs) {
                 /* 2026-10-14 用户钦定规格（二次澄清）：一方有、另一方没有的工作区 =
                    **完全跳过，一个字节都不碰**——不在本机建、更不动它的内容。
@@ -3597,6 +3701,14 @@ module.exports = {
                 if (!byWorkspace[key].sessionIds.includes(sid)) byWorkspace[key].sessionIds.push(sid)
               }
               applied.push(src.to + ' -> ' + grp.targetDirName + ' (' + grp.cloudBases.join('+') + ', ' + cwsSessionIds.length + ')')
+            }
+            /* [2026-11-02 阶段三] 旧 lineage 目录内容已按新者赢落地本机/并入 ws/
+               canonical → 从影子仓移除，下次 push 云端即归一形态。 */
+            for (const od of oldLineageDirs) {
+              await fsP.rm(join(source, od), { recursive: true, force: true }).catch(() => {})
+            }
+            if (oldLineageDirs.length > 0) {
+              try { ctx.logger?.info?.('dsh-sync: 旧 lineage 目录已归并移除: ' + oldLineageDirs.join(', ')) } catch {}
             }
             try {
               const workspaceJsonPath = join(dshHome(), 'storages', 'workspace.json')
