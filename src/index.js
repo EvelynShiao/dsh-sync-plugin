@@ -3471,7 +3471,7 @@ module.exports = {
                 // [final-A] 子代理会话目录不带 "session-" 前缀（DSH 真会话一律带），
                 // 它们 UI 上看不见、跨设备同步纯属占地方。只上传真会话。
                 if (!s.name.startsWith('session-')) continue
-                const sPath = join(src.from, ws.name, s.name)
+                const sPath = join(src.from, ws.dirName, s.name)
                 let filesUp = []
                 try { filesUp = await fsP.readdir(sPath) } catch {}
                 const zst = filesUp.find(x => x.endsWith('.zstd'))
