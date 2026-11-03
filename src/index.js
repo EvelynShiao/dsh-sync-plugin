@@ -1771,7 +1771,17 @@ async function rebuildCloudRepoIfBloated(pushOut, eff, repoDir, state, logger) {
     if (!parsed) { try { logger?.warn?.('[dsh-sync] 体积巡检: 超限警告但 repoUrl 非 GitCode，跳过') } catch {}; return false }
     if (!eff.token) { try { logger?.warn?.('[dsh-sync] 体积巡检: 超限警告但无 token，跳过自动重建') } catch {}; return false }
     const warn = (m) => { try { logger?.warn?.('[dsh-sync] 体积巡检: ' + m) } catch {} }
-    warn('GitCode 报告仓库物理体积超限（orphan 不释放配额）→ 自动删仓重建')
+    warn('GitCode 报告仓库物理体积超限（orphan 不释放配额）→ 自动处理')
+    // ① 优先 Compact（官方若开放该端点：服务端原地 GC，秒级、零重传，不删仓）
+    try {
+      const compact = await gitcodeRequest(eff.token, 'POST', `/repos/${parsed.owner}/${parsed.repo}/compact`)
+      if (compact.ok) {
+        try { logger?.warn?.('[dsh-sync] 体积巡检: Compact API 可用，服务端 GC 已触发（零重传），下轮上传恢复正常速度') } catch {}
+        return true
+      }
+    } catch { /* 探测失败继续走删仓重建 */ }
+    // ② 无 Compact API（2026-11-03 实测三端点 404）→ 删仓重建：GitCode 服务端 orphan
+    //    对象不释放配额，这是当时唯一可行解；重推基线仅在超限时发生（罕见），平时上传秒传 delta。
     try {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
       await gitExec(eff.gitBinary, ['bundle', 'create', join(dshHome(), 'dsh-sync', `repo-rebuild-backup-${stamp}.bundle`), 'HEAD'], repoDir)
