@@ -1667,6 +1667,130 @@ async function gateSqlitePayload(livePath, buf, logger, stamp) {
   return { ok: true }
 }
 
+// ── 2026-11-03 sqlite 健康底座（启动自愈 + 上传门共用，事故驱动，别删）─────
+// 11-03 事故：FTS shadow 表损坏的库被镜像进影子仓并推上云端；本机库坏了插件
+// 毫无感知、更无自愈。三洞齐补：①启动自愈（本坏影好→换库）②上传门（本坏→拒传）
+// ③体积巡检（push 超限警告→自动删仓重建）。
+// 返回 { healthy, detail }。打不开 / integrity_check 非 ok 一律算坏。
+function sqliteHealthy(livePath) {
+  try {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(livePath, { readOnly: true })
+    try {
+      const bad = db.prepare('PRAGMA integrity_check').all().filter((r) => r.integrity_check !== 'ok')
+      return bad.length ? { healthy: false, detail: bad[0].integrity_check } : { healthy: true, detail: 'ok' }
+    } finally { try { db.close() } catch {} }
+  } catch (e) {
+    return { healthy: false, detail: String((e && e.message) || e).slice(0, 160) }
+  }
+}
+
+// buffer 版（校验影子仓副本本身是否健康——11-03 教训：坏库也能进影子仓）
+function sqliteHealthyBuf(buf) {
+  const fsx = require('node:fs')
+  const tmp = join(dshHome(), 'dsh-sync', `heal-tmp-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`)
+  try {
+    fsx.writeFileSync(tmp, buf)
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(tmp, { readOnly: true })
+    try {
+      const bad = db.prepare('PRAGMA integrity_check').all().filter((r) => r.integrity_check !== 'ok')
+      return bad.length ? { healthy: false, detail: bad[0].integrity_check } : { healthy: true, detail: 'ok' }
+    } finally { try { db.close() } catch {} }
+  } catch (e) {
+    return { healthy: false, detail: String((e && e.message) || e).slice(0, 160) }
+  } finally { try { fsx.rmSync(tmp, { force: true }) } catch {} }
+}
+
+/* ── 2026-11-03 启动自愈：本机 sqlite 坏 + 影子仓基线健康 → 同步换好库 ──
+   挂 apply 早期同步执行（session-kit 尚未开库、WAL 空窗，唯一安全覆盖窗口）。
+   数据源=本地影子仓 repo（上次同步基线），不依赖网络，毫秒级。
+   三重防护：坏库三件套先备份 rescue/ → 影子仓副本先过健康校验 → 覆盖后清残留。
+   任何异常吞掉，绝不阻塞插件启动。 */
+function selfHealSqlitesOnBoot(cfg, roots, io) {
+  const targets = []
+  try {
+    if (cfg.syncMemory) targets.push({ live: roots.sessionKitMemory, shadowDir: 'memory', name: 'memory.sqlite' })
+    if (cfg.syncKnowledge) targets.push({ live: roots.knowledge, shadowDir: 'knowledge', name: 'knowledge.sqlite' })
+  } catch { return }
+  const fsx = require('node:fs')
+  for (const t of targets) {
+    try {
+      let h = null
+      try { h = sqliteHealthy(t.live) } catch {}
+      if (h && h.healthy) continue
+      // 影子仓副本候选：merge 形态 <dir>/<name>；standalone 形态 backup/<instanceId>/<dir>/<name>
+      const candidates = [join(io.repoDir, t.shadowDir, t.name)]
+      try {
+        const bakRoot = join(io.repoDir, 'backup')
+        for (const inst of fsx.readdirSync(bakRoot)) candidates.push(join(bakRoot, inst, t.shadowDir, t.name))
+      } catch {}
+      let shadowBuf = null, usedPath = null
+      for (const c of candidates) {
+        try { const b = fsx.readFileSync(c); if (b && b.length) { shadowBuf = b; usedPath = c; break } } catch {}
+      }
+      if (!shadowBuf) {
+        try { io.logger?.warn?.(`[dsh-sync] 启动自愈: ${t.name} 本机损坏（${(h && h.detail) || '?'}），影子仓无副本，保留现场未动`) } catch {}
+        continue
+      }
+      const sh = sqliteHealthyBuf(shadowBuf)
+      if (!sh.healthy) {
+        try { io.logger?.warn?.(`[dsh-sync] 启动自愈: ${t.name} 本机损坏，影子仓副本也不健康（${sh.detail}），保留现场未动`) } catch {}
+        continue
+      }
+      let rescueDir = null
+      try {
+        rescueDir = join(io.syncDir, 'rescue', new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19))
+        fsx.mkdirSync(rescueDir, { recursive: true })
+        for (const ext of ['', '-wal', '-shm']) {
+          try { const b = fsx.readFileSync(t.live + ext); if (b && b.length) fsx.writeFileSync(join(rescueDir, t.name + ext), b) } catch {}
+        }
+      } catch {}
+      for (const ext of ['-wal', '-shm']) { try { fsx.rmSync(t.live + ext, { force: true }) } catch {} }
+      const tmpLive = t.live + '.healing'
+      fsx.writeFileSync(tmpLive, shadowBuf)
+      fsx.renameSync(tmpLive, t.live)
+      try { io.logger?.warn?.(`[dsh-sync] 启动自愈: ${t.name} 本机损坏（${(h && h.detail) || '?'}），已用影子仓健康副本换上（${usedPath}），坏库备份在 ${rescueDir || 'rescue/'}`) } catch {}
+    } catch { /* 单目标失败不影响另一个 */ }
+  }
+}
+
+/* ── 2026-11-03 云端体积巡检：push 回显超限警告 → 自动删仓重建（GitCode 专属）──
+   auto-squash 砍 git 历史但 GitCode 配额按服务端物理体积算，orphan 旧对象不释放
+   （10-25 与 11-03 凌晨两次 1GiB 超限验证：唯一解=删仓重建）。API 无体积字段，
+   唯一可靠信号=push 回显的 exceeds limit 警告（超限必出现，出现时常还放行）。
+   重建四步：bundle 保险 → DELETE 旧仓 → POST 重建私有仓 → push 原基线。
+   commit sha 不变 ⇒ state.lastSyncedCommit 天然有效，其他端无感知。
+   任何一步失败只记警告：下轮上传警告再现时自动重试（幂等）。 */
+const REBUILD_WARNING_RE = /exceeds limit|size \(\d+(?:\.\d+)?\s*[MG]iB\)/i
+async function rebuildCloudRepoIfBloated(pushOut, eff, repoDir, state, logger) {
+  try {
+    const out = String(pushOut || '')
+    if (!REBUILD_WARNING_RE.test(out)) return false
+    const parsed = parseRepoUrl(eff.repoUrl)
+    if (!parsed) { try { logger?.warn?.('[dsh-sync] 体积巡检: 超限警告但 repoUrl 非 GitCode，跳过') } catch {}; return false }
+    if (!eff.token) { try { logger?.warn?.('[dsh-sync] 体积巡检: 超限警告但无 token，跳过自动重建') } catch {}; return false }
+    const warn = (m) => { try { logger?.warn?.('[dsh-sync] 体积巡检: ' + m) } catch {} }
+    warn('GitCode 报告仓库物理体积超限（orphan 不释放配额）→ 自动删仓重建')
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      await gitExec(eff.gitBinary, ['bundle', 'create', join(dshHome(), 'dsh-sync', `repo-rebuild-backup-${stamp}.bundle`), 'HEAD'], repoDir)
+    } catch (e) { warn('bundle 保险失败（继续，影子仓本地即全量）: ' + String((e && e.message) || e)) }
+    const del = await gitcodeRequest(eff.token, 'DELETE', `/repos/${parsed.owner}/${parsed.repo}`)
+    if (!del.ok && del.status !== 404) { warn(`删除旧仓失败 HTTP ${del.status}，下轮上传警告再现时重试`); return false }
+    await new Promise((r) => setTimeout(r, 3000))
+    const create = await gitcodeRequest(eff.token, 'POST', '/user/repos', { name: parsed.repo, private: true, description: 'dsh-sync repo (auto-rebuilt after size limit warning)' })
+    if (!create.ok) { warn(`重建仓库失败 HTTP ${create.status}: ${String((create.json && create.json.message) || create.text || '').slice(0, 120)}`); return false }
+    const remote = authedUrl(eff.repoUrl, eff.token)
+    await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
+    warn('删仓重建完成，基线已重推（sha 不变，各端无感知）')
+    return true
+  } catch (e) {
+    try { logger?.warn?.('[dsh-sync] 体积巡检异常（忽略）: ' + String((e && e.message) || e)) } catch {}
+    return false
+  }
+}
+
 async function normalizeDownloadedSessions(home) {
   const zlib = require('node:zlib')
   const sessionsRoot = join(home, 'sessions')
@@ -2904,7 +3028,7 @@ module.exports = {
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
-    gateSessionPayload, scanZstdFrames,
+    gateSessionPayload, scanZstdFrames, sqliteHealthy, sqliteHealthyBuf, selfHealSqlitesOnBoot, rebuildCloudRepoIfBloated,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
@@ -2932,6 +3056,16 @@ module.exports = {
       if (typeof config.repoUrl === 'string' && config.repoUrl !== '') base.repoUrl = config.repoUrl
       return base
     }
+    /* ── [2026-11-03 启动自愈] 本机 sqlite 损坏 + 影子仓副本健康 → 同步换好库 ──
+       必须在 apply 早期同步执行：此刻 session-kit 尚未打开库、WAL 空窗，是唯一
+       能安全覆盖主库的时刻。数据源=本地影子仓基线（不依赖网络，毫秒级）。
+       坏库三件套先备份到 dsh-sync/rescue/<stamp>/，绝不静默丢数据。 */
+    try {
+      const cfgHeal = baseSettings()
+      if (cfgHeal.syncMemory || cfgHeal.syncKnowledge) {
+        selfHealSqlitesOnBoot(cfgHeal, defaultRoots(dh), { repoDir, syncDir, logger: ctx && ctx.logger })
+      }
+    } catch { /* 自愈失败不阻塞启动 */ }
     const settingsOverrides = {} // 进程内兜底：写回缺席/失败时保本次运行一致
     function readDescriptor() {
       try {
@@ -3226,6 +3360,25 @@ module.exports = {
             await fsP.rm(target, { recursive: true, force: true }).catch(() => {})
           }
           if (src.file) {
+            /* [2026-11-03 sqlite 上传门] 本机库损坏时拒绝上传（11-03 事故：坏库被镜像
+               进影子仓并随 auto-squash 推上云端，手机端旧版无下载门即中招）。
+               坏库三件套备份到 dsh-sync/rescue/<stamp>/ 后跳过该文件，其余组照常。 */
+            if (/\.sqlite$/i.test(String(src.to))) {
+              const hbUp = sqliteHealthy(src.from)
+              if (!hbUp.healthy) {
+                try {
+                  const stampUp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+                  const rescueDirUp = join(syncDir, 'rescue', stampUp)
+                  await fsP.mkdir(rescueDirUp, { recursive: true })
+                  for (const ext of ['', '-wal', '-shm']) {
+                    try { const b = await fsP.readFile(src.from + ext); if (b && b.length) await fsP.writeFile(join(rescueDirUp, src.from.split(/[\\/]/).pop() + ext), b) } catch {}
+                  }
+                } catch {}
+                skipped.push(src.to + ' (本机库损坏，拒绝上传，坏库已备份到 dsh-sync/rescue/)')
+                try { ctx.logger?.warn?.('[dsh-sync] sqlite 上传门: ' + src.from + ' integrity 不通过（' + hbUp.detail + '），拒绝上传，坏库已隔离') } catch {}
+                continue
+              }
+            }
             try {
               await fsP.access(src.from)
               await fsP.mkdir(join(target, '..'), { recursive: true })
@@ -3370,7 +3523,10 @@ module.exports = {
         commitOk = true
       } catch {}
       if (!commitOk) return { uploaded: false, nothingToCommit: true }
-      await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
+      {
+        const pushOutMain = await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
+        await rebuildCloudRepoIfBloated(pushOutMain, eff, repoDir, state, ctx.logger)
+      }
       state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
       state.lastSyncAt = new Date().toISOString()
       await saveState()
@@ -3393,7 +3549,8 @@ module.exports = {
           await gitExec(eff.gitBinary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `auto-squash: 单提交基线（原 ${commitCount} 份历史快照已合并，内容不变）`], repoDir)
           await gitExec(eff.gitBinary, ['branch', '-D', eff.branch], repoDir)
           await gitExec(eff.gitBinary, ['branch', '-M', eff.branch], repoDir)
-          await gitExec(eff.gitBinary, ['push', '-f', remote, `HEAD:${eff.branch}`], repoDir)
+          const pushOutSq = await gitExec(eff.gitBinary, ['push', '-f', remote, `HEAD:${eff.branch}`], repoDir)
+          await rebuildCloudRepoIfBloated(pushOutSq, eff, repoDir, state, ctx.logger)
           state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
           await saveState()
           ctx.logger?.info?.(`dsh-sync: auto-squash 完成：${commitCount} → 1 份基线，已 force push`)
