@@ -91,6 +91,10 @@ const DEFAULT_SYNC_SETTINGS = {
   conflictMode: 'ai',   // 'ai' (action button → in-process agent) | 'manual'
   syncSkills: true,    // 原版策略不变；体积由 [size-skip] 的 treeSignature 把关
   syncSessions: false,
+  // [2026-11-03 parts 增量] true = 影子仓会话按 part 链存储（part0000 基底 + partNNNN
+  // 追加段），追加只传增量 blob，服务端垃圾降 3-4 个数量级。前提：所有端插件 ≥9999.9.20
+  // （旧端读不懂 parts，会话会停止更新但不会坏）。本机/落地形态恒为单文件 zstd。
+  sessionsParts: false,
   syncSettings: true,
   syncPlugins: true,
   syncKnowledge: true,   // 跨机共享知识库（knowledge.sqlite，单文件、journal_mode=delete 可安全拷贝）
@@ -146,6 +150,7 @@ function syncSettingsSchema(S) {
     pluginsStrategy: S.string(),
     knowledgeStrategy: S.string(),
     memoryStrategy: S.string(),
+    sessionsParts: S.boolean(),
     uploadOverwrite: S.boolean(),
     snapshotSkills: S.boolean(),
     snapshotAuto: S.boolean(),
@@ -286,7 +291,7 @@ function writeProfileFileSync(effIn, clearToken) {
   }
   const eff = effIn
   const vals = {}
-  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy']) vals[k] = eff[k]
+  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts']) vals[k] = eff[k]
   for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
   for (const k of ['intervalMinutes','snapshotLocalKeep']) vals[k] = eff[k]
   if (keptToken && !vals.token) vals.token = keptToken
@@ -1799,6 +1804,54 @@ async function rebuildCloudRepoIfBloated(pushOut, eff, repoDir, state, logger) {
     try { logger?.warn?.('[dsh-sync] 体积巡检异常（忽略）: ' + String((e && e.message) || e)) } catch {}
     return false
   }
+}
+
+// ── 2026-11-03 会话分片（parts）增量上传 ─────────────────────────────────
+// 会话 zst 是 append-only 帧序列（实测 156 会话跨 16h：无变化/纯追加占绝对多数，
+// 重写仅抢救 normalize 所致）。影子仓按 part 链存储：part0000 基底 + partNNNN 追加段。
+// 追加 72B 只产生 72B 的 git blob → 服务端垃圾从「每轮全文件」降 3-4 个数量级。
+// part 文件写入后永不再改 → 云端真正「无历史版本」。本机/落地形态恒为单文件 zstd。
+const SESSION_PART_PREFIX = 'session.v4.jsonl.zstd.part'
+const SESSION_PART_MAX = 24
+function partFileName(k) { return SESSION_PART_PREFIX + String(k).padStart(4, '0') }
+async function listSessionParts(dir) {
+  try {
+    const ents = await fsP.readdir(dir)
+    return ents.filter((x) => x.startsWith(SESSION_PART_PREFIX)).sort()
+  } catch { return null }
+}
+async function concatSessionParts(dir, parts) {
+  const bufs = []
+  for (const p of parts) bufs.push(await fsP.readFile(join(dir, p)))
+  return Buffer.concat(bufs)
+}
+async function readSessionBuf(dir, name) {
+  if (name === '::parts::') {
+    const parts = await listSessionParts(dir)
+    if (parts && parts.length) return concatSessionParts(dir, parts)
+    throw new Error('parts 目录为空: ' + dir)
+  }
+  return fsP.readFile(join(dir, name))
+}
+function sessionMaxTimeBuf(buf) {
+  const zlib2 = require('node:zlib')
+  try {
+    const positions = []
+    for (let k = 0; k <= buf.length - 4; k++) {
+      if (buf[k] === 0x28 && buf[k+1] === 0xB5 && buf[k+2] === 0x2F && buf[k+3] === 0xFD) positions.push(k)
+    }
+    positions.push(buf.length)
+    let mx = 0
+    for (let i = 0; i < positions.length - 1; i++) {
+      let text = ''
+      try { text = zlib2.zstdDecompressSync(buf.subarray(positions[i], positions[i + 1])).toString('utf8') } catch { continue }
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue
+        try { const ev = JSON.parse(line); if (typeof ev.time === 'number' && ev.time > mx) mx = ev.time } catch {}
+      }
+    }
+    return mx
+  } catch { return 0 }
 }
 
 async function normalizeDownloadedSessions(home) {
@@ -3436,7 +3489,33 @@ module.exports = {
                 let cloudSt = null
                 try { cloudSt = await fsP.stat(cloudFile) } catch {}
                 if (cloudSt && cloudSt.size === st.size && cloudSt.mtimeMs === st.mtimeMs) continue
+                /* [2026-11-03 parts 增量] 见 SESSION_PART_PREFIX 注释。追加判定：
+                   云端拼接结果为本机文件前缀 → 只写增量 part；否则重置 base。
+                   兼容过渡：云端还是旧单文件时，rename 成 part0000（内容不变，blob 不变）。 */
+                if (eff.sessionsParts === true) {
+                  const lb = await fsP.readFile(join(sPath, zst))
+                  const partsInfo = await listSessionParts(cloudSess)
+                  let merged = null, baseFromSingle = false
+                  if (partsInfo && partsInfo.length) merged = await concatSessionParts(cloudSess, partsInfo)
+                  else { try { merged = await fsP.readFile(cloudFile); baseFromSingle = true } catch {} }
+                  const forceReset = partsInfo && partsInfo.length >= SESSION_PART_MAX
+                  if (!forceReset && merged && merged.equals(lb)) continue
+                  if (!forceReset && merged && lb.length > merged.length && lb.subarray(0, merged.length).equals(merged)) {
+                    const nextIdx = baseFromSingle ? 1 : partsInfo.length
+                    if (baseFromSingle) { try { await fsP.rename(cloudFile, join(cloudSess, partFileName(0))) } catch {} }
+                    await fsP.writeFile(join(cloudSess, partFileName(nextIdx)), lb.subarray(merged.length))
+                    continue
+                  }
+                  await fsP.rm(cloudSess, { recursive: true, force: true }).catch(() => {})
+                  await fsP.mkdir(cloudSess, { recursive: true })
+                  await fsP.writeFile(join(cloudSess, partFileName(0)), lb)
+                  const lockFileUp = join(sPath, 'session.lock')
+                  try { await fsP.copyFile(lockFileUp, join(cloudSess, 'session.lock')) } catch {}
+                  continue
+                }
                 await fsP.rm(cloudSess, { recursive: true, force: true }).catch(() => {})
+
+                void 0
                 /* [2026-10-26 副本泄漏修复] 会话目录只允许 .zstd 主文件 + session.lock
                    上云——.bak 手术备份 / 杂物绝不传（昨晚 8 次同步把 5 个 .bak 和
                    手术副本全传上去过，白吃配额）。白名单制，新增文件类型必须显式加。 */
@@ -3800,12 +3879,14 @@ module.exports = {
                 if (!se.isDirectory() || !se.name.startsWith('session-')) continue   // [final-B] 子代理会话不落地
                 let seFiles = []
                 try { seFiles = await fsP.readdir(join(cwsPath, se.name)) } catch {}
-                const seZst = seFiles.find(x => x.endsWith('.zstd'))
-                if (!seZst) continue
+                const seParts = eff.sessionsParts === true ? (await listSessionParts(join(cwsPath, se.name)) || []) : []
+                const seZst = seParts.length ? null : seFiles.find(x => x.endsWith('.zstd'))
+                if (!seZst && !seParts.length) continue
                 let size = 0
-                try { size = (await fsP.stat(join(cwsPath, se.name, seZst))).size } catch {}
+                try { size = (await fsP.stat(join(cwsPath, se.name, seZst || seParts[0]))).size } catch {}
+                if (seParts.length) { size = 0; for (const pp of seParts) { try { size += (await fsP.stat(join(cwsPath, se.name, pp))).size } catch {} } }
                 const list = grp.copies.get(se.name) || []
-                list.push({ dirName: cws.name, sessionDir: join(cwsPath, se.name), zstName: seZst, size, maxTime: null })
+                list.push({ dirName: cws.name, sessionDir: join(cwsPath, se.name), zstName: seZst || '::parts::', size, maxTime: null })
                 grp.copies.set(se.name, list)
               }
             }
@@ -3817,7 +3898,7 @@ module.exports = {
               const cwsSessionIds = []
               for (const [sid, copies] of grp.copies) {
                 const dstSession = join(targetWsDir, sid)
-                const localZst = join(dstSession, copies[0].zstName)
+                const localZst = join(dstSession, 'session.v4.jsonl.zstd') // [parts] 本机恒单文件
                 let localSt = null
                 try { localSt = await fsP.stat(localZst) } catch {}
                 if (copies.length === 1 && localSt && copies[0].size === localSt.size) {
@@ -3827,9 +3908,9 @@ module.exports = {
                   continue
                 }
                 for (const cp of copies) {
-                  if (cp.maxTime === null) cp.maxTime = await sessionMaxTime(join(cp.sessionDir, cp.zstName))
+                  if (cp.maxTime === null) cp.maxTime = sessionMaxTimeBuf(await readSessionBuf(cp.sessionDir, cp.zstName))
                 }
-                const localMaxTime = localSt ? await sessionMaxTime(localZst) : -1
+                const localMaxTime = localSt ? sessionMaxTimeBuf(await fsP.readFile(localZst)) : -1
                 const best = copies.reduce((a, b) => (b.maxTime > a.maxTime ? b : a), copies[0])
                 if (localSt && localMaxTime >= best.maxTime) {
                   cwsSessionIds.push(sid)   // 本机最新（或并列）→ 保留本机
@@ -3839,14 +3920,17 @@ module.exports = {
                 }
                 // 云端胜出 → 过完整性门后覆盖本机
                 try {
-                  const candBuf = await fsP.readFile(join(best.sessionDir, best.zstName))
+                  const candBuf = await readSessionBuf(best.sessionDir, best.zstName)
                   if (!await gateSessionPayload(join(dstSession, best.zstName), candBuf, ctx.logger)) {
                     applied.push(src.to + ' -> SKIP ' + sid + ' (完整性门隔离：' + best.dirName + ')')
                     continue
                   }
                 } catch {}
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
-                await copyTree(best.sessionDir, dstSession, {})
+                /* [parts] 云端可能是 part 链 → 本机落地恒为拼接后的单文件（原 copyTree 复制 parts 目录会带病） */
+                await fsP.mkdir(dstSession, { recursive: true })
+                await fsP.writeFile(join(dstSession, 'session.v4.jsonl.zstd'), candBuf)
+                try { await fsP.copyFile(join(best.sessionDir, 'session.lock'), join(dstSession, 'session.lock')) } catch {}
                 wrote = true
                 cwsSessionIds.push(sid)
                 if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
@@ -4251,7 +4335,7 @@ module.exports = {
             for (const key of ['repoUrl', 'branch', 'gitBinary', 'conflictMode', 'downloadWorkspacePath']) {
               if (typeof body[key] === 'string' && body[key] !== '') patch[key] = body[key]
             }
-            for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy', 'knowledgeStrategy', 'memoryStrategy']) {
+            for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy', 'knowledgeStrategy', 'memoryStrategy', 'sessionsParts']) {
               if (STRATEGY_VALUES.includes(body[key])) patch[key] = body[key]
             }
             for (const key of ['snapshotSkills', 'snapshotAuto']) {
