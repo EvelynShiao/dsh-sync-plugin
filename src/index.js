@@ -1933,28 +1933,28 @@ async function normalizeDownloadedSessions(home) {
 //      救回本机权威目录（改写 cwd + 过完整性门，不改云端字节）并写进云端 canonical；
 //   ③ 映射不上的（如「手机专用」在电脑上无对应工作区）整目录保留，绝不删；
 //   ④ 目录里所有会话都处置完后，空的异 lineage 目录整个移除。
-// 前提：调用点在本机目录镜像（rm+重灌）**之后**，本机 lineage 的云端目录已是
-// 本机真源；canonical 与本机 lineage 同名（encodeWorkspaceDir 一致）时天然跳过。
+// 前提：调用点在本机目录镜像（rm+重灌）**之后**，ws/ canonical 已含本机真源。
+// [2026-11-04 canonical 判定修正（9999.9.23）] 11-02 起 canonical = sessions/ws/<工作区名编码>，
+// 上传镜像只写 ws/、不再写路径派生目录；但本函数仍用 authDirs（路径派生名）判
+// 「本机 lineage 跳过」——本机自己的旧形态目录（--C-...-work-Evelyn--，3e4b2f31
+// 化石实锤）于是每次上传都被跳过，永远清不掉，并存复活的根源。
+// 修正：ws/ 前缀 = canonical（镜像刚写过）跳过；其余目录一律进收敛，
+// 不再区分是不是本机自己的旧名。
 async function convergeCloudSessions(home, repoDir, logger) {
   const zlib = require('node:zlib')
   const shadowSess = join(repoDir, 'sessions')
   const liveSess = join(home, 'sessions')
   const wsByFolder = new Map()
-  const authDirs = new Set()
   try {
     const doc = JSON.parse(await fsP.readFile(join(home, 'storages', 'workspace.json'), 'utf8'))
     for (const w of Object.values(doc?.tables?.workspaces ?? {})) {
       if (!w?.path) continue
-      authDirs.add(encodeWorkspaceDir(w.path))
       const folder = String(w.path).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
       wsByFolder.set(folder, w.path)
     }
   } catch { return { converged: 0, rescued: 0, kept: 0 } }
-  // 云端 canonical 目标目录集合（本机权威工作区名）+ 本机已有会话 ID 集合
-  const cloudCanonical = new Set()
   let cloudDirs = []
   try { cloudDirs = (await fsP.readdir(shadowSess, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name) } catch { return { converged: 0, rescued: 0, kept: 0 } }
-  for (const d of cloudDirs) if (authDirs.has(d)) cloudCanonical.add(d)
   const localIds = new Set()
   try {
     for (const ws of (await fsP.readdir(liveSess, { withFileTypes: true })).filter((d) => d.isDirectory())) {
@@ -1963,7 +1963,9 @@ async function convergeCloudSessions(home, repoDir, logger) {
   } catch {}
   let converged = 0, rescued = 0, kept = 0
   for (const cloudDir of cloudDirs) {
-    if (authDirs.has(cloudDir)) continue          // 本机 lineage 的云端目录：镜像阶段已写真源，跳过
+    /* [9999.9.23] canonical（ws/<key>，镜像刚写过）跳过；旧形态目录一律进收敛，
+       包括本机自己的路径派生旧名——authDirs 判定已随化石事故废除。 */
+    if (cloudDir === 'ws' || cloudDir.startsWith('ws' + sep) || cloudDir.startsWith('ws/')) continue
     if (cloudDir === '--quarantine--') continue   // 隔离区永不处理
     let sess = []
     try { sess = (await fsP.readdir(join(shadowSess, cloudDir), { withFileTypes: true })).filter((d) => d.isDirectory()) } catch { continue }
