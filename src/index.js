@@ -3919,13 +3919,28 @@ module.exports = {
                   continue
                 }
                 // 云端胜出 → 过完整性门后覆盖本机
+                // 2026-11-04 修：原先这里是 `} catch {}`，门内任何异常被吞掉后仍继续往下写
+                // → 非 zstd 字节（实测 PC session-3e4b2f31 被写成 ZIP 壳 50 4b 03 04）能直接落地。
+                // 现在：读失败/门抛异常一律视为「候选不可信」，跳过本会话，绝不用未经校验的字节覆盖本机。
+                let candBuf = null
                 try {
-                  const candBuf = await readSessionBuf(best.sessionDir, best.zstName)
+                  candBuf = await readSessionBuf(best.sessionDir, best.zstName)
                   if (!await gateSessionPayload(join(dstSession, best.zstName), candBuf, ctx.logger)) {
                     applied.push(src.to + ' -> SKIP ' + sid + ' (完整性门隔离：' + best.dirName + ')')
+                    candBuf = null
                     continue
                   }
-                } catch {}
+                } catch (e) {
+                  applied.push(src.to + ' -> SKIP ' + sid + ' (候选读取/校验异常：' + String(e && e.message).slice(0, 120) + ')')
+                  candBuf = null
+                  continue
+                }
+                if (!candBuf || !candBuf.length) continue
+                // 第二道：魔数硬校验，非 zstd 多帧一律不落地（防门被绕过/未来改动回归）
+                if (candBuf[0] !== 0x28 || candBuf[1] !== 0xb5 || candBuf[2] !== 0x2f || candBuf[3] !== 0xfd) {
+                  applied.push(src.to + ' -> SKIP ' + sid + ' (非 zstd 魔数：' + candBuf.subarray(0, 4).toString('hex') + ')')
+                  continue
+                }
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
                 /* [parts] 云端可能是 part 链 → 本机落地恒为拼接后的单文件（原 copyTree 复制 parts 目录会带病） */
                 await fsP.mkdir(dstSession, { recursive: true })
