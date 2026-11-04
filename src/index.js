@@ -94,7 +94,10 @@ const DEFAULT_SYNC_SETTINGS = {
   // [2026-11-03 parts 增量] true = 影子仓会话按 part 链存储（part0000 基底 + partNNNN
   // 追加段），追加只传增量 blob，服务端垃圾降 3-4 个数量级。前提：所有端插件 ≥9999.9.20
   // （旧端读不懂 parts，会话会停止更新但不会坏）。本机/落地形态恒为单文件 zstd。
-  sessionsParts: false,
+  // [2026-11-04 用户钦定：默认开 + 上设置面板] 从「默认关、改 patch.yml 手动开」改为
+  // 默认 true，并在同步设置页给出开关（sessionsPartsLabel）。两端插件均 ≥9999.9.20
+  // 之后此默认才安全——旧端读不懂 part 链，会把分片会话当不存在（不坏但停更）。
+  sessionsParts: true,
   syncSettings: true,
   syncPlugins: true,
   syncKnowledge: true,   // 跨机共享知识库（knowledge.sqlite，单文件、journal_mode=delete 可安全拷贝）
@@ -4287,6 +4290,7 @@ module.exports = {
               syncSkills: eff.syncSkills, syncSessions: eff.syncSessions,
               syncSettings: eff.syncSettings, syncPlugins: eff.syncPlugins,
               syncMemory: eff.syncMemory, syncKnowledge: eff.syncKnowledge,
+              sessionsParts: eff.sessionsParts !== false,   // [2026-11-04] 设置面板开关回填依据
               strategies: {
                 skills: STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'standalone',
                 sessions: STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'merge',
@@ -4352,14 +4356,17 @@ module.exports = {
             for (const key of ['repoUrl', 'branch', 'gitBinary', 'conflictMode', 'downloadWorkspacePath']) {
               if (typeof body[key] === 'string' && body[key] !== '') patch[key] = body[key]
             }
-            for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy', 'knowledgeStrategy', 'memoryStrategy', 'sessionsParts']) {
+            /* [2026-11-04 修正] sessionsParts 是布尔开关，曾被误放进这个「策略枚举」组——
+               策略组只收 STRATEGY_VALUES（'standalone'/'merge'）里的字符串，布尔值永远不匹配，
+               于是设置面板就算传了它也存不进去（静默丢弃）。挪到下面的布尔组。 */
+            for (const key of ['skillsStrategy', 'sessionsStrategy', 'settingsStrategy', 'pluginsStrategy', 'knowledgeStrategy', 'memoryStrategy']) {
               if (STRATEGY_VALUES.includes(body[key])) patch[key] = body[key]
             }
             for (const key of ['snapshotSkills', 'snapshotAuto']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.snapshotLocalKeep === 'number' && body.snapshotLocalKeep >= 1) patch.snapshotLocalKeep = Math.floor(body.snapshotLocalKeep)
-            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins', 'syncKnowledge', 'syncMemory']) {
+            for (const key of ['autoSync', 'syncOnStartup', 'syncSkills', 'syncSessions', 'syncSettings', 'syncPlugins', 'syncKnowledge', 'syncMemory', 'sessionsParts']) {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes

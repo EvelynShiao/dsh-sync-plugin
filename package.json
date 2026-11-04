@@ -1,8 +1,12 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "9999.9.23",
+  "version": "9999.9.24",
   "description": "dsh-sync custom build",
   "license": "MIT",
+  "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "check:client": "node scripts/build-client.mjs --check"
+  },
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
@@ -24,6 +28,7 @@
   "files": [
     "src",
     "client",
+    "scripts",
     "docs",
     "cordis.patch.yml",
     "test"

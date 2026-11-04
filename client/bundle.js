@@ -79,16 +79,20 @@ window.__ModuleLoader__.load({
       syncing: '同步中，可能需要一分钟…',
       syncDone: '同步完成',
       syncFailed: '同步失败',
-  snapshotDelete: '删除',
-  snapshotRename: '重命名',
-  snapshotDeleteConfirm: '确定删除快照 {name}？此操作不可恢复。',
-  snapshotDeleted: '快照已删除',
-  snapshotRenamePrompt: '重命名快照 {name}：',
-  snapshotRenamed: '快照已重命名',
-  uploadBtn: '上传',
-  downloadBtn: '下载',
-  uploadHint: '本地 → 云端：推送会话、设置、插件清单、技能、知识库',
-  downloadHint: '云端 → 本地：拉取并覆盖本地（覆盖前先拍安全快照）',
+      snapshotDelete: '删除',
+      snapshotRename: '重命名',
+      snapshotDeleteConfirm: '确定删除快照 {name}？此操作不可恢复。',
+      snapshotDeleted: '快照已删除',
+      snapshotRenamePrompt: '重命名快照 {name}：',
+      snapshotRenamed: '快照已重命名',
+      uploadAll: '上传',
+      downloadAll: '下载',
+      uploadBtn: '上传',
+      downloadBtn: '下载',
+      uploadHint: '本地 → 云端：把本机的会话、设置、插件清单、技能、知识库推上去',
+      downloadHint: '云端 → 本地：从云端拉取并覆盖本地（覆盖前自动拍安全快照，可回滚）',
+      strategyStandalone: '各机独立（本机专属目录，与对方互不覆盖）',
+      strategyMerge: '共用同一份（同一路径；上传=覆盖云端，下载=覆盖本地）',
       save: '保存',
       saved: '设置已保存',
       repoUrlLabel: '仓库地址',
@@ -106,22 +110,24 @@ window.__ModuleLoader__.load({
       autoSyncLabel: '定时自动同步',
       syncOnStartupLabel: '启动时同步',
       intervalLabel: '同步间隔（分钟）',
+      sessionsPartsLabel: '会话增量上传',
+      sessionsPartsHint: '会话按增量分片上传，云端历史垃圾降 3-4 个数量级（省流量、省仓库体积）。要求两端插件都 ≥9999.9.20',
       conflictModeLabel: '冲突处理',
       conflictModeAi: 'AI 处理（推荐）',
       conflictModeManual: '人工网页合并',
       conflictModeHint: '两台机器改了同一文件时：AI 模式弹出按钮由 AI 自动解决；人工模式 PR 挂起等你去 gitcode.com 合并',
       toggleSkills: '技能 skills',
-        toggleMemory: '长期记忆（session-kit）',
-        toggleKnowledge: '知识库（knowledge-sqlite）',
+            toggleMemory: '长期记忆（session-kit）',
+            toggleKnowledge: '知识库（knowledge-sqlite）',
       toggleSessions: '会话 sessions',
       toggleSettings: '设置 settings',
       togglePlugins: '插件 plugins',
       groupHint: '勾选要同步的类别，再为每类选策略',
-      strategyStandalone: '各机独立（本机专属目录，与对方互不覆盖）',
-      strategyMerge: '共用同一份（同一路径；上传=覆盖云端，下载=覆盖本地）',
-      strategyHint: '独立=云端按实例ID分文件夹，互不干扰；合并=云端共享文件夹，多机内容叠加',
-      uploadAll: '上传',
-      downloadAll: '下载',
+      strategyBackup: '备份 · 各机独立',
+      strategyUnion: '并集 · 冲突交 AI',
+      strategyRemote: '覆盖 · 远端为准',
+      strategyLocal: '覆盖 · 本地为准',
+      strategyHint: '备份=云上各存各的（backup/实例ID/），本地永不被覆盖；并集=新增都收、双方改动交 AI；远端为准=本地只读镜像；本地为准=只推不拉',
       snapshotTitle: '快照',
       snapshotNow: '立即快照',
       snapshotNamePlaceholder: '快照名（可选）',
@@ -190,12 +196,18 @@ window.__ModuleLoader__.load({
       syncing: 'Syncing, may take a minute…',
       syncDone: 'Sync complete',
       syncFailed: 'Sync failed',
-  snapshotDelete: 'Delete',
-  snapshotRename: 'Rename',
-  snapshotDeleteConfirm: 'Delete snapshot {name}? This cannot be undone.',
-  snapshotDeleted: 'Snapshot deleted',
-  snapshotRenamePrompt: 'Rename snapshot {name}:',
-  snapshotRenamed: 'Snapshot renamed',
+      snapshotDelete: 'Delete',
+      snapshotRename: 'Rename',
+      snapshotDeleteConfirm: 'Delete snapshot {name}? This cannot be undone.',
+      snapshotDeleted: 'Snapshot deleted',
+      snapshotRenamePrompt: 'Rename snapshot {name}:',
+      snapshotRenamed: 'Snapshot renamed',
+      uploadBtn: 'Upload',
+      downloadBtn: 'Download',
+      uploadHint: 'Local → remote: push sessions, settings, plugins, skills and knowledge',
+      downloadHint: 'Remote → local: pull and overwrite local (safety snapshot first)',
+      strategyStandalone: '各机独立（本机专属目录，与对方互不覆盖）',
+      strategyMerge: '共用同一份（同一路径；上传=覆盖云端，下载=覆盖本地）',
       save: 'Save',
       saved: 'Settings saved',
       repoUrlLabel: 'Repository URL',
@@ -213,22 +225,24 @@ window.__ModuleLoader__.load({
       autoSyncLabel: 'Auto sync on schedule',
       syncOnStartupLabel: 'Sync on startup',
       intervalLabel: 'Interval (minutes)',
+      sessionsPartsLabel: 'Incremental session upload',
+      sessionsPartsHint: 'Upload sessions as incremental parts — cloud garbage drops by 3-4 orders of magnitude. Requires both ends on plugin >= 9999.9.20',
       conflictModeLabel: 'Conflict handling',
       conflictModeAi: 'AI resolve (recommended)',
       conflictModeManual: 'Manual web merge',
       conflictModeHint: 'When two machines edit the same file: AI mode shows a button the AI resolves; manual mode leaves the PR open for you to merge on gitcode.com',
       toggleSkills: 'Skills',
-        toggleMemory: 'Long-term memory (session-kit)',
-        toggleKnowledge: 'Knowledge base (knowledge-sqlite)',
+            toggleMemory: 'Long-term memory (session-kit)',
+            toggleKnowledge: 'Knowledge base (knowledge-sqlite)',
       toggleSessions: 'Sessions',
       toggleSettings: 'Settings',
       togglePlugins: 'Plugins',
       groupHint: 'Toggle a category, then pick its strategy',
-      strategyStandalone: '各机独立（本机专属目录，与对方互不覆盖）',
-      strategyMerge: '共用同一份（同一路径；上传=覆盖云端，下载=覆盖本地）',
-      strategyHint: 'Standalone = per-instance folders in cloud; Merge = shared folder across machines',
-      uploadAll: 'Upload',
-      downloadAll: 'Download',
+      strategyBackup: 'Backup · per-machine',
+      strategyUnion: 'Union · AI resolves',
+      strategyRemote: 'Overwrite · remote wins',
+      strategyLocal: 'Overwrite · local wins',
+      strategyHint: 'Backup = each machine stores its own (backup/<id>/), local never overwritten; Union = collect all adds, both-side edits go to AI; remote wins = local read-only mirror; local wins = push-only',
       snapshotTitle: 'Snapshots',
       snapshotNow: 'Snapshot now',
       snapshotNamePlaceholder: 'snapshot name (optional)',
@@ -689,6 +703,8 @@ window.__ModuleLoader__.load({
       const [intervalMinutes, setIntervalMinutes] = useState(30)
       const [autoSync, setAutoSync] = useState(true)
       const [syncOnStartup, setSyncOnStartup] = useState(false)
+      // [2026-11-04] 会话增量上传：默认 true（用户钦定默认开，可在面板关）。
+      const [sessionsParts, setSessionsParts] = useState(true)
       const [conflictMode, setConflictMode] = useState('ai')
       const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true , memory: true, knowledge: true })
       const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' , memory: 'merge', knowledge: 'merge' })
@@ -707,8 +723,10 @@ window.__ModuleLoader__.load({
         setIntervalMinutes(d.intervalMinutes)
         setAutoSync(d.autoSync)
         setSyncOnStartup(d.syncOnStartup)
+        // 后端缺字段（旧版宿主半）时按默认开处理，避免面板显示成关
+        setSessionsParts(d.sessionsParts !== false)
         setConflictMode(d.conflictMode)
-        setG(prev => ({ ...prev, skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins, ...(d.syncMemory !== undefined ? { memory: d.syncMemory } : {}), ...(d.syncKnowledge !== undefined ? { knowledge: d.syncKnowledge } : {}) }))
+            setG(prev => ({ ...prev, skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins, ...(d.syncMemory !== undefined ? { memory: d.syncMemory } : {}), ...(d.syncKnowledge !== undefined ? { knowledge: d.syncKnowledge } : {}) }))
         if (d.strategies) setGs(prev => ({ ...prev, ...d.strategies }))
         if (d.snapshot) setSnapCfg(d.snapshot)
         getJson(API + '/snapshot/list').then(l => setSnapList(l)).catch(() => {})
@@ -720,30 +738,41 @@ window.__ModuleLoader__.load({
         return () => clearInterval(timer)
       }, [])
 
+      const doSync = async () => {
+        setBusy(true)
+        try {
+          const r = await fetch(API + '/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          onToast(t('syncDone'), 2600)
+        } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
+        finally { setBusy(false); refresh() }
+      }
+      // AI smart align: POST runs a deterministic sync first (remote-only files
+      // pulled back), then streams the semantic-merge agent run; dialog opens
+      // already running with the both-modified file list.
+      // 单向上传：本地 → 云端（只推不拉，不覆盖本地）
       const doUpload = async () => {
         setBusy(true)
         try {
           const r = await fetch(API + '/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
           const d = await r.json().catch(() => ({}))
           if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
-          onToast(d.uploaded ? '上传完成' : '无变化', 2600)
-        } catch (e) { onToast('上传失败: ' + e.message, 4000) }
+          onToast(t('syncDone'), 2600)
+        } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
         finally { setBusy(false); refresh() }
       }
+      // 单向下载：云端 → 本地（覆盖本地，覆盖前服务端会先拍安全快照）
       const doDownload = async () => {
-        if (!confirm('下载会用云端内容覆盖本地。继续？')) return
         setBusy(true)
         try {
           const r = await fetch(API + '/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
           const d = await r.json().catch(() => ({}))
           if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
-          onToast(d.downloaded ? '下载完成' : '云端为空', 2600)
-        } catch (e) { onToast('下载失败: ' + e.message, 4000) }
+          onToast(t('syncDone'), 2600)
+        } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
         finally { setBusy(false); refresh() }
       }
-      // AI smart align: POST runs a deterministic sync first (remote-only files
-      // pulled back), then streams the semantic-merge agent run; dialog opens
-      // already running with the both-modified file list.
       const doAlign = async () => {
         setAlignBusy(true)
         try {
@@ -763,7 +792,7 @@ window.__ModuleLoader__.load({
       }
       const doSave = async () => {
         try {
-          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep }
+          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts }
           if (token !== '') patch.token = token
           await putSettings(patch)
           setToken('')
@@ -795,35 +824,35 @@ window.__ModuleLoader__.load({
         finally { setSnapBusy(false) }
       }
       const doDelete = async (name) => {
-    if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
-      if (!window.confirm(t('snapshotDeleteConfirm', { name }))) return
-    }
-    setSnapBusy(true)
-    try {
-      const r = await fetch(API + '/snapshot/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
-      const d = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
-      onToast(t('snapshotDeleted'), 2400)
-      refresh()
-    } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
-    finally { setSnapBusy(false) }
-  }
-  const doRename = async (name) => {
-    if (typeof window === 'undefined' || typeof window.prompt !== 'function') return
-    const newName = window.prompt(t('snapshotRenamePrompt', { name }), name)
-    if (!newName || newName === name) return
-    setSnapBusy(true)
-    try {
-      const r = await fetch(API + '/snapshot/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, newName }) })
-      const d = await r.json().catch(() => ({}))
-      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
-      onToast(t('snapshotRenamed'), 2400)
-      refresh()
-    } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
-    finally { setSnapBusy(false) }
-  }
+        if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          if (!window.confirm(t('snapshotDeleteConfirm', { name }))) return
+        }
+        setSnapBusy(true)
+        try {
+          const r = await fetch(API + '/snapshot/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          onToast(t('snapshotDeleted'), 2400)
+          refresh()
+        } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+        finally { setSnapBusy(false) }
+      }
+      const doRename = async (name) => {
+        if (typeof window === 'undefined' || typeof window.prompt !== 'function') return
+        const newName = window.prompt(t('snapshotRenamePrompt', { name }), name)
+        if (!newName || newName === name) return
+        setSnapBusy(true)
+        try {
+          const r = await fetch(API + '/snapshot/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, newName }) })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          onToast(t('snapshotRenamed'), 2400)
+          refresh()
+        } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+        finally { setSnapBusy(false) }
+      }
 
-  const doClearToken = async () => {
+      const doClearToken = async () => {
         try { await putSettings({ token: null }); onToast(t('saved'), 2200); refresh() }
         catch (e) { onToast(e.message || t('operationFailed'), 4000) }
       }
@@ -832,6 +861,7 @@ window.__ModuleLoader__.load({
       try {
         const row = (label, value) => h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '3px 0' } },
           h('span', { className: 'sk-dir' }, label), h('span', { className: 'sk-hint', style: { wordBreak: 'break-all', textAlign: 'right' } }, value))
+        // 只留后端 STRATEGY_VALUES 真正认的两个值：之前给的 backup/union/remote/local 后端一律回退 standalone，选了等于没选
         const STRATS = ['standalone', 'merge']
         const cap = (v) => v[0].toUpperCase() + v.slice(1)
         const groupCard = (key, label) => h('div', { key, className: 'sk-gcard' + (g[key] ? ' on' : '') },
@@ -874,13 +904,16 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'sk-toggles' },
                   groupCard('skills', t('toggleSkills')), groupCard('sessions', t('toggleSessions')),
                   groupCard('settings', t('toggleSettings')), groupCard('plugins', t('togglePlugins')),
-          groupCard('memory', t('toggleMemory')), groupCard('knowledge', t('toggleKnowledge'))),
+              groupCard('memory', t('toggleMemory')), groupCard('knowledge', t('toggleKnowledge'))),
                 h('div', { className: 'sk-dir' }, t('strategyHint'))),
               h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   h('input', { type: 'checkbox', checked: autoSync, onChange: e => setAutoSync(e.target.checked) }), t('autoSyncLabel')),
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   h('input', { type: 'checkbox', checked: syncOnStartup, onChange: e => setSyncOnStartup(e.target.checked) }), t('syncOnStartupLabel')),
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+                  h('input', { type: 'checkbox', checked: sessionsParts, onChange: e => setSessionsParts(e.target.checked) }), t('sessionsPartsLabel')),
+                h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('sessionsPartsHint')),
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
               h('div', { className: 'sk-card' },
@@ -911,8 +944,8 @@ window.__ModuleLoader__.load({
                           h(Tag, { tone: s.inCloud ? 'accent' : undefined }, s.inCloud ? t('snapshotInCloud') : t('snapshotLocalOnly')),
                           h('span', { className: 'sk-spacer' }),
                           h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRestore(s.name) }, t('snapshotRestore')),
-                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRename(s.name) }, t('snapshotRename')),
-                      h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doDelete(s.name) }, t('snapshotDelete'))))))),
+                          h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doRename(s.name) }, t('snapshotRename')),
+                          h(ButtonLite, { small: true, disabled: snapBusy, onClick: () => doDelete(s.name) }, t('snapshotDelete'))))))),
               h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
                 h('input', { className: 'sk-input', value: repoUrl, onChange: e => setRepoUrl(e.target.value), placeholder: t('repoUrlPlaceholder'), style: { width: '100%' } }),
                 h('input', { className: 'sk-input', value: branch, onChange: e => setBranch(e.target.value), placeholder: t('branchLabel'), style: { width: '100%' } }),
@@ -933,8 +966,8 @@ window.__ModuleLoader__.load({
                 h(ButtonLite, { onClick: doSave }, t('save')),
                 h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
                 h('span', { className: 'sk-spacer' }),
-                h(ButtonLite, { primary: true, disabled: busy || status.syncing, onClick: doUpload }, busy ? '…' : t('uploadAll')),
-                h(ButtonLite, { disabled: busy || status.syncing, onClick: doDownload }, t('downloadAll'))))
+                h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('uploadHint'), onClick: doUpload }, t('uploadBtn')),
+                h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn'))))
       } catch (renderErr) {
         ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))
         body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },

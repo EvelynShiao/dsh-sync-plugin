@@ -100,6 +100,8 @@ const ZH = {
   autoSyncLabel: '定时自动同步',
   syncOnStartupLabel: '启动时同步',
   intervalLabel: '同步间隔（分钟）',
+  sessionsPartsLabel: '会话增量上传',
+  sessionsPartsHint: '会话按增量分片上传，云端历史垃圾降 3-4 个数量级（省流量、省仓库体积）。要求两端插件都 ≥9999.9.20',
   conflictModeLabel: '冲突处理',
   conflictModeAi: 'AI 处理（推荐）',
   conflictModeManual: '人工网页合并',
@@ -213,6 +215,8 @@ const EN = {
   autoSyncLabel: 'Auto sync on schedule',
   syncOnStartupLabel: 'Sync on startup',
   intervalLabel: 'Interval (minutes)',
+  sessionsPartsLabel: 'Incremental session upload',
+  sessionsPartsHint: 'Upload sessions as incremental parts — cloud garbage drops by 3-4 orders of magnitude. Requires both ends on plugin >= 9999.9.20',
   conflictModeLabel: 'Conflict handling',
   conflictModeAi: 'AI resolve (recommended)',
   conflictModeManual: 'Manual web merge',
@@ -689,6 +693,8 @@ function SettingsSection({ t }) {
   const [intervalMinutes, setIntervalMinutes] = useState(30)
   const [autoSync, setAutoSync] = useState(true)
   const [syncOnStartup, setSyncOnStartup] = useState(false)
+  // [2026-11-04] 会话增量上传：默认 true（用户钦定默认开，可在面板关）。
+  const [sessionsParts, setSessionsParts] = useState(true)
   const [conflictMode, setConflictMode] = useState('ai')
   const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true , memory: true, knowledge: true })
   const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' , memory: 'merge', knowledge: 'merge' })
@@ -707,6 +713,8 @@ function SettingsSection({ t }) {
     setIntervalMinutes(d.intervalMinutes)
     setAutoSync(d.autoSync)
     setSyncOnStartup(d.syncOnStartup)
+    // 后端缺字段（旧版宿主半）时按默认开处理，避免面板显示成关
+    setSessionsParts(d.sessionsParts !== false)
     setConflictMode(d.conflictMode)
         setG(prev => ({ ...prev, skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins, ...(d.syncMemory !== undefined ? { memory: d.syncMemory } : {}), ...(d.syncKnowledge !== undefined ? { knowledge: d.syncKnowledge } : {}) }))
     if (d.strategies) setGs(prev => ({ ...prev, ...d.strategies }))
@@ -774,7 +782,7 @@ function SettingsSection({ t }) {
   }
   const doSave = async () => {
     try {
-      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep }
+      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts }
       if (token !== '') patch.token = token
       await putSettings(patch)
       setToken('')
@@ -893,6 +901,9 @@ function SettingsSection({ t }) {
               h('input', { type: 'checkbox', checked: autoSync, onChange: e => setAutoSync(e.target.checked) }), t('autoSyncLabel')),
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
               h('input', { type: 'checkbox', checked: syncOnStartup, onChange: e => setSyncOnStartup(e.target.checked) }), t('syncOnStartupLabel')),
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+              h('input', { type: 'checkbox', checked: sessionsParts, onChange: e => setSessionsParts(e.target.checked) }), t('sessionsPartsLabel')),
+            h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('sessionsPartsHint')),
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
               t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
           h('div', { className: 'sk-card' },
