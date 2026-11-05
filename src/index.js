@@ -98,8 +98,8 @@ const DEFAULT_SYNC_SETTINGS = {
   // 默认 true，并在同步设置页给出开关（sessionsPartsLabel）。两端插件均 ≥9999.9.20
   // 之后此默认才安全——旧端读不懂 part 链，会把分片会话当不存在（不坏但停更）。
   sessionsParts: true,
-  // [2026-11-05 墓碑] true = 本机删除的会话会写云端墓碑并从云端移除；下载不再复活
-  // 已删会话。缺省开（用户主诉「删了云端还留」的根治）；显式 false 回到旧行为。
+  // [2026-11-05 覆盖·9999.9.26] true = 上传删云端多余会话 + 下载删本机多余会话
+  // （纯机械集合镜像，用户钦定）；false = 上传只增不减、下载不删本机（旧行为）。
   sessionsDeleteSync: true,
   syncSettings: true,
   syncPlugins: true,
@@ -1840,178 +1840,97 @@ async function readSessionBuf(dir, name) {
   }
   return fsP.readFile(join(dir, name))
 }
-/* ── 会话删除墓碑（2026-11-05，9999.9.25）──────────────────────────────
-   背景：sessions 组上传是「只增不减」纯拷入（两机共用 ws/<工作区名>/，先清空
-   会抹掉他机独有会话），于是本机删除永不传导云端；下载侧「本机无该 id → 云端
-   补齐」还会把已删会话批量写回（复活）。用户原话：「我这里删了那么多对话云端
-   还留那么多」——删除同步此前不存在，这是新增能力，不是修补。
-   机制：
-   · 云端共享墓碑 sessions/.deleted.json（[{id, wsKey, at, by}]，随 sessions 组走）
-   · 每机基线 .dsh/dsh-sync/session-manifest-<instanceId>.json（上次同步时云端
-     各 wsKey 的会话 id 集 + capturedAt）
-   · 上传侧三条件判「本机删除」：基线里记过 && 本机 live 没有 && 云端还有 →
-     写墓碑 + 删云端份。工作区整个不在本机 → 跳过（删工作区 ≠ 删会话，10-14 规格延续）。
-   · 下载侧：墓碑命中 → 不从云端复活；本机还挂着的已删会话跟手删除。
-   · 安全阀：云端副本 maxEventTime 晚于墓碑/基线时点（对方删完又聊过）→
-     内容为准，墓碑作废——宁可漏删，不可误删活跃会话。
-   · 墓碑 30 天过期；开关 sessionsDeleteSync（默认开）。 */
-const SESSION_TOMBSTONE_TTL_MS = 30 * 24 * 3600 * 1000
-const SESSION_TOMBSTONE_GRACE_MS = 5000
-function sessionTombstoneFile(repoDir) { return join(repoDir, 'sessions', '.deleted.json') }
-async function readSessionTombstones(repoDir) {
+/* ── 覆盖镜像（2026-11-05，9999.9.26）──────────────────────────────────
+   用户钦定终态（原话）：「我的插件只有上传和下载两种，都是覆盖逻辑！原作者的
+   merge 逻辑早就应该废弃！同步的时候，本地有而云端没有的会话该删掉，反之亦然！
+   不同工作区的除外！」「不管啥内容新不新，机械覆盖」。
+   · 上传 = 本地为准：镜像后影子仓 ws/<工作区>/ 里本机没有的会话目录 → 直接删。
+   · 下载 = 云端为准：同工作区本机有云端无 → 删本机（pruneLocalOnlySessions）；
+     云端有的无条件落地覆盖本机（不比内容新旧）。
+   · 不同工作区除外：本机没有的工作区整个不碰（10-14 规格延续）。
+   9.25 的墓碑（sessions/.deleted.json）与本版初稿的基线（session-manifest）/
+   吸收对齐全部退役：纯集合镜像下，删除传导 = 上传删云端多余、下载删本机多余，
+   不需要任何「删除记忆」。 */
+/* [9999.9.26 上传侧] 镜像后的纯集合差删除：影子仓 ws/<key>/ 中本机 live 没有的
+   会话目录 → rm。无基线、无墓碑、无时间判断；工作区不在 workspace.json 的整个
+   跳过（删工作区 ≠ 删会话）。 */
+async function pruneCloudExtras(repoDir, eff, logger) {
+  const out = { pruned: 0, prunedIds: [] }
+  if (!eff || !eff.syncSessions || eff.sessionsDeleteSync === false) return out
+  if (eff.sessionsStrategy === 'standalone') return out   // 各机独立备份，无共享可删
   try {
-    const doc = JSON.parse(await fsP.readFile(sessionTombstoneFile(repoDir), 'utf8'))
-    const now = Date.now()
-    return (Array.isArray(doc?.deleted) ? doc.deleted : [])
-      .filter((t) => t && typeof t.id === 'string' && typeof t.wsKey === 'string'
-        && typeof t.at === 'number' && (now - t.at) < SESSION_TOMBSTONE_TTL_MS)
-  } catch { return [] }
+    const wsMap = await loadWorkspaceMap()
+    const liveRoot = join(dshHome(), 'sessions')
+    for (const m of wsMap) {
+      const cloudWsDir = join(repoDir, 'sessions', 'ws', m.folderKey)
+      let ents = []
+      try { ents = await fsP.readdir(cloudWsDir, { withFileTypes: true }) } catch { continue }
+      /* 工作区在册 = 本机有这个工作区：live 目录读不到（还没建）就当空集合，
+         云端该工作区的会话按机械镜像全删。readdir 抛错也按空集处理（rm 自带 force）。 */
+      let liveEnts = []
+      try { liveEnts = await fsP.readdir(join(liveRoot, m.dirName), { withFileTypes: true }) } catch { liveEnts = [] }
+      const liveIds = new Set(liveEnts.filter((e) => e.isDirectory() && e.name.startsWith('session-')).map((e) => e.name))
+      for (const e of ents) {
+        if (!e.isDirectory() || !e.name.startsWith('session-')) continue
+        if (liveIds.has(e.name)) continue
+        await fsP.rm(join(cloudWsDir, e.name), { recursive: true, force: true }).catch(() => {})
+        out.pruned++
+        out.prunedIds.push(e.name)
+      }
+    }
+    if (out.pruned > 0) {
+      try { logger?.info?.(`[dsh-sync] 覆盖(上传): 本地为准，删云端多余 ${out.pruned} 个会话: ${out.prunedIds.join(', ')}`) } catch {}
+    }
+  } catch (e) {
+    try { (logger || console)?.warn?.('[dsh-sync] 覆盖(上传)失败: ' + String((e && e.stack) || e)) } catch {}
+  }
+  return out
 }
-async function writeSessionTombstones(repoDir, list) {
-  const file = sessionTombstoneFile(repoDir)
+
+/* [9999.9.26 覆盖·下载侧] 下载 = 云端为准（纯机械镜像）：wsGroups = 下载阶段一/二
+   收集的「本机有同名工作区 && 云端有该工作区目录」的映射；对其中「本机有 && 云端
+   已无」的会话直接删本机份——不判断是不是本机新建、不比较内容新旧（用户钦定：
+   「本机新建没同步过的会话下载肯定删阿，不然我TM覆盖啥子」「不管啥内容新不新，
+   机械覆盖」）。工作区级保护照旧：云端没有该工作区目录的工作区根本不进 wsGroups
+   （一个字节不碰，10-14 规格延续）。 */
+async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger }) {
+  const out = { pruned: 0, prunedIds: [] }
+  if (!eff || eff.sessionsDeleteSync === false || eff.sessionsStrategy === 'standalone') return out
   try {
-    if (!list || list.length === 0) { await fsP.rm(file, { force: true }).catch(() => {}); return }
-    await fsP.mkdir(join(file, '..'), { recursive: true })
-    await atomicWriteFile(file, JSON.stringify({ version: 1, deleted: list }, null, 2))
-  } catch {}
-}
-function sessionManifestFile(instanceId) { return join(dshHome(), 'dsh-sync', `session-manifest-${instanceId}.json`) }
-async function readSessionManifest(instanceId) {
-  /* null = 没有基线（首跑）。没有基线就绝不判「本机删除」——首跑保护。 */
-  try {
-    const doc = JSON.parse(await fsP.readFile(sessionManifestFile(instanceId), 'utf8'))
-    const map = new Map()
-    for (const [k, v] of Object.entries(doc?.wsKeys ?? {})) if (Array.isArray(v)) map.set(k, new Set(v))
-    const capturedAt = typeof doc?.capturedAt === 'number' ? doc.capturedAt : Date.parse(doc?.capturedAtAt || '') || 0
-    return { capturedAt, map }
-  } catch { return null }
-}
-async function writeSessionManifest(instanceId, wsKeyToIds) {
-  const doc = { version: 1, capturedAt: Date.now(), wsKeys: {} }
-  for (const [k, set] of wsKeyToIds) doc.wsKeys[k] = [...set]
-  const file = sessionManifestFile(instanceId)
-  try { await fsP.mkdir(join(file, '..'), { recursive: true }); await atomicWriteFile(file, JSON.stringify(doc, null, 2)) } catch {}
-}
-async function collectShadowSessionIds(repoDir) {
-  /* 影子仓（=云端基线）ws/<key>/ 下的会话 id 集。part 链与单文件都是目录级，不区分。 */
-  const out = new Map()
-  try {
-    for (const key of await fsP.readdir(join(repoDir, 'sessions', 'ws'))) {
-      const set = new Set()
+    const keyByPath = new Map((await loadWorkspaceMap()).map((m) => [m.path, m.folderKey]))
+    for (const grp of (wsGroups instanceof Map ? wsGroups.values() : [])) {
+      const fk = keyByPath.get(grp.targetWs.path)
+      if (!fk) continue
+      /* 云端真相直接重读影子仓（=FETCH_HEAD 工作树），不用阶段一的 copies——
+         收集链任何缺漏都不该演变成误删（宁可少删）。 */
+      const cloudSet = new Set()
       try {
-        for (const e of await fsP.readdir(join(repoDir, 'sessions', 'ws', key))) {
-          if (e.startsWith('session-')) set.add(e)
+        for (const e of await fsP.readdir(join(repoDir, 'sessions', 'ws', fk), { withFileTypes: true })) {
+          if (e.isDirectory() && e.name.startsWith('session-')) cloudSet.add(e.name)
         }
       } catch {}
-      out.set(key, set)
-    }
-  } catch {}
-  return out
-}
-async function collectLiveSessionIdsByFolderKey() {
-  /* 本机 live：只数 workspace.json 现存工作区（folderKey → 会话 id 集）。
-     工作区已删/改名的孤儿目录不进结果 → 上传侧对它们整体跳过（不判删除）。 */
-  const out = new Map()
-  const liveSess = join(dshHome(), 'sessions')
-  for (const m of await loadWorkspaceMap()) {
-    const set = new Set()
-    try {
-      for (const e of await fsP.readdir(join(liveSess, m.dirName), { withFileTypes: true })) {
-        if (e.isDirectory() && e.name.startsWith('session-')) set.add(e.name)
-      }
-    } catch {}
-    out.set(m.folderKey, set)
-  }
-  return out
-}
-async function shadowSessionMaxTime(dir) {
-  /* 云端副本最大事件时间（part 链或单文件都行）；读不到 = 0（视为「云端已无副本」）。 */
-  try {
-    const parts = await listSessionParts(dir)
-    if (parts && parts.length) return sessionMaxTimeBuf(await concatSessionParts(dir, parts))
-    return sessionMaxTimeBuf(await fsP.readFile(join(dir, 'session.v4.jsonl.zstd')))
-  } catch { return 0 }
-}
-async function applyTombstoneUpload(repoDir, instanceId, eff, logger) {
-  if (!eff || !eff.syncSessions || eff.sessionsDeleteSync === false) return { tombed: 0 }
-  if (eff.sessionsStrategy === 'standalone') return { tombed: 0 }   // 各机独立备份，无共享可删
-  try {
-    const baseline = await readSessionManifest(instanceId)
-    if (!baseline || !baseline.capturedAt) {
-      /* 首跑：只建基线不判删除（没有基线就无法区分「本机删过」和「本机从来没有」）。
-         [防误删他机独有] 首基线剔除「part 链形态 && 本机 live 没有」的会话——part 链
-         是 ≥9.20 端刚上传的他机活跃内容（实测：手机 11-04 上传的活跃会话全是 part 链，
-         而 PC 删除的化石全是 zstd 单文件）；它们进基线会在第二轮被误判成「本机删除」，
-         继而在手机端被墓碑跟手删掉。剔除 = 它们永不判删（宁可漏删）。 */
-      const live0 = await collectLiveSessionIdsByFolderKey()
-      const shadow0 = await collectShadowSessionIds(repoDir)
-      const seed = new Map()
-      for (const [wsKey, set] of shadow0) {
-        const l0 = live0.get(wsKey) || new Set()
-        const keep = new Set()
-        for (const sid of set) {
-          if (!l0.has(sid)) {
-            try { if ((await listSessionParts(join(repoDir, 'sessions', 'ws', wsKey, sid)) || []).length > 0) continue } catch {}
-          }
-          keep.add(sid)
-        }
-        if (keep.size) seed.set(wsKey, keep)
-      }
-      await writeSessionManifest(instanceId, seed)
-      try { logger?.info?.('[dsh-sync] 墓碑: 已建立会话基线（首跑不判删除；part 链他机独有已排除）') } catch {}
-      return { tombed: 0, seeded: true }
-    }
-    const live = await collectLiveSessionIdsByFolderKey()
-    const shadow = await collectShadowSessionIds(repoDir)
-    const tombs = await readSessionTombstones(repoDir)
-    const seen = new Set(tombs.map((t) => `${t.wsKey}|${t.id}`))
-    let tombed = 0
-    const deletedThisRound = new Map()   // wsKey -> Set(id)
-    const now = Date.now()
-    for (const [wsKey, cloudSet] of shadow) {
-      const liveSet = live.get(wsKey)
-      if (!liveSet) continue                       // 本机连这个工作区都没有 → 完全不碰（删工作区≠删会话）
-      const known = baseline.map.get(wsKey) || new Set()
-      for (const sid of cloudSet) {
-        if (!known.has(sid)) continue              // 基线里没有 = 本机从没同步过它（他机的）→ 不判
-        if (liveSet.has(sid)) continue             // 本机还有 → 活着
-        if (seen.has(`${wsKey}|${sid}`)) continue  // 墓碑已写过
-        /* 安全阀：云端副本在基线之后还有更新（他机删完又聊过/刚推上来）→ 内容为准 */
-        const cloudMx = await shadowSessionMaxTime(join(repoDir, 'sessions', 'ws', wsKey, sid))
-        if (cloudMx > baseline.capturedAt + SESSION_TOMBSTONE_GRACE_MS) continue
-        tombs.push({ id: sid, wsKey, at: now, by: instanceId })
-        seen.add(`${wsKey}|${sid}`)
-        if (!deletedThisRound.has(wsKey)) deletedThisRound.set(wsKey, new Set())
-        deletedThisRound.get(wsKey).add(sid)
-        await fsP.rm(join(repoDir, 'sessions', 'ws', wsKey, sid), { recursive: true, force: true }).catch(() => {})
-        tombed++
+      /* grp 上没有 targetWsDir（那是下载 handler 阶段二的局部变量），按 targetDirName 重算 */
+      const wsDir = grp.targetWsDir || join(dshHome(), 'sessions', grp.targetDirName)
+      let localEnts = []
+      try { localEnts = await fsP.readdir(wsDir, { withFileTypes: true }) } catch {}
+      for (const le of localEnts) {
+        if (!le.isDirectory() || !le.name.startsWith('session-')) continue
+        if (cloudSet.has(le.name)) continue          // 云端还有 → 已按镜像落地
+        await fsP.rm(join(wsDir, le.name), { recursive: true, force: true }).catch(() => {})
+        try { await fsP.rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', le.name + '.json'), { force: true }).catch(() => {}) } catch {}
+        out.pruned++
+        out.prunedIds.push(le.name)
       }
     }
-    if (tombed > 0) {
-      await writeSessionTombstones(repoDir, tombs)
-      try { logger?.info?.(`[dsh-sync] 墓碑: 本机删除 ${tombed} 个会话，已写墓碑并从云端移除`) } catch {}
+    if (out.pruned > 0) {
+      try { logger?.info?.('[dsh-sync] 覆盖(下载): 云端为准，删本机多余 ' + out.pruned + ' 个会话: ' + out.prunedIds.join(', ')) } catch {}
     }
-    /* 基线语义 = 「本机曾有过且未被本机删除」：旧基线 ∪ 本机 live − 本轮墓碑删除。
-       （不是 shadow 全集！云端独有会话本机从没见过，进基线 = 下轮被误判删除。 */
-    const merged = new Map()
-    const liveAll = live
-    for (const [wsKey, knownSet] of baseline.map) merged.set(wsKey, new Set(knownSet))
-    for (const [wsKey, liveSet] of liveAll) {
-      if (!merged.has(wsKey)) merged.set(wsKey, new Set())
-      for (const sid of liveSet) merged.get(wsKey).add(sid)
-    }
-    for (const [wsKey, delSet] of deletedThisRound) {
-      if (!merged.has(wsKey)) continue
-      for (const sid of delSet) merged.get(wsKey).delete(sid)
-    }
-    for (const [k, s] of [...merged]) if (s.size === 0) merged.delete(k)
-    await writeSessionManifest(instanceId, merged)
-    return { tombed }
   } catch (e) {
-    try { logger?.warn?.('[dsh-sync] 墓碑(上传侧)失败: ' + String((e && e.message) || e)) } catch {}
-    return { tombed: 0, error: String((e && e.message) || e) }
+    try { (logger || console)?.warn?.('[dsh-sync] 覆盖(下载)失败: ' + String((e && e.stack) || e)) } catch {}
   }
+  return out
 }
+
 function sessionMaxTimeBuf(buf) {
   const zlib2 = require('node:zlib')
   try {
@@ -2141,10 +2060,6 @@ async function convergeCloudSessions(home, repoDir, logger) {
     }
   } catch {}
   let converged = 0, rescued = 0, kept = 0
-  /* [2026-11-05 墓碑] 命中墓碑的会话是「已删除」——异 lineage 目录里再见到它，
-     不救回本机（那等于复活），云端异 lineage 副本直接清掉。 */
-  let tombIds = new Set()
-  try { tombIds = new Set((await readSessionTombstones(repoDir)).map((t) => t.id)) } catch {}
   for (const cloudDir of cloudDirs) {
     /* [9999.9.23] canonical（ws/<key>，镜像刚写过）跳过；旧形态目录一律进收敛，
        包括本机自己的路径派生旧名——authDirs 判定已随化石事故废除。 */
@@ -2196,12 +2111,7 @@ async function convergeCloudSessions(home, repoDir, logger) {
       }
       // ②b 本机缺此 ID → 救回本机权威目录（cwd 改写 + 完整性门），再写云端 canonical。
       //    救回的是会话内容本身，云端异 lineage 字节原样保留至救回成功后才删。
-      //    [2026-11-05 墓碑例外] 命中墓碑 = 用户删过的会话 → 绝不救回（防复活），
-      //    异 lineage 副本就地清除。
-      if (tombIds.has(s.name)) {
-        try { await fsP.rm(join(shadowSess, cloudDir, s.name), { recursive: true, force: true }); converged++ } catch { dirEmpty = false }
-        continue
-      }
+      //    [9999.9.26] 墓碑例外已随墓碑机制退役（机械镜像下无「删除名单」）。
       header.cwd = localPath
       const newHeader = zlib.zstdCompressSync(Buffer.from(JSON.stringify(header) + '\n', 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
       const newBuf = Buffer.concat([newHeader, buf.subarray(frameEnd)])
@@ -2256,12 +2166,14 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   // 3. overlay live snapshot onto the baseline: shadow now = baseline + local deltas
   // remote（覆盖·远端为准）组本地是只读镜像：不推送本机版本
   await mirrorLiveToShadow(spec.filter(g => g.strategy !== 'remote'), repoDir)
-  // 3.1 [2026-11-05 墓碑] 本机删除判定：基线里有 && 本机 live 没有 && 云端还有 →
-  //     写墓碑 + 从影子仓移除（随本次 push 生效到云端）。首跑只建基线不判删。
-  let tombUp = { tombed: 0 }
+  // 3.1 [2026-11-05 覆盖·9999.9.26] 上传 = 本地为准（纯机械镜像，无任何判断）：
+  //     影子仓 ws/<工作区>/ 里本机 live 没有的会话目录 → 直接删（随本次 push 生效）。
+  //     9.25 的墓碑/基线/9.26 初版的吸收对齐全部退役：用户钦定「不管啥内容新不新，
+  //     机械覆盖」——本机没有 = 不要了，云端也删。
+  let pruneUp = { pruned: 0 }
   if (eff.syncSessions && eff.sessionsDeleteSync !== false && eff.sessionsStrategy !== 'standalone') {
-    try { tombUp = await applyTombstoneUpload(repoDir, instanceId, eff, logger) }
-    catch (e) { try { logger?.warn?.('dsh-sync: 墓碑(上传侧): ' + String((e && e.message) || e)) } catch {} }
+    try { pruneUp = await pruneCloudExtras(repoDir, eff, logger) }
+    catch (e) { try { logger?.warn?.('dsh-sync: 覆盖(上传): ' + String((e && e.message) || e)) } catch {} }
   }
   // 3.2 云端收敛（2026-10-20）：sessions 共享组镜像后，把云端异 lineage 目录就地
   // 归一（冗余删、缺失救回本机并写 canonical、映射不上保留），根治两套目录并存。
@@ -2570,6 +2482,14 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
     const strategy = strategyForPath(spec, p)
     // backup（各机独立备份）与 local（覆盖·本地为准）：本地是权威，远端动向一概不理
     if (strategy === 'backup' || strategy === 'local') {
+      delete state.pendingBoth[p]
+      continue
+    }
+    // [9999.9.26] 会话组不走文件级对账：存在性/内容对账由会话级镜像负责
+    // （下载=新者赢+覆盖删除本机多余；上传=吸收他机新增+覆盖删除云端多余）。
+    // 文件级 diff 对 part 链会逐文件「回填」到本机不存在的路径形态（<sessions>/ws/…），
+    // 同 id 分叉还会挂 bothModified 把 zstd 二进制送进 AI 对齐——两者都无意义。
+    if (p === 'sessions' || p.startsWith('sessions/') || /^backup\/[^/]+\/sessions(\/|$)/.test(p)) {
       delete state.pendingBoth[p]
       continue
     }
@@ -3285,7 +3205,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, readSessionTombstones, writeSessionTombstones, readSessionManifest, writeSessionManifest, collectShadowSessionIds, collectLiveSessionIdsByFolderKey, applyTombstoneUpload, shadowSessionMaxTime,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, pruneCloudExtras, pruneLocalOnlySessions,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
@@ -3727,12 +3647,11 @@ module.exports = {
                  会话删除从此是单机行为（云端不随本机删除而删），跨机对账由
                  converge 的新者赢统一负责。 */
             }
-            // [2026-11-05 墓碑] 手动上传路径同 runPush：循环只增不减，本机删除靠
-            // 基线比对判定（基线里有 && live 没有 && 云端还有）→ 写墓碑 + 删云端份。
-            // 旧的「会话删除是单机行为」注释就此作废。
-            let tombUpManual = { tombed: 0 }
-            try { tombUpManual = await applyTombstoneUpload(repoDir, state.instanceId, eff, ctx.logger) }
-            catch (e) { try { ctx.logger?.warn?.('dsh-sync: 墓碑(上传侧): ' + String((e && e.message) || e)) } catch {} }
+            // [2026-11-05 覆盖·9999.9.26] 手动上传 = 本地为准（纯机械镜像）：镜像后
+            // 影子仓 ws/<工作区>/ 里本机没有的会话直接删。无基线、无墓碑、无判断。
+            let pruneUpManual = { pruned: 0 }
+            try { pruneUpManual = await pruneCloudExtras(repoDir, eff, ctx.logger) }
+            catch (e) { try { ctx.logger?.warn?.('dsh-sync: 覆盖(上传): ' + String((e && e.message) || e)) } catch {} }
             // [converge 2026-10-20] 本机目录镜像完、云端 canonical 就位后，就地收敛
             // 云端异 lineage 目录：冗余删 / 缺失救回 / 映射不上保留。
             // 账目记日志 + 并进返回值（runUpload 无 skipped 列表——那是 runDownload
@@ -3935,67 +3854,17 @@ module.exports = {
             let cloudWsDirs = []
             try { cloudWsDirs = await fsP.readdir(source, { withFileTypes: true }) } catch {}
             const byWorkspace = {}
-            /* [2026-11-05 墓碑·下载侧] 远端墓碑 = 「这台/那台机器删了这些会话」。
-               ① 安全阀：云端副本 maxEventTime 晚于墓碑（对方删完又聊过）→ 墓碑作废，
-                  该会话按正常新者赢对账走；
-               ② 本机还挂着的已删会话 → 跟手删除（删除随同步传导到本机）；
-               ③ 阶段一收集时 tombIdsValid 里的 id 一律不落地（下载不再复活已删会话，
-                  修复「本机无该 id → 云端胜出 → 写回」的复活路径）。 */
-            let tombIdsValid = new Set()
-            let tombLocalRemoved = 0
-            const tombRemovedIds = []
-            if (eff.sessionsDeleteSync !== false && eff.sessionsStrategy !== 'standalone') {
-              try {
-                for (const t of await readSessionTombstones(repoDir)) {
-                  const cloudMx = await shadowSessionMaxTime(join(source, 'ws', t.wsKey, 'session-' + t.id))
-                  if (cloudMx > (t.at || 0) + SESSION_TOMBSTONE_GRACE_MS) continue   // 墓碑作废
-                  tombIdsValid.add(t.id)
-                  const m = (await loadWorkspaceMap()).find((x) => x.folderKey === t.wsKey)
-                  if (!m) continue                                                    // 本机无此工作区 → 没东西可删
-                  const localDir = join(localRoot, m.dirName, 'session-' + t.id)
-                  let exists = false
-                  try { exists = (await fsP.stat(localDir)).isDirectory() } catch {}
-                  if (exists) {
-                    await fsP.rm(localDir, { recursive: true, force: true }).catch(() => {})
-                    tombLocalRemoved++
-                    tombRemovedIds.push(t.id)
-                    try {
-                      await fsP.rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', t.id + '.json'), { force: true }).catch(() => {})
-                    } catch {}
-                  }
-                }
-                if (tombLocalRemoved > 0) {
-                  applied.push(src.to + ' -> 墓碑跟手删除本机 ' + tombLocalRemoved + ' 个已删会话')
-                  /* workspace.json 的 sessionIds 同步摘除，否则宿主列表残留点开 404 的幽灵 */
-                  try {
-                    const wsJsonPath = join(dshHome(), 'storages', 'workspace.json')
-                    const wsDoc = JSON.parse(await fsP.readFile(wsJsonPath, 'utf8'))
-                    let touched = false
-                    for (const w of Object.values(wsDoc?.tables?.workspaces ?? {})) {
-                      if (!Array.isArray(w.sessionIds)) continue
-                      const next = w.sessionIds.filter((sid) => !tombRemovedIds.includes(sid))
-                      if (next.length !== w.sessionIds.length) { w.sessionIds = next; touched = true }
-                    }
-                    if (touched) await fsP.writeFile(wsJsonPath, JSON.stringify(wsDoc, null, 2), 'utf8')
-                  } catch {}
-                }
-              } catch (e) { try { ctx.logger?.warn?.('[dsh-sync] 墓碑(下载侧): ' + String((e && e.message) || e)) } catch {} }
-            }
-            /* 2026-11-02 会话下载重写：多机同 id 会话「新者赢」（事故根治）。
-               事故：同一工作区在云端有 PC 目录 + 手机目录（--root-...），同 id 会话
-               双线各自演化。旧实现按目录字母序「清空本机+重灌」——手机目录排在 PC
-               目录之后，同 id 会话 rm+copyTree 把刚落地的 PC 新版盖成手机旧版
-               （实测：PC 端聊到 488 行的会话被回退成手机端 202 行，用户「上传→下载
-               →还是被冲」）。原「并集拷入」注释对同 id 会话是假的：copyTree 遇到
-               同名目录就是整目录覆盖。
-               新语义（三版本取最新）：
-               ① 收集每个会话 id 的全部云端副本（各机目录），解压取最大事件时间；
-               ② 与本机现有版本比 maxTime，最新者落地；并列优先本机（免无谓写）；
-               ③ 本机有、云端无任何副本 → 保留不动（本机独有会话不再被整目录清空蒸发）；
-               ④ 云端有、本机无 → 拷入最新副本（新会话下载照旧）；
-               ⑤ 单副本且与本机 size 相同 → 快路径跳过（免解压）；
-               ⑥ 云端胜出要覆盖前过完整性门（gateSessionPayload），坏副本不落地；
-                  解压失败的副本 maxTime=0 永不赢；本机解压失败按 0（让云端健康版救回）。 */
+            /* [9999.9.26] 9.25 的墓碑段已退役：纯机械镜像下删除传导 = 上传删云端多余
+               （pruneCloudExtras）+ 下载删本机多余（pruneLocalOnlySessions），不需要
+               「删除名单」。 */
+            /* 2026-11-02 会话下载重写 → 9999.9.26 机械覆盖：
+                ① 收集每个会话 id 的全部云端副本（各机目录），云端内部多副本取最大
+                  事件时间那份（那是云端自己的事）；
+                ② [9.26 改] 本机 vs 云端不比内容新旧：云端有 → 无条件落地覆盖本机
+                  （机械覆盖，用户钦定「不管啥内容新不新」）；
+                ③ 本机有、云端无 → 交 pruneLocalOnlySessions 删本机（镜像）；
+                ④ 单副本且与本机 size 相同 → 快路径跳过（内容相同写不写一样）；
+                ⑤ 覆盖前过完整性门（gateSessionPayload）+ zstd 魔数硬校验，坏副本不落地。 */
             const fixCwd = async (dir, wsPath) => {
               let ents = []
               try { ents = await fsP.readdir(dir, { withFileTypes: true }) } catch { return }
@@ -4127,9 +3996,6 @@ module.exports = {
               grp.cloudBases.push(cloudBase)
               for (const se of sessionsList) {
                 if (!se.isDirectory() || !se.name.startsWith('session-')) continue   // [final-B] 子代理会话不落地
-                /* [2026-11-05 墓碑] 已删除会话绝不复活：命中有效墓碑的云端副本不进
-                   落地清单——「本机无该 id → 云端胜出 → 写回」的复活路径就此封死。 */
-                if (tombIdsValid.has(se.name)) { applied.push(src.to + ' -> 墓碑跳过 ' + se.name); continue }
                 let seFiles = []
                 try { seFiles = await fsP.readdir(join(cwsPath, se.name)) } catch {}
                 const seParts = eff.sessionsParts === true ? (await listSessionParts(join(cwsPath, se.name)) || []) : []
@@ -4143,7 +4009,7 @@ module.exports = {
                 grp.copies.set(se.name, list)
               }
             }
-            // 阶段二：逐工作区落地（新者赢；本机独有保留）
+            // 阶段二：逐工作区落地（[9.26 机械覆盖] 云端有 → 无条件落地覆盖本机）
             for (const grp of wsGroups.values()) {
               const targetWsDir = join(localRoot, grp.targetDirName)
               const targetWorkspacePath = grp.targetWs.path
@@ -4160,18 +4026,14 @@ module.exports = {
                   if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
                   continue
                 }
+                /* [9.26 机械覆盖] 本机 vs 云端不比内容新旧：云端有就落地（快路径
+                   size 相同的上面已跳过）。maxTime 只用于云端内部多副本选份——
+                   那是云端自己的事，与「谁覆盖谁」无关。 */
                 for (const cp of copies) {
                   if (cp.maxTime === null) cp.maxTime = sessionMaxTimeBuf(await readSessionBuf(cp.sessionDir, cp.zstName))
                 }
-                const localMaxTime = localSt ? sessionMaxTimeBuf(await fsP.readFile(localZst)) : -1
                 const best = copies.reduce((a, b) => (b.maxTime > a.maxTime ? b : a), copies[0])
-                if (localSt && localMaxTime >= best.maxTime) {
-                  cwsSessionIds.push(sid)   // 本机最新（或并列）→ 保留本机
-                  if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
-                  if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
-                  continue
-                }
-                // 云端胜出 → 过完整性门后覆盖本机
+                // 云端落地 → 过完整性门后覆盖本机
                 // 2026-11-04 修：原先这里是 `} catch {}`，门内任何异常被吞掉后仍继续往下写
                 // → 非 zstd 字节（实测 PC session-3e4b2f31 被写成 ZIP 壳 50 4b 03 04）能直接落地。
                 // 现在：读失败/门抛异常一律视为「候选不可信」，跳过本会话，绝不用未经校验的字节覆盖本机。
@@ -4221,6 +4083,30 @@ module.exports = {
               }
               applied.push(src.to + ' -> ' + grp.targetDirName + ' (' + grp.cloudBases.join('+') + ', ' + cwsSessionIds.length + ')')
             }
+            /* [2026-11-05 覆盖·下载 9999.9.26] 下载 = 云端为准（纯机械镜像）：同工作区
+               内「本机有 && 云端已无」的会话直接删本机份——不判断是不是本机新建、
+               不比较内容新旧。工作区级保护照旧：云端没有该工作区目录的，上面循环
+               根本不进 wsGroups，这里一个字节都碰不到（10-14 规格延续）。 */
+            if (eff.sessionsDeleteSync !== false && eff.sessionsStrategy !== 'standalone' && wsGroups.size > 0) {
+              try {
+                const pruneR = await pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger: ctx.logger })
+                if (pruneR.pruned > 0) {
+                  applied.push(src.to + ' -> 覆盖(下载): 删本机 ' + pruneR.pruned + ' 个云端已无会话: ' + pruneR.prunedIds.join(', '))
+                  /* workspace.json 的 sessionIds 同步摘除（防幽灵条目） */
+                  try {
+                    const wsJsonPath2 = join(dshHome(), 'storages', 'workspace.json')
+                    const wsDoc2 = JSON.parse(await fsP.readFile(wsJsonPath2, 'utf8'))
+                    let touched2 = false
+                    for (const w of Object.values(wsDoc2?.tables?.workspaces ?? {})) {
+                      if (!Array.isArray(w.sessionIds)) continue
+                      const next = w.sessionIds.filter((sid) => !pruneR.prunedIds.includes(sid))
+                      if (next.length !== w.sessionIds.length) { w.sessionIds = next; touched2 = true }
+                    }
+                    if (touched2) await fsP.writeFile(wsJsonPath2, JSON.stringify(wsDoc2, null, 2), 'utf8')
+                  } catch {}
+                }
+              } catch (e) { try { ctx.logger?.warn?.('[dsh-sync] 覆盖对齐(下载): ' + String((e && e.message) || e)) } catch {} }
+            }
             /* [2026-11-02 阶段三] 旧 lineage 目录内容已按新者赢落地本机/并入 ws/
                canonical → 从影子仓移除，下次 push 云端即归一形态。 */
             for (const od of oldLineageDirs) {
@@ -4229,21 +4115,7 @@ module.exports = {
             if (oldLineageDirs.length > 0) {
               try { ctx.logger?.info?.('dsh-sync: 旧 lineage 目录已归并移除: ' + oldLineageDirs.join(', ')) } catch {}
             }
-            /* [2026-11-05 墓碑] 下载落地后基线并入「本机现有」——语义 = 曾有过且未删
-               （旧基线 ∪ live，绝不用 shadow 全集：云端独有且未落地的会话进基线，
-               下轮上传会被误判成「本机删除」）。 */
-            if (eff.sessionsDeleteSync !== false && eff.sessionsStrategy !== 'standalone') {
-              try {
-                const prevM = await readSessionManifest(state.instanceId)
-                const liveM = await collectLiveSessionIdsByFolderKey()
-                const mergedM = new Map(prevM ? prevM.map : [])
-                for (const [wsKey, set] of liveM) {
-                  if (!mergedM.has(wsKey)) mergedM.set(wsKey, new Set())
-                  for (const sid of set) mergedM.get(wsKey).add(sid)
-                }
-                await writeSessionManifest(state.instanceId, mergedM)
-              } catch {}
-            }
+            /* [9999.9.26] 9.25 的「下载落地后基线并入」已随基线机制退役。 */
             try {
               const workspaceJsonPath = join(dshHome(), 'storages', 'workspace.json')
               let wsData = null
@@ -4554,7 +4426,7 @@ module.exports = {
               syncSettings: eff.syncSettings, syncPlugins: eff.syncPlugins,
               syncMemory: eff.syncMemory, syncKnowledge: eff.syncKnowledge,
               sessionsParts: eff.sessionsParts !== false,   // [2026-11-04] 设置面板开关回填依据
-              sessionsDeleteSync: eff.sessionsDeleteSync !== false,   // [2026-11-05] 墓碑开关回填
+              sessionsDeleteSync: eff.sessionsDeleteSync !== false,   // [9999.9.26] 覆盖删除开关回填
               strategies: {
                 skills: STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'standalone',
                 sessions: STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'merge',

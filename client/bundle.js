@@ -112,8 +112,8 @@ window.__ModuleLoader__.load({
       intervalLabel: '同步间隔（分钟）',
       sessionsPartsLabel: '会话增量上传',
       sessionsPartsHint: '会话按增量分片上传，云端历史垃圾降 3-4 个数量级（省流量、省仓库体积）。要求两端插件都 ≥9999.9.20',
-      sessionsDeleteSyncLabel: '会话删除同步（墓碑）',
-      sessionsDeleteSyncHint: '本机删除的会话会写云端墓碑并从云端移除；下载不再复活已删会话。云端副本晚于墓碑（对方删完又聊过）时以内容为准。墓碑保留 30 天',
+      sessionsDeleteSyncLabel: '会话覆盖删除',
+      sessionsDeleteSyncHint: '纯机械镜像：上传=本地为准，云端有本机没有的直接删；下载=云端为准，本机有云端没有的直接删、云端有的直接覆盖本机。不判断新旧、无豁免',
       conflictModeLabel: '冲突处理',
       conflictModeAi: 'AI 处理（推荐）',
       conflictModeManual: '人工网页合并',
@@ -709,7 +709,7 @@ window.__ModuleLoader__.load({
       const [syncOnStartup, setSyncOnStartup] = useState(false)
       // [2026-11-04] 会话增量上传：默认 true（用户钦定默认开，可在面板关）。
       const [sessionsParts, setSessionsParts] = useState(true)
-      // [2026-11-05] 会话删除墓碑：默认 true（本机删除会同步删云端、下载不复活）。
+      // [9999.9.26] 会话覆盖删除：默认 true（上传删云端多余 + 下载删本机多余，纯机械镜像）。
       const [sessionsDeleteSync, setSessionsDeleteSync] = useState(true)
       const [conflictMode, setConflictMode] = useState('ai')
       const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true , memory: true, knowledge: true })
