@@ -102,6 +102,8 @@ const ZH = {
   intervalLabel: '同步间隔（分钟）',
   sessionsPartsLabel: '会话增量上传',
   sessionsPartsHint: '会话按增量分片上传，云端历史垃圾降 3-4 个数量级（省流量、省仓库体积）。要求两端插件都 ≥9999.9.20',
+  sessionsDeleteSyncLabel: '会话删除同步（墓碑）',
+  sessionsDeleteSyncHint: '本机删除的会话会写云端墓碑并从云端移除；下载不再复活已删会话。云端副本晚于墓碑（对方删完又聊过）时以内容为准。墓碑保留 30 天',
   conflictModeLabel: '冲突处理',
   conflictModeAi: 'AI 处理（推荐）',
   conflictModeManual: '人工网页合并',
@@ -217,6 +219,8 @@ const EN = {
   intervalLabel: 'Interval (minutes)',
   sessionsPartsLabel: 'Incremental session upload',
   sessionsPartsHint: 'Upload sessions as incremental parts — cloud garbage drops by 3-4 orders of magnitude. Requires both ends on plugin >= 9999.9.20',
+  sessionsDeleteSyncLabel: 'Session deletion sync (tombstones)',
+  sessionsDeleteSyncHint: 'Sessions deleted locally are tombstoned and removed from the cloud; download no longer resurrects them. Newer cloud copies (peer kept chatting after deletion) win over tombstones. Tombstones expire after 30 days',
   conflictModeLabel: 'Conflict handling',
   conflictModeAi: 'AI resolve (recommended)',
   conflictModeManual: 'Manual web merge',
@@ -695,6 +699,8 @@ function SettingsSection({ t }) {
   const [syncOnStartup, setSyncOnStartup] = useState(false)
   // [2026-11-04] 会话增量上传：默认 true（用户钦定默认开，可在面板关）。
   const [sessionsParts, setSessionsParts] = useState(true)
+  // [2026-11-05] 会话删除墓碑：默认 true（本机删除会同步删云端、下载不复活）。
+  const [sessionsDeleteSync, setSessionsDeleteSync] = useState(true)
   const [conflictMode, setConflictMode] = useState('ai')
   const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true , memory: true, knowledge: true })
   const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' , memory: 'merge', knowledge: 'merge' })
@@ -715,6 +721,7 @@ function SettingsSection({ t }) {
     setSyncOnStartup(d.syncOnStartup)
     // 后端缺字段（旧版宿主半）时按默认开处理，避免面板显示成关
     setSessionsParts(d.sessionsParts !== false)
+    setSessionsDeleteSync(d.sessionsDeleteSync !== false)
     setConflictMode(d.conflictMode)
         setG(prev => ({ ...prev, skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins, ...(d.syncMemory !== undefined ? { memory: d.syncMemory } : {}), ...(d.syncKnowledge !== undefined ? { knowledge: d.syncKnowledge } : {}) }))
     if (d.strategies) setGs(prev => ({ ...prev, ...d.strategies }))
@@ -782,7 +789,7 @@ function SettingsSection({ t }) {
   }
   const doSave = async () => {
     try {
-      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts }
+      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts, sessionsDeleteSync }
       if (token !== '') patch.token = token
       await putSettings(patch)
       setToken('')
@@ -904,6 +911,9 @@ function SettingsSection({ t }) {
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
               h('input', { type: 'checkbox', checked: sessionsParts, onChange: e => setSessionsParts(e.target.checked) }), t('sessionsPartsLabel')),
             h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('sessionsPartsHint')),
+            h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
+              h('input', { type: 'checkbox', checked: sessionsDeleteSync, onChange: e => setSessionsDeleteSync(e.target.checked) }), t('sessionsDeleteSyncLabel')),
+            h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('sessionsDeleteSyncHint')),
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
               t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
           h('div', { className: 'sk-card' },
