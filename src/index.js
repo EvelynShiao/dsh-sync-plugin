@@ -1938,9 +1938,27 @@ async function applyTombstoneUpload(repoDir, instanceId, eff, logger) {
   try {
     const baseline = await readSessionManifest(instanceId)
     if (!baseline || !baseline.capturedAt) {
-      /* 首跑：只建基线不判删除（没有基线就无法区分「本机删过」和「本机从来没有」） */
-      await writeSessionManifest(instanceId, await collectShadowSessionIds(repoDir))
-      try { logger?.info?.('[dsh-sync] 墓碑: 已建立会话基线（首跑不判删除）') } catch {}
+      /* 首跑：只建基线不判删除（没有基线就无法区分「本机删过」和「本机从来没有」）。
+         [防误删他机独有] 首基线剔除「part 链形态 && 本机 live 没有」的会话——part 链
+         是 ≥9.20 端刚上传的他机活跃内容（实测：手机 11-04 上传的活跃会话全是 part 链，
+         而 PC 删除的化石全是 zstd 单文件）；它们进基线会在第二轮被误判成「本机删除」，
+         继而在手机端被墓碑跟手删掉。剔除 = 它们永不判删（宁可漏删）。 */
+      const live0 = await collectLiveSessionIdsByFolderKey()
+      const shadow0 = await collectShadowSessionIds(repoDir)
+      const seed = new Map()
+      for (const [wsKey, set] of shadow0) {
+        const l0 = live0.get(wsKey) || new Set()
+        const keep = new Set()
+        for (const sid of set) {
+          if (!l0.has(sid)) {
+            try { if ((await listSessionParts(join(repoDir, 'sessions', 'ws', wsKey, sid)) || []).length > 0) continue } catch {}
+          }
+          keep.add(sid)
+        }
+        if (keep.size) seed.set(wsKey, keep)
+      }
+      await writeSessionManifest(instanceId, seed)
+      try { logger?.info?.('[dsh-sync] 墓碑: 已建立会话基线（首跑不判删除；part 链他机独有已排除）') } catch {}
       return { tombed: 0, seeded: true }
     }
     const live = await collectLiveSessionIdsByFolderKey()
@@ -1948,6 +1966,7 @@ async function applyTombstoneUpload(repoDir, instanceId, eff, logger) {
     const tombs = await readSessionTombstones(repoDir)
     const seen = new Set(tombs.map((t) => `${t.wsKey}|${t.id}`))
     let tombed = 0
+    const deletedThisRound = new Map()   // wsKey -> Set(id)
     const now = Date.now()
     for (const [wsKey, cloudSet] of shadow) {
       const liveSet = live.get(wsKey)
@@ -1962,6 +1981,8 @@ async function applyTombstoneUpload(repoDir, instanceId, eff, logger) {
         if (cloudMx > baseline.capturedAt + SESSION_TOMBSTONE_GRACE_MS) continue
         tombs.push({ id: sid, wsKey, at: now, by: instanceId })
         seen.add(`${wsKey}|${sid}`)
+        if (!deletedThisRound.has(wsKey)) deletedThisRound.set(wsKey, new Set())
+        deletedThisRound.get(wsKey).add(sid)
         await fsP.rm(join(repoDir, 'sessions', 'ws', wsKey, sid), { recursive: true, force: true }).catch(() => {})
         tombed++
       }
@@ -1970,8 +1991,21 @@ async function applyTombstoneUpload(repoDir, instanceId, eff, logger) {
       await writeSessionTombstones(repoDir, tombs)
       try { logger?.info?.(`[dsh-sync] 墓碑: 本机删除 ${tombed} 个会话，已写墓碑并从云端移除`) } catch {}
     }
-    /* 基线永远对齐「本轮处理后的影子状态」（含墓碑删除后的残集） */
-    await writeSessionManifest(instanceId, await collectShadowSessionIds(repoDir))
+    /* 基线语义 = 「本机曾有过且未被本机删除」：旧基线 ∪ 本机 live − 本轮墓碑删除。
+       （不是 shadow 全集！云端独有会话本机从没见过，进基线 = 下轮被误判删除。 */
+    const merged = new Map()
+    const liveAll = live
+    for (const [wsKey, knownSet] of baseline.map) merged.set(wsKey, new Set(knownSet))
+    for (const [wsKey, liveSet] of liveAll) {
+      if (!merged.has(wsKey)) merged.set(wsKey, new Set())
+      for (const sid of liveSet) merged.get(wsKey).add(sid)
+    }
+    for (const [wsKey, delSet] of deletedThisRound) {
+      if (!merged.has(wsKey)) continue
+      for (const sid of delSet) merged.get(wsKey).delete(sid)
+    }
+    for (const [k, s] of [...merged]) if (s.size === 0) merged.delete(k)
+    await writeSessionManifest(instanceId, merged)
     return { tombed }
   } catch (e) {
     try { logger?.warn?.('[dsh-sync] 墓碑(上传侧)失败: ' + String((e && e.message) || e)) } catch {}
@@ -4195,10 +4229,20 @@ module.exports = {
             if (oldLineageDirs.length > 0) {
               try { ctx.logger?.info?.('dsh-sync: 旧 lineage 目录已归并移除: ' + oldLineageDirs.join(', ')) } catch {}
             }
-            /* [2026-11-05 墓碑] 下载落地后把基线对齐到云端现状——否则下次上传会拿
-               旧基线把刚拉回来的会话误判成「本机删除」。 */
+            /* [2026-11-05 墓碑] 下载落地后基线并入「本机现有」——语义 = 曾有过且未删
+               （旧基线 ∪ live，绝不用 shadow 全集：云端独有且未落地的会话进基线，
+               下轮上传会被误判成「本机删除」）。 */
             if (eff.sessionsDeleteSync !== false && eff.sessionsStrategy !== 'standalone') {
-              try { await writeSessionManifest(state.instanceId, await collectShadowSessionIds(repoDir)) } catch {}
+              try {
+                const prevM = await readSessionManifest(state.instanceId)
+                const liveM = await collectLiveSessionIdsByFolderKey()
+                const mergedM = new Map(prevM ? prevM.map : [])
+                for (const [wsKey, set] of liveM) {
+                  if (!mergedM.has(wsKey)) mergedM.set(wsKey, new Set())
+                  for (const sid of set) mergedM.get(wsKey).add(sid)
+                }
+                await writeSessionManifest(state.instanceId, mergedM)
+              } catch {}
             }
             try {
               const workspaceJsonPath = join(dshHome(), 'storages', 'workspace.json')
