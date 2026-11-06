@@ -1214,14 +1214,11 @@ function mergeOrder(local, cloud) {
     sessions[title] = mine
   }
   out.sessions = sessions
-  // 归档/置顶：并集（本机在前）
+  // 归档/置顶：机械覆盖——本机为准直写云端（2026-11-06 定案，替换旧并集语义。
+  // 旧并集让「取消置顶」永远传不出去：上传时云端旧值并回 order，下载时又把钉子并回本机，
+  // 用户实测「取消置顶→上传→下载」后置顶复活。现改为只信本机，云端幽灵 archived 一并洗净。）
   for (const key of ['archived', 'pinned']) {
-    const mine = Array.isArray(out[key]) ? out[key] : []
-    const seen = new Set(mine)
-    for (const id of Array.isArray(cloud[key]) ? cloud[key] : []) {
-      if (typeof id === 'string' && !seen.has(id)) { mine.push(id); seen.add(id) }
-    }
-    out[key] = mine
+    if (!Array.isArray(out[key])) out[key] = []
   }
   // 手动顺序（sessionOrderByAccount 等）：逐工作区并集，本机在前；其余键本机赢
   if (cloud.manualOrder && typeof cloud.manualOrder === 'object') {
@@ -1380,7 +1377,7 @@ async function applyWorkspaceOrderViaRegistry(reg, order) {
   for (const t of order.workspaces) { const id = idByTitle.get(t); if (id && !orderedIds.includes(id)) orderedIds.push(id) }
   const newWsIds = [...orderedIds, ...state.workspaceIds.filter((id) => !orderedIds.includes(id))]
   const wsChanged = newWsIds.length === state.workspaceIds.length && newWsIds.some((v, i) => v !== state.workspaceIds[i])
-  // 归档/置顶：并集 + 只保留本机确实存在的（sessionKnown 权威判定，防幽灵）
+  // 归档/置顶：机械覆盖——以云端为准替换本机 + 只保留本机确实存在的（sessionKnown 权威判定，防幽灵）
   const localKnownCache = new Set(Array.isArray(state.archivedSessionIds) ? state.archivedSessionIds : [])
   const localKnown = async (id) => {
     if (localKnownCache.has(id)) return true
@@ -1388,12 +1385,13 @@ async function applyWorkspaceOrderViaRegistry(reg, order) {
   }
   const mergeFlag = async (key) => {
     const remote = order[key]
-    if (!Array.isArray(remote) || remote.length === 0) return state[key]
+    if (!Array.isArray(remote)) return state[key] // 云端 order 无该字段（旧格式）→ 不动本机
     const cur = Array.isArray(state[key]) ? state[key] : []
     const keep = []
-    for (const id of new Set([...cur, ...remote])) keep.push(cur.includes(id) || (await localKnown(id)) ? id : null)
-    const merged = keep.filter((id) => id !== null)
-    return merged.length === cur.length && merged.every((v, i) => v === cur[i]) ? cur : merged
+    for (const id of remote) {
+      if (typeof id === 'string' && (cur.includes(id) || (await localKnown(id)))) keep.push(id)
+    }
+    return keep.length === cur.length && keep.every((v, i) => v === cur[i]) ? cur : keep
   }
   const newArchived = await mergeFlag('archived')
   const newPinned = await mergeFlag('pinned')
@@ -1482,14 +1480,14 @@ async function applyWorkspaceOrder(order, ctx) {
       changed = true
     }
   }
-  // 归档/置顶标记：与云端并集（一台归档/置顶能带到其他设备），但只保留本机真实存在的
-  // 会话 id（避免给不存在的会话引入幽灵墓碑——那会让宿主报 duplicate/加载失败）。
+  // 归档/置顶标记：以云端为准机械覆盖（一台设备的取消置顶/归档也能传到其他设备），
+  // 只保留本机真实存在的会话 id（避免给不存在的会话引入幽灵墓碑——那会让宿主报 duplicate/加载失败）。
   const allLocalIds = new Set()
   for (const w of Object.values(table)) if (Array.isArray(w?.sessionIds)) for (const s of w.sessionIds) allLocalIds.add(s)
   const mergeFlagList = (key, remoteArr) => {
-    if (!Array.isArray(remoteArr) || !remoteArr.length) return
+    if (!Array.isArray(remoteArr)) return // 云端 order 无该字段（旧格式）→ 不动本机
     const cur = Array.isArray(doc.global[key]) ? doc.global[key] : []
-    const merged = [...new Set([...cur, ...remoteArr])].filter((id) => allLocalIds.has(id))
+    const merged = [...new Set(remoteArr)].filter((id) => allLocalIds.has(id))
     if (merged.length !== cur.length || merged.some((v, i) => v !== cur[i])) { doc.global[key] = merged; changed = true }
   }
   mergeFlagList('archivedSessionIds', order.archived)
