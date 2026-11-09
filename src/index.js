@@ -122,6 +122,14 @@ const DEFAULT_SYNC_SETTINGS = {
   snapshotSkills: false,      // 快照是否包含技能（体积大，默认只含 设置+插件清单）
   snapshotAuto: false,           // [用户设定] 不要每天自动快照         // 每天首个同步自动打一份本地快照（auto-<日期>）
   snapshotLocalKeep: 10,           // [用户设定] 只保留 5 份      // 本地快照滚动保留份数（勾了云端的随时可从云端恢复）
+  // [2026-11-09 体积自愈] 单文件上传门阈值（MB）：超限跳过+报错，防止异常大文件卡配额/推送失败。
+  // 会话 zstd 实测 ≤6MB，knowledge/memory.sqlite ≤30MB，GitCode 单文件硬限 ~100MB。
+  // 默认 64MB：只挡离谱异常，不误杀正常会话/库。
+  maxUploadFileMB: 64,
+  // [2026-11-09 体积自愈] 推送前置体积巡检阈值（MB）：git count-objects size-pack 超过此值
+  // 自动执行 git gc --aggressive --prune=now（本地瘦身，降低推送包体积）。
+  // GitCode 仓库配额 1GiB，默认 500MB 留足安全裕度。
+  repoGcThresholdMB: 500,
 }
 
 const STRATEGY_VALUES = ['standalone', 'merge']
@@ -163,6 +171,10 @@ function syncSettingsSchema(S) {
     snapshotAuto: S.boolean(),
     snapshotLocalKeep: S.number(),
     token: S.string(),
+    // [2026-11-09 体积自愈] 单文件上传门阈值（MB），默认 64，最小 1
+    maxUploadFileMB: S.number().default(64).min(1),
+    // [2026-11-09 体积自愈] 推送前置体积巡检阈值（MB），默认 500，最小 10
+    repoGcThresholdMB: S.number().default(500).min(10),
   })
 }
 let Config = undefined
@@ -298,7 +310,7 @@ function writeProfileFileSync(effIn, clearToken) {
   }
   const eff = effIn
   const vals = {}
-  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync']) vals[k] = eff[k]
+  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB']) vals[k] = eff[k]
   for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
   for (const k of ['intervalMinutes','snapshotLocalKeep']) vals[k] = eff[k]
   if (keptToken && !vals.token) vals.token = keptToken
@@ -896,7 +908,7 @@ function validatePresetLitePatch(fileText) {
   return { ok: true }
 }
 
-async function mirrorLiveToShadow(spec, shadowDir) {
+async function mirrorLiveToShadow(spec, shadowDir, eff) {
   for (const group of spec) {
     for (const src of group.sources) {
       const target = join(shadowDir, src.to)
@@ -948,13 +960,33 @@ async function mirrorLiveToShadow(spec, shadowDir) {
            同 id 会话单份；copyTree 纯增量=本机新版覆盖云端（后来居上），云端独有
            （他机刚传）保留不动，跨机对账交给 converge 的新者赢。2026-10-14 的
            「不整目录删」语义由 ws/ 共享目录天然继承。 */
+        /* [2026-11-09 part 感知] sessionsParts=true 时逐会话增量同步，防混合形态与 .bak 泄漏。 */
         const wsMap = await loadWorkspaceMap()
-        for (const m of wsMap) {
-          const srcDir = join(src.from, m.dirName)
-          let isDir = false
-          try { isDir = (await fsP.stat(srcDir)).isDirectory() } catch {}
-          if (!isDir) continue
-          await copyTree(srcDir, join(target, 'ws', m.folderKey), {})
+        if (eff?.sessionsParts === true) {
+          for (const m of wsMap) {
+            const srcDir = join(src.from, m.dirName)
+            let isDir = false
+            try { isDir = (await fsP.stat(srcDir)).isDirectory() } catch {}
+            if (!isDir) continue
+            const cloudWsDir = join(target, 'ws', m.folderKey)
+            await fsP.mkdir(cloudWsDir, { recursive: true })
+            let sessionsUp = []
+            try { sessionsUp = await fsP.readdir(srcDir, { withFileTypes: true }) } catch {}
+            for (const s of sessionsUp) {
+              if (!s.isDirectory() || !s.name.startsWith('session-')) continue
+              const liveSessDir = join(srcDir, s.name)
+              const cloudSessDir = join(cloudWsDir, s.name)
+              await upsertSessionToShadowParts(liveSessDir, cloudSessDir, eff, null)
+            }
+          }
+        } else {
+          for (const m of wsMap) {
+            const srcDir = join(src.from, m.dirName)
+            let isDir = false
+            try { isDir = (await fsP.stat(srcDir)).isDirectory() } catch {}
+            if (!isDir) continue
+            await copyTree(srcDir, join(target, 'ws', m.folderKey), {})
+          }
         }
       } else {
         /* 非 sessions 组保持原全量镜像语义（skills/plugins/settings 按目录整体属于本机）。 */
@@ -1838,6 +1870,131 @@ async function readSessionBuf(dir, name) {
   }
   return fsP.readFile(join(dir, name))
 }
+
+/* [2026-11-09 体积自愈] 读取本地仓库 pack 大小（MB，来自 git count-objects -v 的 size-pack，单位 KiB）。 */
+async function dirSizePackMb(binary, repoDir) {
+  try {
+    const out = await gitExec(binary, ['count-objects', '-v'], repoDir)
+    const m = /size-pack:\s*(\d+)/.exec(out)
+    if (m) return Number(m[1]) / 1024
+  } catch {}
+  return 0
+}
+
+/* [2026-11-09 体积自愈] 推送前置体积巡检：pack 超过阈值自动 gc --aggressive --prune=now。 */
+async function gcIfBloated(binary, repoDir, eff, logger) {
+  try {
+    const mb = await dirSizePackMb(binary, repoDir)
+    const threshold = Number(eff.repoGcThresholdMB) > 0 ? Number(eff.repoGcThresholdMB) : 500
+    if (mb >= threshold) {
+      logger?.warn?.(`[dsh-sync] 体积巡检: pack ${mb.toFixed(0)}MB ≥ ${threshold}MB，自动 git gc --aggressive --prune=now…`)
+      await gitExec(binary, ['gc', '--aggressive', '--prune=now'], repoDir)
+      const after = await dirSizePackMb(binary, repoDir)
+      logger?.info?.(`[dsh-sync] 体积巡检: gc 后 pack ${after.toFixed(0)}MB`)
+    }
+  } catch (e) {
+    logger?.warn?.('[dsh-sync] 体积巡检异常（忽略）: ' + String((e && e.message) || e))
+  }
+}
+
+/* [2026-11-09 体积自愈] 带自愈阶梯的推送：push 失败且匹配体积超限正则 → 本地 gc 重试 → rebuildCloudRepoIfBloated 重试 → 抛错。
+   execGit 注入点供测试（默认 gitExec）。pushArgs: ['push', remote, refspec] 形式。 */
+async function pushWithSelfHeal(binary, pushArgs, repoDir, eff, state, logger, execGit = gitExec) {
+  try {
+    return await execGit(binary, pushArgs, repoDir)
+  } catch (firstErr) {
+    const msg = String(firstErr && firstErr.message || '')
+    if (!REBUILD_WARNING_RE.test(msg)) throw firstErr
+    logger?.warn?.('[dsh-sync] 推送被拒（体积超限），触发自愈阶梯: ' + msg.slice(0, 160))
+    // ① 本地 gc 重试
+    try {
+      await gcIfBloated(binary, repoDir, eff, logger)
+      return await execGit(binary, pushArgs, repoDir)
+    } catch (e) {
+      logger?.warn?.('[dsh-sync] gc 重试仍失败: ' + String((e && e.message) || e).slice(0, 160))
+    }
+    // ② rebuildCloudRepoIfBloated（compact → 删仓重建 + 基线重推）
+    try {
+      const healed = await rebuildCloudRepoIfBloated(msg, eff, repoDir, state, logger)
+      if (healed) {
+        logger?.info?.('[dsh-sync] 自愈重建完成，再次尝试推送')
+        return await execGit(binary, pushArgs, repoDir)
+      }
+    } catch (e) {
+      logger?.warn?.('[dsh-sync] rebuildCloudRepoIfBloated 异常: ' + String((e && e.message) || e).slice(0, 160))
+    }
+    throw firstErr
+  }
+}
+
+/* [2026-11-09 体积自愈] 会话增量同步到影子仓（part 链感知）：
+   - 云端无 parts 且有 .zstd → 兼容：读 .zstd 作为 baseFromSingle
+   - 云端有 parts → 拼接为 merged
+   - 内容相等 → 清理可能混入的 .zstd，返回 'skip'
+   - 本地为 merged 严格前缀追加 → 写 delta part，返回 'append'
+   - 否则（回退/不相关/part 链已满）→ 重置链：rm 云端目录，写 part0000=本地全量，返回 'reset'
+   - sessionsParts=false → 旧单文件形态（白名单：zstd + session.lock），返回 'full'
+   返回: 'skip' | 'append' | 'reset' | 'full' */
+async function upsertSessionToShadowParts(liveDir, cloudDir, eff, logger) {
+  const ZST = 'session.v4.jsonl.zstd'
+  let st = null
+  try { st = await fsP.stat(join(liveDir, ZST)) } catch {}
+  if (!st || st.size < 1024) return 'skip'
+  if (eff?.sessionsParts !== true) {
+    await fsP.rm(cloudDir, { recursive: true, force: true }).catch(() => {})
+    await fsP.mkdir(cloudDir, { recursive: true })
+    await fsP.copyFile(join(liveDir, ZST), join(cloudDir, ZST))
+    try { await fsP.copyFile(join(liveDir, 'session.lock'), join(cloudDir, 'session.lock')) } catch {}
+    return 'full'
+  }
+  const lb = await fsP.readFile(join(liveDir, ZST))
+  const partsInfo = await listSessionParts(cloudDir)
+  let merged = null, baseFromSingle = false
+  if (partsInfo && partsInfo.length) merged = await concatSessionParts(cloudDir, partsInfo)
+  else { try { merged = await fsP.readFile(join(cloudDir, ZST)); baseFromSingle = true } catch {} }
+  const forceReset = partsInfo && partsInfo.length >= SESSION_PART_MAX
+  if (!forceReset && merged && merged.equals(lb)) {
+    if (!baseFromSingle && partsInfo && partsInfo.length) { try { await fsP.unlink(join(cloudDir, ZST)) } catch {} }
+    return 'skip'
+  }
+  if (!forceReset && merged && lb.length > merged.length && lb.subarray(0, merged.length).equals(merged)) {
+    const nextIdx = baseFromSingle ? 1 : partsInfo.length
+    if (baseFromSingle) { try { await fsP.rename(join(cloudDir, ZST), join(cloudDir, partFileName(0))) } catch {} }
+    await fsP.writeFile(join(cloudDir, partFileName(nextIdx)), lb.subarray(merged.length))
+    try { await fsP.unlink(join(cloudDir, ZST)) } catch {}
+    return 'append'
+  }
+  await fsP.rm(cloudDir, { recursive: true, force: true }).catch(() => {})
+  await fsP.mkdir(cloudDir, { recursive: true })
+  await fsP.writeFile(join(cloudDir, partFileName(0)), lb)
+  try { await fsP.copyFile(join(liveDir, 'session.lock'), join(cloudDir, 'session.lock')) } catch {}
+  return 'reset'
+}
+
+/* [2026-11-09 runPull part 组装] 从指定 rev（FETCH_HEAD 或 lastSynced）读取会话目录的完整缓冲：
+   优先拼接 part*；回退读 .zstd；均无则返回 null。 */
+async function assembleSessionBufFromRev(binary, rev, dirRel, repoDir) {
+  const parts = []
+  try {
+    const ls = await gitExec(binary, ['ls-tree', '-r', '--name-only', rev, '--', dirRel], repoDir)
+    for (const line of ls.split(/\r?\n/)) {
+      const name = line.trim()
+      if (name && name.startsWith('session.v4.jsonl.zstd.part')) parts.push(name)
+    }
+  } catch {}
+  if (parts.length) {
+    parts.sort()
+    const bufs = []
+    for (const p of parts) {
+      try { bufs.push(await gitShowBuf(binary, `${rev}:${dirRel}/${p}`, repoDir)) } catch { return null }
+    }
+    return Buffer.concat(bufs)
+  }
+  try {
+    return await gitShowBuf(binary, `${rev}:${dirRel}/session.v4.jsonl.zstd`, repoDir)
+  } catch { return null }
+}
+
 /* ── 覆盖镜像（2026-11-05，9999.9.26）──────────────────────────────────
    用户钦定终态（原话）：「我的插件只有上传和下载两种，都是覆盖逻辑！原作者的
    merge 逻辑早就应该废弃！同步的时候，本地有而云端没有的会话该删掉，反之亦然！
@@ -2163,7 +2320,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   await gitExec(binary, ['checkout', '--detach', baseRef], repoDir).catch(() => {})
   // 3. overlay live snapshot onto the baseline: shadow now = baseline + local deltas
   // remote（覆盖·远端为准）组本地是只读镜像：不推送本机版本
-  await mirrorLiveToShadow(spec.filter(g => g.strategy !== 'remote'), repoDir)
+  await mirrorLiveToShadow(spec.filter(g => g.strategy !== 'remote'), repoDir, eff)
   // 3.1 [2026-11-05 覆盖·9999.9.26] 上传 = 本地为准（纯机械镜像，无任何判断）：
   //     影子仓 ws/<工作区>/ 里本机 live 没有的会话目录 → 直接删（随本次 push 生效）。
   //     9.25 的墓碑/基线/9.26 初版的吸收对齐全部退役：用户钦定「不管啥内容新不新，
@@ -2234,6 +2391,9 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
     } catch { /* 排序导出失败不阻断推送 */ }
   }
 
+  // [2026-11-09 体积自愈] 推送前置体积巡检 + 自动 gc
+  await gcIfBloated(binary, repoDir, eff, logger)
+
   // 4. commit on a fresh branch
   await gitExec(binary, ['checkout', '-b', branch], repoDir)
   await gitExec(binary, ['add', '-A'], repoDir)
@@ -2241,8 +2401,8 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   try { await gitExec(binary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `sync ${instanceId} ${new Date().toISOString()}`], repoDir); commitOk = true } catch { /* nothing to commit */ }
   if (!commitOk) return { pushed: false, nothingToCommit: true }
 
-  // 5. push the branch (token in URL, not in config)
-  await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir)
+  // 5. push the branch (token in URL, not in config) —— 带自愈阶梯
+  await pushWithSelfHeal(binary, ['push', remote, `HEAD:${branch}`], repoDir, eff, state, logger)
 
   // 6. create PR + mergeable check
   const parsed = parseRepoUrl(eff.repoUrl)
@@ -2320,7 +2480,17 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
   const changed = changedRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
   let applied = 0, skipped = 0
   state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
+
+  /* [2026-11-09 runPull part 组装] 预扫描 part 路径，按会话目录分组；
+     这些不在主循环处理，后续统一拼接、完整性门、落地为单文件 .zstd。 */
+  const partDirs = new Map() // shadowRelDir -> true
   for (const p of changed) {
+    const m = p.match(/^(.+)\/session\.v4\.jsonl\.zstd\.part\d{4}$/)
+    if (m) partDirs.set(m[1], true)
+  }
+  // 主循环：跳过 part 文件，其余按原逻辑
+  for (const p of changed) {
+    if (partDirs.has(p.slice(0, p.lastIndexOf('/')))) continue
     const livePath = resolveLivePath(spec, p)
     if (!livePath) { skipped++; continue }
     let liveBuf = null
@@ -2364,6 +2534,36 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     if (!await gateSessionPayload(livePath, remoteBuf, logger)) { skipped++; continue }
     try {
       await atomicWriteFile(livePath, remoteBuf)
+      applied++
+    } catch { skipped++ }
+  }
+
+  /* [2026-11-09 runPull part 组装] 处理分片会话：按目录拼接 FETCH_HEAD 的 parts，
+     对比 lastSynced 基线做 untouched 判定，完整性门后落地为单文件 .zstd。 */
+  for (const partDir of partDirs.keys()) {
+    const shadowRel = partDir // e.g. 'sessions/ws/Evelyn/session-xxx'
+    const liveZstdPath = resolveLivePath(spec, shadowRel + '/session.v4.jsonl.zstd')
+    if (!liveZstdPath) { logger?.warn?.(`[dsh-sync] runPull: 无法解析 ${shadowRel} 的 live 路径，跳过`); continue }
+    // 远端完整缓冲（优先 parts）
+    const remoteBuf = await assembleSessionBufFromRev(binary, 'FETCH_HEAD', shadowRel, repoDir)
+    if (!remoteBuf) { skipped++; continue }
+    // 基线缓冲（lastSynced 的 parts 或 .zstd）
+    const baseBuf = await assembleSessionBufFromRev(binary, lastSynced, shadowRel, repoDir)
+    let liveBuf = null
+    try { liveBuf = await fsP.readFile(liveZstdPath) } catch {}
+    const untouched = liveBuf === null ? (baseBuf === null || baseBuf.length === 0) : (baseBuf !== null && Buffer.compare(liveBuf, baseBuf) === 0)
+    if (!untouched) {
+      // 本地动过 → 记入 pendingBoth（键用 .zstd 影子路径），跳过
+      const pendKey = shadowRel + '/session.v4.jsonl.zstd'
+      if (!state.pendingBoth[pendKey]) state.pendingBoth[pendKey] = lastSynced
+      skipped++
+      continue
+    }
+    delete state.pendingBoth[shadowRel + '/session.v4.jsonl.zstd']
+    // 完整性门（传真实 .zstd 路径，确保 gate 生效）
+    if (!await gateSessionPayload(liveZstdPath, remoteBuf, logger)) { skipped++; continue }
+    try {
+      await atomicWriteFile(liveZstdPath, remoteBuf)
       applied++
     } catch { skipped++ }
   }
@@ -3208,6 +3408,9 @@ module.exports = {
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
     gateSessionPayload, scanZstdFrames, sqliteHealthy, sqliteHealthyBuf, selfHealSqlitesOnBoot, rebuildCloudRepoIfBloated,
+    // part 链工具（导出供测试）
+    listSessionParts, concatSessionParts, readSessionBuf, upsertSessionToShadowParts, pushWithSelfHeal, gcIfBloated, assembleSessionBufFromRev, dirSizePackMb,
+    SESSION_PART_PREFIX, SESSION_PART_MAX, partFileName,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
     __setConnection(svc) { connectionSvcRef = svc }, __resetApiproxyCache() { authedUrlCache = null; cookieCache = null },
@@ -3464,6 +3667,8 @@ module.exports = {
       try {
         const sessionsSignatureForUpload = async (root) => {
           /* 与上传循环完全同口径：sessions/<工作区>/<session-*>/session.v4.jsonl.zstd。
+             [2026-11-09] 影子仓可能存 part 链：同时统计 .zstd 与 part* 文件（字节数累加、文件数累加）。
+             同一会话若同时存在 .zstd 与 parts（混合形态），字节会重复计，但此时 sizes 不会相等 → 不会误触发短路。
              返回 bytes:files 指纹（与 treeSignature 同形状）；目录不存在返回 null。 */
           const { readdirSync, statSync: statSync2 } = require('node:fs')
           let bytes = 0, files = 0, exists = false
@@ -3477,8 +3682,19 @@ module.exports = {
             try { sessDirs = readdirSync(wsPath, { withFileTypes: true }) } catch { continue }
             for (const s of sessDirs) {
               if (!s.isDirectory() || !s.name.startsWith('session-')) continue
-              const zst = join(wsPath, s.name, 'session.v4.jsonl.zstd')
+              const sessPath = join(wsPath, s.name)
+              // 先统计 .zstd
+              const zst = join(sessPath, 'session.v4.jsonl.zstd')
               try { const st = statSync2(zst); if (st.size >= 1024) { bytes += st.size; files += 1; exists = true } } catch {}
+              // 再统计 part* 文件（影子仓 part 链形态）
+              try {
+                const entries = readdirSync(sessPath)
+                for (const e of entries) {
+                  if (e.startsWith('session.v4.jsonl.zstd.part')) {
+                    try { const st = statSync2(join(sessPath, e)); if (st.size >= 1024) { bytes += st.size; files += 1; exists = true } } catch {}
+                  }
+                }
+              } catch {}
             }
           }
           return exists || true ? `${bytes}:${files}` : null
@@ -3595,6 +3811,13 @@ module.exports = {
                 let st = null
                 try { st = await fsP.stat(join(sPath, zst)) } catch {}
                 if (!st || st.size < 1024) continue
+                // [2026-11-09 体积自愈] 单文件上传门：超限跳过+报错，不炸整轮
+                const maxMB = Number(eff.maxUploadFileMB) > 0 ? Number(eff.maxUploadFileMB) : 64
+                if (st.size > maxMB * 1024 * 1024) {
+                  ctx.logger?.warn?.(`[dsh-sync] 单文件上传门: ${s.name}/${zst} ${(st.size/1048576).toFixed(1)}MB > ${maxMB}MB，跳过上传`)
+                  skipped.push(s.name + '/' + zst + ` (${(st.size/1048576).toFixed(1)}MB > ${maxMB}MB)`)
+                  continue
+                }
                 uploadedIds.add(s.name)
                 /* [E线增量 2026-10-25] 会话粒度字节对比：云端同会话 zstd 的
                    (size,mtime) 与本地一致 → 整个会话跳过（不删不拷）。
@@ -3605,40 +3828,10 @@ module.exports = {
                 let cloudSt = null
                 try { cloudSt = await fsP.stat(cloudFile) } catch {}
                 if (cloudSt && cloudSt.size === st.size && cloudSt.mtimeMs === st.mtimeMs) continue
-                /* [2026-11-03 parts 增量] 见 SESSION_PART_PREFIX 注释。追加判定：
-                   云端拼接结果为本机文件前缀 → 只写增量 part；否则重置 base。
-                   兼容过渡：云端还是旧单文件时，rename 成 part0000（内容不变，blob 不变）。 */
-                if (eff.sessionsParts === true) {
-                  const lb = await fsP.readFile(join(sPath, zst))
-                  const partsInfo = await listSessionParts(cloudSess)
-                  let merged = null, baseFromSingle = false
-                  if (partsInfo && partsInfo.length) merged = await concatSessionParts(cloudSess, partsInfo)
-                  else { try { merged = await fsP.readFile(cloudFile); baseFromSingle = true } catch {} }
-                  const forceReset = partsInfo && partsInfo.length >= SESSION_PART_MAX
-                  if (!forceReset && merged && merged.equals(lb)) continue
-                  if (!forceReset && merged && lb.length > merged.length && lb.subarray(0, merged.length).equals(merged)) {
-                    const nextIdx = baseFromSingle ? 1 : partsInfo.length
-                    if (baseFromSingle) { try { await fsP.rename(cloudFile, join(cloudSess, partFileName(0))) } catch {} }
-                    await fsP.writeFile(join(cloudSess, partFileName(nextIdx)), lb.subarray(merged.length))
-                    continue
-                  }
-                  await fsP.rm(cloudSess, { recursive: true, force: true }).catch(() => {})
-                  await fsP.mkdir(cloudSess, { recursive: true })
-                  await fsP.writeFile(join(cloudSess, partFileName(0)), lb)
-                  const lockFileUp = join(sPath, 'session.lock')
-                  try { await fsP.copyFile(lockFileUp, join(cloudSess, 'session.lock')) } catch {}
-                  continue
-                }
-                await fsP.rm(cloudSess, { recursive: true, force: true }).catch(() => {})
-
-                void 0
-                /* [2026-10-26 副本泄漏修复] 会话目录只允许 .zstd 主文件 + session.lock
-                   上云——.bak 手术备份 / 杂物绝不传（昨晚 8 次同步把 5 个 .bak 和
-                   手术副本全传上去过，白吃配额）。白名单制，新增文件类型必须显式加。 */
-                await fsP.mkdir(cloudSess, { recursive: true })
-                await fsP.copyFile(join(sPath, zst), cloudFile)
-                const lockFile = join(sPath, 'session.lock')
-                try { await fsP.copyFile(lockFile, join(cloudSess, 'session.lock')) } catch {}
+                /* [2026-11-09 part 感知重构] 使用统一的 upsertSessionToShadowParts，
+                   含：相等跳过+清理混入 .zstd、追加写 delta part、重置链、sessionsParts=false 单文件白名单。 */
+                await upsertSessionToShadowParts(sPath, cloudSess, eff, ctx.logger)
+                continue
               }
               /* [2026-11-02 归一后取消对账删除] ws/<key>/ 是跨机共享目录：本机没有的
                  会话可能是另一台机器刚传的，按「本机删了」处理会误删他机内容。
@@ -3733,8 +3926,10 @@ module.exports = {
         commitOk = true
       } catch {}
       if (!commitOk) return { uploaded: false, nothingToCommit: true }
+      // [2026-11-09 体积自愈] 推送前置体积巡检 + 自动 gc
+      await gcIfBloated(eff.gitBinary, repoDir, eff, ctx.logger)
       {
-        const pushOutMain = await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
+        const pushOutMain = await pushWithSelfHeal(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir, eff, state, ctx.logger)
         await rebuildCloudRepoIfBloated(pushOutMain, eff, repoDir, state, ctx.logger)
       }
       state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
@@ -3759,7 +3954,7 @@ module.exports = {
           await gitExec(eff.gitBinary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `auto-squash: 单提交基线（原 ${commitCount} 份历史快照已合并，内容不变）`], repoDir)
           await gitExec(eff.gitBinary, ['branch', '-D', eff.branch], repoDir)
           await gitExec(eff.gitBinary, ['branch', '-M', eff.branch], repoDir)
-          const pushOutSq = await gitExec(eff.gitBinary, ['push', '-f', remote, `HEAD:${eff.branch}`], repoDir)
+          const pushOutSq = await pushWithSelfHeal(eff.gitBinary, ['push', '-f', remote, `HEAD:${eff.branch}`], repoDir, eff, state, ctx.logger)
           await rebuildCloudRepoIfBloated(pushOutSq, eff, repoDir, state, ctx.logger)
           state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
           await saveState()
@@ -4038,7 +4233,8 @@ module.exports = {
                 let candBuf = null
                 try {
                   candBuf = await readSessionBuf(best.sessionDir, best.zstName)
-                  if (!await gateSessionPayload(join(dstSession, best.zstName), candBuf, ctx.logger)) {
+                  // [2026-11-09 修] gate 必须传真实 .zstd 路径（而非 '::parts::'），否则 gateSessionPayload 会绕过完整性校验。
+                  if (!await gateSessionPayload(join(dstSession, 'session.v4.jsonl.zstd'), candBuf, ctx.logger)) {
                     applied.push(src.to + ' -> SKIP ' + sid + ' (完整性门隔离：' + best.dirName + ')')
                     candBuf = null
                     continue
@@ -4504,6 +4700,8 @@ module.exports = {
               if (typeof body[key] === 'boolean') patch[key] = body[key]
             }
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes
+            if (typeof body.maxUploadFileMB === 'number' && body.maxUploadFileMB >= 1) patch.maxUploadFileMB = Math.floor(body.maxUploadFileMB)
+            if (typeof body.repoGcThresholdMB === 'number' && body.repoGcThresholdMB >= 10) patch.repoGcThresholdMB = Math.floor(body.repoGcThresholdMB)
             // token: non-empty sets; null/'' clears. Never echoed.
             let clearToken = false
             if (typeof body.token === 'string' && body.token !== '') patch.token = body.token
