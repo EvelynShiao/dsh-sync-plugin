@@ -1913,12 +1913,19 @@ async function packOrphanStats(binary, repoDir) {
   const out = await gitExec(binary, ['count-objects', '-v'], repoDir)
   const sizePackKb = Number((/size-pack:\s*(\d+)/.exec(out) || [])[1] || 0)
   const inPack = Number((/in-pack:\s*(\d+)/.exec(out) || [])[1] || 0)
+  const looseCount = Number((/^count:\s*(\d+)/m.exec(out) || [])[1] || 0)
   let reachable = 0
   try {
     reachable = Number(String(await gitExec(binary, ['rev-list', '--objects', '--all', '--count'], repoDir)).trim()) || 0
-  } catch { /* rev-list 失败按「无孤儿」处理（保守：不触发孤儿 gc，只走绝对体积阈值） */ reachable = inPack }
-  const orphans = Math.max(0, inPack - reachable)
-  return { mb: sizePackKb / 1024, inPack, reachable, orphans, orphanRatio: inPack > 0 ? orphans / inPack : 0 }
+  } catch { /* rev-list 失败按「无孤儿」处理（保守：不触发孤儿 gc，只走绝对体积阈值） */ reachable = inPack + looseCount }
+  /* [2026-11-10 口径修正] rev-list 可达数含 loose 对象，而 in-pack 只算 pack——直接相减会把真
+     孤儿（reflog 钉住的 squash 孤儿）被 loose 抵成 0（2026-11-10 下午真仓实测：463 in-pack /
+     493 reachable 算出 0%，实际 pack 里藏 119 个孤儿、~45MB 死重）。修正：pack 可达 ≈ 可达总数
+     − loose 数（松散对象刚写入通常可达），孤儿 = in-pack − pack可达。loose 孤儿不计入（不占
+     pack，gc 时一并清，低估方向安全）。 */
+  const packReachable = Math.max(0, reachable - looseCount)
+  const orphans = Math.max(0, inPack - packReachable)
+  return { mb: sizePackKb / 1024, inPack, reachable, looseCount, orphans, orphanRatio: inPack > 0 ? orphans / inPack : 0 }
 }
 
 /* [2026-11-10 孤儿自愈] 体积/孤儿双触发巡检：

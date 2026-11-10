@@ -72,6 +72,22 @@ await t('干净仓：可达=已打包，孤儿占比 0', async () => {
   } finally { cleanup(r) }
 })
 
+await t('口径修正：pack 孤儿 + loose 可达共存 → 不被 loose 抵消成 0', async () => {
+  const r = newRepo()
+  try {
+    commitFile(r.repo, 'a.bin', blob(1), 'base')
+    packAll(r.repo)                                 // A 全进 pack
+    commitFile(r.repo, 'b.bin', blob(2), 'second')
+    packAll(r.repo)                                 // B 也进 pack（当时可达）
+    g(r.repo, 'reset', '-q', '--hard', 'HEAD~1')    // B 的 pack 对象变孤儿（reflog 钉着）
+    commitFile(r.repo, 'c.bin', blob(0.5), 'third') // C 走 loose（可达）——复刻真仓 463/493 形态
+    const st = await packOrphanStats('git', r.repo)
+    ok(st.looseCount > 0, `前置：应有 loose 对象，实得 ${st.looseCount}`)
+    ok(st.orphans > 0, `pack 孤儿不应被 loose 抵消，实得 ${st.orphans}（旧口径会算出 0）`)
+    ok(st.orphanRatio > 0.2, `孤儿占比应可观，实得 ${st.orphanRatio.toFixed(2)}`)
+  } finally { cleanup(r) }
+})
+
 await t('squash 形态：reset 孤儿化旧提交 → 占比 > 0，对象暂存但 refs 不可达', async () => {
   const r = newRepo()
   try {
