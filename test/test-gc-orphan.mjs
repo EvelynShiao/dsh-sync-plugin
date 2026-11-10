@@ -14,10 +14,11 @@ import { randomBytes } from 'node:crypto'
 
 const require = createRequire(import.meta.url)
 const mod = require('../src/index.js')
-const { packOrphanStats, gcIfBloated, pushWithSelfHeal } = mod.__internals
+const { packOrphanStats, gcIfBloated, pushWithSelfHeal, gitExec, gitExecOut, REBUILD_WARNING_RE, rebuildCloudRepoIfBloated } = mod.__internals
 
 let pass = 0, fail = 0
 const ok = (v, msg) => { if (!v) throw new Error(msg || '断言失败') }
+const eq = (a, b, msg) => { const A = JSON.stringify(a), B = JSON.stringify(b); if (A !== B) throw new Error(`${msg || ''} 期望 ${B} 实得 ${A}`) }
 const t = async (name, fn) => {
   try { await fn(); pass++; console.log(`  ✓ ${name}`) }
   catch (e) { fail++; console.log(`  ✗ ${name}\n      ${e.message}`) }
@@ -182,5 +183,56 @@ await t('packOrphanStats 读真仓：体积与占比可解析', async () => {
   } catch (e) { throw new Error('真仓读取失败: ' + e.message) }
 })
 
+console.log('\n=== ⑤ 推送取证：stderr 捕获 + 删仓重建触发（9999.9.30 真凶回归） ===')
+
+await t('gitExecOut 成功回传含 stderr；旧 gitExec 只回 stdout（根因复现）', async () => {
+  const r = newRepo()
+  try {
+    commitFile(r.repo, 'a.txt', Buffer.from('x'), 'init')
+    const legacyOut = await gitExec('git', ['checkout', '-b', 'probe-legacy'], r.repo)
+    ok(!legacyOut.includes('Switched'), '旧 gitExec 不应含 stderr（复现 9999.9.29 的盲区）')
+    const out = await gitExecOut('git', ['checkout', '-b', 'probe-new'], r.repo)
+    ok(out.includes('Switched to a new branch'), 'gitExecOut 应合并 stderr（远端横幅可见的前提）')
+  } finally { cleanup(r) }
+})
+
+await t('gitExecOut 失败错误信息带 stderr 尾部（拒收报告不丢）', async () => {
+  const r = newRepo()
+  try {
+    commitFile(r.repo, 'a.txt', Buffer.from('x'), 'init')
+    let msg = ''
+    try { await gitExecOut('git', ['rev-parse', '--verify', 'no-such-ref-xyz'], r.repo) } catch (e) { msg = e.message }
+    ok(/fatal|no such/i.test(msg), `错误应含 stderr 文本，实得: ${msg.slice(0, 80)}`)
+  } finally { cleanup(r) }
+})
+
+await t('pushWithSelfHeal 真推送返回值含 stderr（体积横幅进得了判定）', async () => {
+  const r = newRepo()
+  const remote = join(r.dir, 'remote.git')
+  try {
+    execFileSync('git', ['init', '-q', '--bare', remote])
+    commitFile(r.repo, 'a.bin', blob(0.3), 'base')
+    g(r.repo, 'remote', 'add', 'origin', remote)
+    const out = await pushWithSelfHeal('git', ['push', 'origin', 'HEAD:main'], r.repo, { repoGcThresholdMB: 9999 }, {}, logger())
+    ok(/-> main|up-to-date/i.test(out), `推送返回应含 stderr 摘要，实得: ${JSON.stringify(out.slice(0, 200))}`)
+  } finally { cleanup(r) }
+})
+
+await t('REBUILD_WARNING_RE 放宽：exceeds the limit / GB 都命中，常规输出不误报', async () => {
+  ok(REBUILD_WARNING_RE.test('remote: GitCode: The repository size (1.1 GiB) exceeds the limit'), 'exceeds the limit 应命中')
+  ok(REBUILD_WARNING_RE.test('remote: repo size (800MB) exceeds limit'), 'exceeds limit + MB 应命中')
+  ok(!REBUILD_WARNING_RE.test('Everything up-to-date'), 'up-to-date 不应命中')
+  ok(!REBUILD_WARNING_RE.test('Writing objects: 100% (463/463), 72 MiB | 3.5 MiB/s, done.'), '进度行不应命中')
+})
+
+await t('rebuildCloudRepoIfBloated 门禁：不匹配/非 GitCode/无 token → false 不上网', async () => {
+  const lg = logger()
+  eq(await rebuildCloudRepoIfBloated('Everything up-to-date', {}, 'x', {}, lg), false, '不匹配输出应返回 false')
+  eq(await rebuildCloudRepoIfBloated('size (1.2 GiB) exceeds the limit', { repoUrl: 'https://github.com/a/b.git' }, 'x', {}, lg), false, '非 GitCode 应返回 false')
+  eq(await rebuildCloudRepoIfBloated('size (1.2 GiB) exceeds the limit', { repoUrl: 'https://gitcode.com/gcw_wXIDw07q/dsh-sync.git' }, 'x', {}, lg), false, '无 token 应返回 false')
+})
+
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
+process.exit(fail === 0 ? 0 : 1)
+
 process.exit(fail === 0 ? 0 : 1)
