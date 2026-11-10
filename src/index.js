@@ -500,6 +500,26 @@ function gitExec(binary, args, cwd) {
   })
 }
 
+/* [2026-11-10 推送取证] gitExec 只回传 stdout，而 git push 的远端警告/拒收报告全在 stderr
+   （"remote: … exceeds limit" 体积横幅、"To <url> / branch 更新行" 都走 stderr）→
+   9999.9.29 之前 rebuildCloudRepoIfBloated 吃到的 pushOut 永远是空 stdout，横幅正则永远匹配不上，
+   「推送被拒→删仓重建」自愈从未真正触发（2026-11-10 定案，用户点名）。
+   gitExecOut：成功时回传 stdout+stderr 合并文本（供横幅正则判定）；失败时错误信息带 stderr 尾部
+   全量（截 4000 字符，保住 remote 横幅），供 pushWithSelfHeal 自愈阶梯匹配。 */
+function gitExecOut(binary, args, cwd) {
+  return new Promise((fulfil, reject) => {
+    execFile(binary, args, { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      const errText = String(stderr || '')
+      if (error) {
+        const flat = errText.replace(/\r/g, '').split(/\r?\n/).filter(Boolean).join(' ')
+        reject(new Error(`git ${args[0]}: ${flat.slice(-4000) || error.message}`))
+        return
+      }
+      fulfil(String(stdout || '') + (errText.trim() ? '\n' + errText : ''))
+    })
+  })
+}
+
 function gitShowBuf(binary, rev, cwd) {
   // raw bytes for binary-safe compare/copy (session logs are zstd)
   return new Promise((fulfil, reject) => {
@@ -1804,7 +1824,9 @@ function selfHealSqlitesOnBoot(cfg, roots, io) {
    重建四步：bundle 保险 → DELETE 旧仓 → POST 重建私有仓 → push 原基线。
    commit sha 不变 ⇒ state.lastSyncedCommit 天然有效，其他端无感知。
    任何一步失败只记警告：下轮上传警告再现时自动重试（幂等）。 */
-const REBUILD_WARNING_RE = /exceeds limit|size \(\d+(?:\.\d+)?\s*[MG]iB\)/i
+/* [2026-11-10] 横幅正则放宽：GitCode 实际文案可能是 "exceeds the limit"（带 the）、"GB"（不带 i），
+   旧式 /exceeds limit|[MG]iB/ 两种都漏。只用于自愈触发判定，放宽无误伤面。 */
+const REBUILD_WARNING_RE = /exceeds\s+(?:the\s+)?limit|size\s*\(\d+(?:\.\d+)?\s*[MG]i?B/i
 async function rebuildCloudRepoIfBloated(pushOut, eff, repoDir, state, logger) {
   try {
     const out = String(pushOut || '')
@@ -1933,8 +1955,11 @@ async function gcIfBloated(binary, repoDir, eff, logger, opts = {}) {
 /* [2026-11-09 体积自愈] 带自愈阶梯的推送：push 失败且匹配体积超限正则 → 本地 gc 重试 → rebuildCloudRepoIfBloated 重试 → 抛错。
    execGit 注入点供测试（默认 gitExec）。pushArgs: ['push', remote, refspec] 形式。 */
 async function pushWithSelfHeal(binary, pushArgs, repoDir, eff, state, logger, execGit = gitExec) {
+  // [2026-11-10 推送取证] 真实推送走 gitExecOut（stdout+stderr 合并），远端体积横幅才进得了
+  // 自愈判定（成功带警告放行的场景 + 失败拒收场景都靠它）；注入 execGit 的测试环境维持原契约。
+  const run = execGit === gitExec ? gitExecOut : execGit
   try {
-    const out = await execGit(binary, pushArgs, repoDir)
+    const out = await run(binary, pushArgs, repoDir)
     // [2026-11-10 孤儿自愈] 推送成功后补一次巡检：auto-squash 在上传流程末段 force push 才把旧历史
     // 孤儿化，而所有预推送巡检（runPush/runUpload 里的 gcIfBloated）全在 squash 之前——孤儿永远活在
     // 巡检盲区（11-10 复盘定案）。推送是所有调用方共同的终点，在这里兜底一次。
@@ -1948,7 +1973,7 @@ async function pushWithSelfHeal(binary, pushArgs, repoDir, eff, state, logger, e
     // ① 本地 gc 重试
     try {
       await gcIfBloated(binary, repoDir, eff, logger)
-      return await execGit(binary, pushArgs, repoDir)
+      return await run(binary, pushArgs, repoDir)
     } catch (e) {
       logger?.warn?.('[dsh-sync] gc 重试仍失败: ' + String((e && e.message) || e).slice(0, 160))
     }
@@ -1957,7 +1982,7 @@ async function pushWithSelfHeal(binary, pushArgs, repoDir, eff, state, logger, e
       const healed = await rebuildCloudRepoIfBloated(msg, eff, repoDir, state, logger)
       if (healed) {
         logger?.info?.('[dsh-sync] 自愈重建完成，再次尝试推送')
-        return await execGit(binary, pushArgs, repoDir)
+        return await run(binary, pushArgs, repoDir)
       }
     } catch (e) {
       logger?.warn?.('[dsh-sync] rebuildCloudRepoIfBloated 异常: ' + String((e && e.message) || e).slice(0, 160))
@@ -2441,7 +2466,9 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   if (!commitOk) return { pushed: false, nothingToCommit: true }
 
   // 5. push the branch (token in URL, not in config) —— 带自愈阶梯
-  await pushWithSelfHeal(binary, ['push', remote, `HEAD:${branch}`], repoDir, eff, state, logger)
+  // [2026-11-10] 推送输出（含 stderr 体积横幅）交给删仓重建自愈判定，与 runUpload 上传路径同权。
+  const pushOutPr = await pushWithSelfHeal(binary, ['push', remote, `HEAD:${branch}`], repoDir, eff, state, logger)
+  await rebuildCloudRepoIfBloated(pushOutPr, eff, repoDir, state, logger)
 
   // 6. create PR + mergeable check
   const parsed = parseRepoUrl(eff.repoUrl)
@@ -3446,7 +3473,7 @@ module.exports = {
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
-    gateSessionPayload, scanZstdFrames, sqliteHealthy, sqliteHealthyBuf, selfHealSqlitesOnBoot, rebuildCloudRepoIfBloated,
+    gateSessionPayload, scanZstdFrames, sqliteHealthy, sqliteHealthyBuf, selfHealSqlitesOnBoot, rebuildCloudRepoIfBloated, gitExecOut, REBUILD_WARNING_RE,
     // part 链工具（导出供测试）
     listSessionParts, concatSessionParts, readSessionBuf, upsertSessionToShadowParts, pushWithSelfHeal, gcIfBloated, packOrphanStats, assembleSessionBufFromRev, dirSizePackMb,
     SESSION_PART_PREFIX, SESSION_PART_MAX, partFileName,
