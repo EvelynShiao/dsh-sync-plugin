@@ -1881,16 +1881,49 @@ async function dirSizePackMb(binary, repoDir) {
   return 0
 }
 
-/* [2026-11-09 体积自愈] 推送前置体积巡检：pack 超过阈值自动 gc --aggressive --prune=now。 */
-async function gcIfBloated(binary, repoDir, eff, logger) {
+/* [2026-11-10 孤儿自愈] pack 对象画像：size-pack(MB) + 已打包对象数 + refs 可达对象数 → 孤儿占比。
+   孤儿来源：auto-squash 在上传流程最后一步把旧历史整链孤儿化，之后无人巡检；
+   HEAD reflog（reset/checkout 足迹）还会把孤儿钉在 pack 里——所以 gc 前必须先 expire reflog，
+   否则 --prune=now 也删不掉（2026-11-10 实测：480MB pack 里 392MB 是这类孤儿，refs 口径占比 97%）。 */
+const GC_ORPHAN_RATIO = 0.5      // 孤儿对象占比 ≥ 50% 视为积压
+const GC_ORPHAN_MIN_PACK_MB = 64 // pack 太小不值得为孤儿 gc（防小仓每次上传空转）
+async function packOrphanStats(binary, repoDir) {
+  const out = await gitExec(binary, ['count-objects', '-v'], repoDir)
+  const sizePackKb = Number((/size-pack:\s*(\d+)/.exec(out) || [])[1] || 0)
+  const inPack = Number((/in-pack:\s*(\d+)/.exec(out) || [])[1] || 0)
+  let reachable = 0
   try {
-    const mb = await dirSizePackMb(binary, repoDir)
+    reachable = Number(String(await gitExec(binary, ['rev-list', '--objects', '--all', '--count'], repoDir)).trim()) || 0
+  } catch { /* rev-list 失败按「无孤儿」处理（保守：不触发孤儿 gc，只走绝对体积阈值） */ reachable = inPack }
+  const orphans = Math.max(0, inPack - reachable)
+  return { mb: sizePackKb / 1024, inPack, reachable, orphans, orphanRatio: inPack > 0 ? orphans / inPack : 0 }
+}
+
+/* [2026-11-10 孤儿自愈] 体积/孤儿双触发巡检：
+   ① 绝对体积：pack ≥ repoGcThresholdMB（原 2026-11-09 行为，阈值型——但 squash 后 pack 几乎不再
+      增长，实测卡在 480MB 永远够不着 500MB，孤儿积压只能靠本条②兜底）
+   ② 孤儿占比：pack ≥ GC_ORPHAN_MIN_PACK_MB 且 refs 不可达对象 ≥ GC_ORPHAN_RATIO
+      （可用 eff.gcOrphanMinPackMB 覆盖下限，供测试/小仓调参）
+   gc 改用 --prune=now（zstd 会话 blob 已是压缩形态，--aggressive 重压无收益白烧 CPU），
+   并在 gc 前先 expire reflog（孤儿被 reflog 钉死的根治，见 packOrphanStats 注释）。 */
+async function gcIfBloated(binary, repoDir, eff, logger, opts = {}) {
+  const phase = opts.phase ? `(${opts.phase})` : ''
+  try {
+    const st = await packOrphanStats(binary, repoDir)
     const threshold = Number(eff.repoGcThresholdMB) > 0 ? Number(eff.repoGcThresholdMB) : 500
-    if (mb >= threshold) {
-      logger?.warn?.(`[dsh-sync] 体积巡检: pack ${mb.toFixed(0)}MB ≥ ${threshold}MB，自动 git gc --aggressive --prune=now…`)
-      await gitExec(binary, ['gc', '--aggressive', '--prune=now'], repoDir)
-      const after = await dirSizePackMb(binary, repoDir)
-      logger?.info?.(`[dsh-sync] 体积巡检: gc 后 pack ${after.toFixed(0)}MB`)
+    const floor = Number(eff.gcOrphanMinPackMB) > 0 ? Number(eff.gcOrphanMinPackMB) : GC_ORPHAN_MIN_PACK_MB
+    let reason = null
+    if (st.mb >= threshold) reason = `pack ${st.mb.toFixed(0)}MB ≥ ${threshold}MB`
+    else if (st.mb >= floor && st.orphanRatio >= GC_ORPHAN_RATIO)
+      reason = `pack ${st.mb.toFixed(0)}MB 孤儿占比 ${(st.orphanRatio * 100).toFixed(0)}%（${st.orphans}/${st.inPack} 对象不可达）`
+    if (reason) {
+      logger?.warn?.(`[dsh-sync] 体积巡检${phase}: ${reason}，自动 git gc --prune=now…`)
+      await gitExec(binary, ['reflog', 'expire', '--expire=now', '--expire-unreachable=now', '--all'], repoDir).catch(() => {})
+      await gitExec(binary, ['gc', '--prune=now'], repoDir)
+      let after = null
+      try { after = await packOrphanStats(binary, repoDir) } catch {}
+      const afterTxt = after ? `pack ${after.mb.toFixed(0)}MB / 孤儿占比 ${(after.orphanRatio * 100).toFixed(0)}%` : '?'
+      logger?.info?.(`[dsh-sync] 体积巡检${phase}: gc 后 ${afterTxt}`)
     }
   } catch (e) {
     logger?.warn?.('[dsh-sync] 体积巡检异常（忽略）: ' + String((e && e.message) || e))
@@ -1901,7 +1934,13 @@ async function gcIfBloated(binary, repoDir, eff, logger) {
    execGit 注入点供测试（默认 gitExec）。pushArgs: ['push', remote, refspec] 形式。 */
 async function pushWithSelfHeal(binary, pushArgs, repoDir, eff, state, logger, execGit = gitExec) {
   try {
-    return await execGit(binary, pushArgs, repoDir)
+    const out = await execGit(binary, pushArgs, repoDir)
+    // [2026-11-10 孤儿自愈] 推送成功后补一次巡检：auto-squash 在上传流程末段 force push 才把旧历史
+    // 孤儿化，而所有预推送巡检（runPush/runUpload 里的 gcIfBloated）全在 squash 之前——孤儿永远活在
+    // 巡检盲区（11-10 复盘定案）。推送是所有调用方共同的终点，在这里兜底一次。
+    // 注入 execGit 的测试环境跳过（fake git 没有 pack 统计可算）。
+    if (execGit === gitExec) await gcIfBloated(binary, repoDir, eff, logger, { phase: '推送后' })
+    return out
   } catch (firstErr) {
     const msg = String(firstErr && firstErr.message || '')
     if (!REBUILD_WARNING_RE.test(msg)) throw firstErr
@@ -3409,7 +3448,7 @@ module.exports = {
     // 完整性门（导出供测试：好/坏样本回归）
     gateSessionPayload, scanZstdFrames, sqliteHealthy, sqliteHealthyBuf, selfHealSqlitesOnBoot, rebuildCloudRepoIfBloated,
     // part 链工具（导出供测试）
-    listSessionParts, concatSessionParts, readSessionBuf, upsertSessionToShadowParts, pushWithSelfHeal, gcIfBloated, assembleSessionBufFromRev, dirSizePackMb,
+    listSessionParts, concatSessionParts, readSessionBuf, upsertSessionToShadowParts, pushWithSelfHeal, gcIfBloated, packOrphanStats, assembleSessionBufFromRev, dirSizePackMb,
     SESSION_PART_PREFIX, SESSION_PART_MAX, partFileName,
     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
     apiproxy, apiproxyCall, apiproxyLegacy, mintCookie,
