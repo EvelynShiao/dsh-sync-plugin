@@ -1045,13 +1045,7 @@ window.__ModuleLoader__.load({
                 h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
                 h('span', { className: 'sk-spacer' }),
                 h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('uploadHint'), onClick: doUpload }, t('uploadBtn')),
-                h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn')))),
-              h('div', null,
-                h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('repoMaintTitle')),
-                h('div', { className: 'sk-toolbar' },
-                  h(ButtonLite, { disabled: repoCheckBusy, onClick: doRepoCheck }, t('repoCheckBtn')),
-                  h(ButtonLite, { disabled: rebuildBusy || !status.repoUrl || !status.hasToken || (repoInfo && repoInfo.isGitCode === false), title: !status.repoUrl || !status.hasToken ? t('notConfigured') : (repoInfo && repoInfo.isGitCode === false ? t('repoNotGitCode') : t('rebuildHint')), onClick: doRepoRebuild }, t('rebuildBtn'))),
-                repoInfo && h('div', { className: 'sk-dir', style: { whiteSpace: 'pre-wrap', margin: '4px 0 0' } }, repoInfoText(repoInfo)))
+                h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn'))))
       } catch (renderErr) {
         ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))
         body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },
@@ -1059,7 +1053,15 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { className: 'sk-page' },
-        h('div', { className: 'sk-body' }, body),
+        h('div', { className: 'sk-body' }, body,
+          // [2026-11-10 仓库维护] 挂在 sk-body 包装层（纯参数位，不碰 body 三元的巨型括号结构——
+          // 9999.9.32 曾把本块插进 body 三元 children，实际落在语句级被创建后丢弃、页面不渲染）
+          status !== null && h('div', null,
+            h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('repoMaintTitle')),
+            h('div', { className: 'sk-toolbar' },
+              h(ButtonLite, { disabled: repoCheckBusy, onClick: doRepoCheck }, t('repoCheckBtn')),
+              h(ButtonLite, { disabled: rebuildBusy || !status.repoUrl || !status.hasToken || (repoInfo && repoInfo.isGitCode === false), title: !status.repoUrl || !status.hasToken ? t('notConfigured') : (repoInfo && repoInfo.isGitCode === false ? t('repoNotGitCode') : t('rebuildHint')), onClick: doRepoRebuild }, t('rebuildBtn'))),
+            repoInfo && h('div', { className: 'sk-dir', style: { whiteSpace: 'pre-wrap', margin: '4px 0 0' } }, repoInfoText(repoInfo)))),
         conflictOpen && status && status.pendingConflict && h(AgentRunDialog, {
           t, mode: 'conflict', pending: status.pendingConflict, onClose: () => setConflictOpen(false), onToast,
         }),
@@ -1085,7 +1087,7 @@ window.__ModuleLoader__.load({
     module.exports = {
       name: CLIENT_NAME,
       inject: ['slots', 'locale'],
-      __internals: { NS, ZH, EN, substituteParams, formatTime },
+      __internals: { NS, ZH, EN, substituteParams, formatTime, SettingsSection },
       __boot(container, opts = {}) {
         ensureStyles()
         let t = opts.t || ((key, vars) => {
