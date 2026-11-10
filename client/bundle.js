@@ -79,6 +79,21 @@ window.__ModuleLoader__.load({
       syncing: '同步中，可能需要一分钟…',
       syncDone: '同步完成',
       syncFailed: '同步失败',
+      repoMaintTitle: '仓库维护',
+      repoCheckBtn: '检查仓库体积',
+      rebuildBtn: '删仓重建（危险）',
+      rebuildHint: '删除云端 GitCode 仓库并重建 + 重推当前基线（云端历史清零、基线 sha 不变、各端无感知）。仅在 GitCode 报体积超限且自动自愈无效时使用',
+      rebuildConfirm: '确定删除云端 GitCode 仓库并重建？\n· 云端仓历史清零（本机影子仓/各端内容不受影响，基线会立即重推）\n· 重建前自动打 bundle 保险到本地\n确定继续？',
+      rebuildDone: '删仓重建完成',
+      rebuildFailed: '删仓重建失败',
+      repoPackLine: '本地 pack',
+      repoOrphans: '孤儿',
+      repoLoose: '松散',
+      repoCommit: '基线',
+      repoCheckLines: '触发线',
+      repoCheckHealthy: '✅ 健康：体积与孤儿均在触发线内，无需处理',
+      repoCheckNeedGc: '⚠ 已达 gc 触发线：下次上传将自动瘦身',
+      repoNotGitCode: '非 GitCode 远端，删仓重建不可用',
       snapshotDelete: '删除',
       snapshotRename: '重命名',
       snapshotDeleteConfirm: '确定删除快照 {name}？此操作不可恢复。',
@@ -198,6 +213,21 @@ window.__ModuleLoader__.load({
       syncing: 'Syncing, may take a minute…',
       syncDone: 'Sync complete',
       syncFailed: 'Sync failed',
+      repoMaintTitle: 'Repo maintenance',
+      repoCheckBtn: 'Check repo size',
+      rebuildBtn: 'Rebuild cloud repo (danger)',
+      rebuildHint: 'Deletes the GitCode remote repo, recreates it and re-pushes the current baseline (remote history reset, baseline sha unchanged, other devices unaffected). Only for size-limit cases where auto self-heal failed',
+      rebuildConfirm: 'Delete and recreate the remote GitCode repo?\n· Remote history is reset (local shadow repo & devices unaffected, baseline re-pushed immediately)\n· A bundle backup is saved locally first\nContinue?',
+      rebuildDone: 'Repo rebuilt',
+      rebuildFailed: 'Rebuild failed',
+      repoPackLine: 'Local pack',
+      repoOrphans: 'orphans',
+      repoLoose: 'loose',
+      repoCommit: 'baseline',
+      repoCheckLines: 'trigger lines',
+      repoCheckHealthy: '✅ Healthy: size & orphans below trigger lines',
+      repoCheckNeedGc: '⚠ GC trigger reached: auto-slim on next upload',
+      repoNotGitCode: 'Non-GitCode remote: rebuild unavailable',
       snapshotDelete: 'Delete',
       snapshotRename: 'Rename',
       snapshotDeleteConfirm: 'Delete snapshot {name}? This cannot be undone.',
@@ -696,6 +726,9 @@ window.__ModuleLoader__.load({
     function SettingsSection({ t }) {
       const [status, setStatus] = useState(null)
       const [busy, setBusy] = useState(false)
+      const [repoInfo, setRepoInfo] = useState(null)
+      const [repoCheckBusy, setRepoCheckBusy] = useState(false)
+      const [rebuildBusy, setRebuildBusy] = useState(false)
       const [alignBusy, setAlignBusy] = useState(false)
       const [conflictOpen, setConflictOpen] = useState(false)
       const [alignOpen, setAlignOpen] = useState(false)
@@ -779,6 +812,41 @@ window.__ModuleLoader__.load({
           onToast(t('syncDone'), 2600)
         } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
         finally { setBusy(false); refresh() }
+      }
+      // [2026-11-10 仓库维护] 只读体积画像 + 手动删仓重建（危险，confirm 后走服务端同款主体）
+      const repoInfoText = (d) => {
+        if (d.rebuilt) return '✔ ' + (d.rebuildDetail || t('rebuildDone'))
+        if (d.error) return '⚠ ' + d.error
+        const pct = Math.round((d.orphanRatio || 0) * 100)
+        return [
+          `${t('repoPackLine')}: ${d.mb}MB · ${d.inPack} obj · ${t('repoOrphans')} ${d.orphans}/${d.inPack} (${pct}%) · ${t('repoLoose')} ${d.loose}`,
+          `${t('repoCommit')}: ${String(d.commit || '-').slice(0, 10)} · ${t('repoCheckLines')}: ${d.gcThresholdMb}MB / ${d.orphanLinePct}%`,
+          d.needGc ? t('repoCheckNeedGc') : t('repoCheckHealthy'),
+        ].join('\n')
+      }
+      const doRepoCheck = async () => {
+        setRepoCheckBusy(true)
+        try {
+          const r = await fetch(API + '/repo/check')
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          setRepoInfo(d)
+        } catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+        finally { setRepoCheckBusy(false) }
+      }
+      const doRepoRebuild = async () => {
+        if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+          if (!window.confirm(t('rebuildConfirm'))) return
+        }
+        setRebuildBusy(true)
+        try {
+          const r = await fetch(API + '/repo/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || d.detail || 'HTTP ' + r.status)
+          setRepoInfo({ rebuilt: true, rebuildDetail: d.detail })
+          onToast(t('rebuildDone'), 3000)
+        } catch (e) { onToast(t('rebuildFailed') + ': ' + e.message, 5000) }
+        finally { setRebuildBusy(false) }
       }
       const doAlign = async () => {
         setAlignBusy(true)
@@ -977,7 +1045,13 @@ window.__ModuleLoader__.load({
                 h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
                 h('span', { className: 'sk-spacer' }),
                 h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('uploadHint'), onClick: doUpload }, t('uploadBtn')),
-                h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn'))))
+                h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn')))),
+              h('div', null,
+                h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('repoMaintTitle')),
+                h('div', { className: 'sk-toolbar' },
+                  h(ButtonLite, { disabled: repoCheckBusy, onClick: doRepoCheck }, t('repoCheckBtn')),
+                  h(ButtonLite, { disabled: rebuildBusy || !status.repoUrl || !status.hasToken || (repoInfo && repoInfo.isGitCode === false), title: !status.repoUrl || !status.hasToken ? t('notConfigured') : (repoInfo && repoInfo.isGitCode === false ? t('repoNotGitCode') : t('rebuildHint')), onClick: doRepoRebuild }, t('rebuildBtn'))),
+                repoInfo && h('div', { className: 'sk-dir', style: { whiteSpace: 'pre-wrap', margin: '4px 0 0' } }, repoInfoText(repoInfo)))
       } catch (renderErr) {
         ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))
         body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },

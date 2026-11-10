@@ -1827,38 +1827,51 @@ function selfHealSqlitesOnBoot(cfg, roots, io) {
 /* [2026-11-10] 横幅正则放宽：GitCode 实际文案可能是 "exceeds the limit"（带 the）、"GB"（不带 i），
    旧式 /exceeds limit|[MG]iB/ 两种都漏。只用于自愈触发判定，放宽无误伤面。 */
 const REBUILD_WARNING_RE = /exceeds\s+(?:the\s+)?limit|size\s*\(\d+(?:\.\d+)?\s*[MG]i?B/i
+/* [2026-11-10 手动删仓重建] 强制执行服务端瘦身：①优先 Compact（官方若开放：服务端原地 GC，零重传）
+   → ②删仓重建 + 重推基线（GitCode 服务端 orphan 不释放配额，删仓重建是唯一彻底解）。
+   与 rebuildCloudRepoIfBloated 的区别：不做横幅正则门禁（那是自动阶梯的触发条件，调用方负责）。
+   返回 { ok, mode:'compact'|'rebuild'|null, detail }——设置页手动按钮与自动阶梯共用主体。 */
+async function forceRebuildCloudRepo(eff, repoDir, state, logger, reason) {
+  const tag = reason || '删仓重建'
+  const warn = (m) => { try { logger?.warn?.('[dsh-sync] ' + tag + ': ' + m) } catch {} }
+  try {
+    const parsed = parseRepoUrl(eff.repoUrl)
+    if (!parsed) return { ok: false, mode: null, detail: 'repoUrl 非 GitCode，删仓重建不可用（仅支持 GitCode 远端）' }
+    if (!eff.token) return { ok: false, mode: null, detail: '未配置令牌，无法操作云端仓库' }
+    try {
+      const compact = await gitcodeRequest(eff.token, 'POST', `/repos/${parsed.owner}/${parsed.repo}/compact`)
+      if (compact.ok) {
+        warn('Compact API 可用，服务端 GC 已触发（零重传），下轮上传恢复正常速度')
+        return { ok: true, mode: 'compact', detail: 'Compact API 可用，服务端 GC 已触发（零重传，未删仓）' }
+      }
+    } catch { /* 探测失败继续走删仓重建（2026-11-03 实测 Compact 三端点 404） */ }
+    let bundlePath = ''
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      bundlePath = join(dshHome(), 'dsh-sync', `repo-rebuild-backup-${stamp}.bundle`)
+      await gitExec(eff.gitBinary, ['bundle', 'create', bundlePath, 'HEAD'], repoDir)
+    } catch (e) { warn('bundle 保险失败（继续，影子仓本地即全量）: ' + String((e && e.message) || e)) }
+    const del = await gitcodeRequest(eff.token, 'DELETE', `/repos/${parsed.owner}/${parsed.repo}`)
+    if (!del.ok && del.status !== 404) return { ok: false, mode: null, detail: `删除旧仓失败 HTTP ${del.status}${bundlePath ? `（bundle 保险已存 ${bundlePath}）` : ''}` }
+    await new Promise((r) => setTimeout(r, 3000))
+    const create = await gitcodeRequest(eff.token, 'POST', '/user/repos', { name: parsed.repo, private: true, description: 'dsh-sync repo (rebuilt after size limit)' })
+    if (!create.ok) return { ok: false, mode: null, detail: `重建仓库失败 HTTP ${create.status}: ${String((create.json && create.json.message) || create.text || '').slice(0, 120)}` }
+    const remote = authedUrl(eff.repoUrl, eff.token)
+    await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
+    warn('删仓重建完成，基线已重推（sha 不变，各端无感知）')
+    return { ok: true, mode: 'rebuild', detail: '删仓重建完成，基线已重推（sha 不变，各端无感知）' }
+  } catch (e) {
+    return { ok: false, mode: null, detail: String((e && e.message) || e) }
+  }
+}
+
 async function rebuildCloudRepoIfBloated(pushOut, eff, repoDir, state, logger) {
   try {
     const out = String(pushOut || '')
     if (!REBUILD_WARNING_RE.test(out)) return false
-    const parsed = parseRepoUrl(eff.repoUrl)
-    if (!parsed) { try { logger?.warn?.('[dsh-sync] 体积巡检: 超限警告但 repoUrl 非 GitCode，跳过') } catch {}; return false }
-    if (!eff.token) { try { logger?.warn?.('[dsh-sync] 体积巡检: 超限警告但无 token，跳过自动重建') } catch {}; return false }
-    const warn = (m) => { try { logger?.warn?.('[dsh-sync] 体积巡检: ' + m) } catch {} }
-    warn('GitCode 报告仓库物理体积超限（orphan 不释放配额）→ 自动处理')
-    // ① 优先 Compact（官方若开放该端点：服务端原地 GC，秒级、零重传，不删仓）
-    try {
-      const compact = await gitcodeRequest(eff.token, 'POST', `/repos/${parsed.owner}/${parsed.repo}/compact`)
-      if (compact.ok) {
-        try { logger?.warn?.('[dsh-sync] 体积巡检: Compact API 可用，服务端 GC 已触发（零重传），下轮上传恢复正常速度') } catch {}
-        return true
-      }
-    } catch { /* 探测失败继续走删仓重建 */ }
-    // ② 无 Compact API（2026-11-03 实测三端点 404）→ 删仓重建：GitCode 服务端 orphan
-    //    对象不释放配额，这是当时唯一可行解；重推基线仅在超限时发生（罕见），平时上传秒传 delta。
-    try {
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-      await gitExec(eff.gitBinary, ['bundle', 'create', join(dshHome(), 'dsh-sync', `repo-rebuild-backup-${stamp}.bundle`), 'HEAD'], repoDir)
-    } catch (e) { warn('bundle 保险失败（继续，影子仓本地即全量）: ' + String((e && e.message) || e)) }
-    const del = await gitcodeRequest(eff.token, 'DELETE', `/repos/${parsed.owner}/${parsed.repo}`)
-    if (!del.ok && del.status !== 404) { warn(`删除旧仓失败 HTTP ${del.status}，下轮上传警告再现时重试`); return false }
-    await new Promise((r) => setTimeout(r, 3000))
-    const create = await gitcodeRequest(eff.token, 'POST', '/user/repos', { name: parsed.repo, private: true, description: 'dsh-sync repo (auto-rebuilt after size limit warning)' })
-    if (!create.ok) { warn(`重建仓库失败 HTTP ${create.status}: ${String((create.json && create.json.message) || create.text || '').slice(0, 120)}`); return false }
-    const remote = authedUrl(eff.repoUrl, eff.token)
-    await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
-    warn('删仓重建完成，基线已重推（sha 不变，各端无感知）')
-    return true
+    const r = await forceRebuildCloudRepo(eff, repoDir, state, logger, 'GitCode 报告仓库物理体积超限（orphan 不释放配额）→ 自动处理')
+    if (!r.ok) { try { logger?.warn?.('[dsh-sync] 体积巡检: ' + r.detail) } catch {} }
+    return r.ok
   } catch (e) {
     try { logger?.warn?.('[dsh-sync] 体积巡检异常（忽略）: ' + String((e && e.message) || e)) } catch {}
     return false
@@ -3480,7 +3493,7 @@ module.exports = {
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
-    gateSessionPayload, scanZstdFrames, sqliteHealthy, sqliteHealthyBuf, selfHealSqlitesOnBoot, rebuildCloudRepoIfBloated, gitExecOut, REBUILD_WARNING_RE,
+    gateSessionPayload, scanZstdFrames, sqliteHealthy, sqliteHealthyBuf, selfHealSqlitesOnBoot, rebuildCloudRepoIfBloated, forceRebuildCloudRepo, gitExecOut, REBUILD_WARNING_RE,
     // part 链工具（导出供测试）
     listSessionParts, concatSessionParts, readSessionBuf, upsertSessionToShadowParts, pushWithSelfHeal, gcIfBloated, packOrphanStats, assembleSessionBufFromRev, dirSizePackMb,
     SESSION_PART_PREFIX, SESSION_PART_MAX, partFileName,
@@ -4933,6 +4946,45 @@ module.exports = {
               } catch (e) { errors.push(`${branch}: ${String(e && e.message || e).slice(0, 120)}`) }
             }
             sendJson(res, 200, { deleted, kept, errors, scanned: refs.length })
+            return
+          }
+
+          // GET /dsh-sync/api/repo/check → 本地影子仓体积画像（只读）：pack 体积 / 孤儿占比 /
+          // 松散对象 / 基线 commit / 双触发线判定。供设置页「检查仓库体积」按钮。
+          if (req.method === 'GET' && apiPath.endsWith('/dsh-sync/api/repo/check')) {
+            await stateLoaded
+            const eff = syncSettings()
+            try {
+              const st = await packOrphanStats(eff.gitBinary, repoDir)
+              const gcThreshold = Number(eff.repoGcThresholdMB) > 0 ? Number(eff.repoGcThresholdMB) : 500
+              const commit = await gitCurrentCommit(eff.gitBinary, repoDir).catch(() => null)
+              const needGc = st.mb >= gcThreshold || (st.mb >= GC_ORPHAN_MIN_PACK_MB && st.orphanRatio >= GC_ORPHAN_RATIO)
+              sendJson(res, 200, {
+                mb: Math.round(st.mb * 10) / 10,
+                inPack: st.inPack, loose: st.looseCount, reachable: st.reachable,
+                orphans: st.orphans, orphanRatio: Math.round(st.orphanRatio * 1000) / 1000,
+                gcThresholdMb: gcThreshold, orphanLinePct: Math.round(GC_ORPHAN_RATIO * 100),
+                needGc, commit,
+                isGitCode: !!parseRepoUrl(eff.repoUrl), hasToken: !!eff.token,
+              })
+            } catch (e) { sendJson(res, 500, { error: String((e && e.message) || e) }) }
+            return
+          }
+
+          // POST /dsh-sync/api/repo/rebuild → 手动删仓重建（危险操作：client 侧已 confirm；
+          // 服务端再校验 GitCode 远端 + 令牌 + 同步锁）。与自动阶梯共用 forceRebuildCloudRepo。
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/repo/rebuild')) {
+            await stateLoaded
+            const eff = syncSettings()
+            if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            if (!parseRepoUrl(eff.repoUrl)) { sendJson(res, 400, { error: '仅支持 GitCode 远端' }); return }
+            const release = await acquireLock(lockFile)
+            if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
+            try {
+              const r = await forceRebuildCloudRepo(eff, repoDir, state, ctx.logger, '手动删仓重建（设置页按钮）')
+              sendJson(res, r.ok ? 200 : 400, r)
+            } catch (e) { sendJson(res, 500, { error: String((e && e.message) || e) }) }
+            finally { release() }
             return
           }
 

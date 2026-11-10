@@ -14,7 +14,7 @@ import { randomBytes } from 'node:crypto'
 
 const require = createRequire(import.meta.url)
 const mod = require('../src/index.js')
-const { packOrphanStats, gcIfBloated, pushWithSelfHeal, gitExec, gitExecOut, REBUILD_WARNING_RE, rebuildCloudRepoIfBloated } = mod.__internals
+const { packOrphanStats, gcIfBloated, pushWithSelfHeal, gitExec, gitExecOut, REBUILD_WARNING_RE, rebuildCloudRepoIfBloated, forceRebuildCloudRepo } = mod.__internals
 
 let pass = 0, fail = 0
 const ok = (v, msg) => { if (!v) throw new Error(msg || '断言失败') }
@@ -246,6 +246,15 @@ await t('rebuildCloudRepoIfBloated 门禁：不匹配/非 GitCode/无 token → 
   eq(await rebuildCloudRepoIfBloated('Everything up-to-date', {}, 'x', {}, lg), false, '不匹配输出应返回 false')
   eq(await rebuildCloudRepoIfBloated('size (1.2 GiB) exceeds the limit', { repoUrl: 'https://github.com/a/b.git' }, 'x', {}, lg), false, '非 GitCode 应返回 false')
   eq(await rebuildCloudRepoIfBloated('size (1.2 GiB) exceeds the limit', { repoUrl: 'https://gitcode.com/gcw_wXIDw07q/dsh-sync.git' }, 'x', {}, lg), false, '无 token 应返回 false')
+})
+
+await t('forceRebuildCloudRepo 门禁：非 GitCode/无 token → ok:false 带原因，不上网', async () => {
+  const r1 = await forceRebuildCloudRepo({ repoUrl: 'https://github.com/a/b.git', gitBinary: 'git' }, 'x', {}, null, '手动')
+  eq(r1.ok, false, '非 GitCode 应 ok:false')
+  ok(/GitCode/.test(r1.detail), '应说明仅支持 GitCode')
+  const r2 = await forceRebuildCloudRepo({ repoUrl: 'https://gitcode.com/gcw_wXIDw07q/dsh-sync.git', gitBinary: 'git' }, 'x', {}, null, '手动')
+  eq(r2.ok, false, '无 token 应 ok:false')
+  ok(/令牌|token/i.test(r2.detail), '应提示配置令牌')
 })
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
