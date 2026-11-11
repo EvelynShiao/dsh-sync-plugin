@@ -634,11 +634,38 @@ async function platformRequest(token, platform, method, path, body, { apiBase } 
   else if (platform === 'gitee') url += (url.includes('?') ? '&' : '?') + 'access_token=' + encodeURIComponent(token)
   else init.headers['PRIVATE-TOKEN'] = token
   if (body !== undefined) init.body = JSON.stringify(body)
-  const r = await fetch(url, init)
-  const text = await r.text()
+  /* [2026-11-11 真机修复] Node fetch 走内置 Mozilla CA，本机 git/curl 走系统证书库（Windows
+     schannel）。本机 TLS 链被本地代理重签时（实测 fetch 报 UNABLE_TO_GET_ISSUER_CERT_LOCALLY，
+     同机 git push 却通），证书类错误回退系统 curl.exe（走系统证书库）——token 用法与 git
+     嵌 URL 同级别（仅本机进程可见），不落地不打印。 */
+  let r
+  try {
+    r = await fetch(url, init)
+  } catch (e) {
+    const cause = e && e.cause
+    const sig = String((cause && cause.code) || (cause && cause.message) || (e && e.message) || '')
+    if (CERT_ERR_RE.test(sig)) r = curlJsonRequest(url, init)
+    else throw e
+  }
+  const text = typeof r.text === 'function' ? await r.text() : String(r.text ?? '')
   let json = null
   try { json = text === '' ? null : JSON.parse(text) } catch {}
   return { ok: r.ok, status: r.status, json, text }
+}
+const CERT_ERR_RE = /UNABLE_TO_GET_ISSUER|UNABLE_TO_VERIFY|SELF_SIGNED|DEPTH_ZERO|CERT_HAS_EXPIRED|ERR_TLS|ERR_SSL/i
+/** 系统 curl 回退（证书链被本地重签时）：-w 尾行取状态码，返回与 fetch 同构 {ok,status,json,text}。 */
+function curlJsonRequest(url, init) {
+  const { execFileSync } = require('node:child_process')
+  const args = ['-s', '-X', init.method || 'GET', '--max-time', '30', '-w', '\n%{http_code}', url]
+  for (const [k, v] of Object.entries(init.headers || {})) args.push('-H', `${k}: ${v}`)
+  if (init.body !== undefined) args.push('-H', 'Content-Type: application/json', '-d', init.body)
+  const out = execFileSync('curl', args, { encoding: 'utf8', timeout: 45000, maxBuffer: 32 * 1024 * 1024 })
+  const nl = out.lastIndexOf('\n')
+  const status = Number((out.slice(nl + 1).trim().match(/\d{3}/) || [0])[0])
+  const text = nl >= 0 ? out.slice(0, nl) : out
+  let json = null
+  try { json = text === '' ? null : JSON.parse(text) } catch {}
+  return { ok: status >= 200 && status < 300, status, json, text }
 }
 /** GitCode 专属薄壳（兼容保留）：PRIVATE-TOKEN 认证。 */
 async function gitcodeRequest(token, method, path, body, { apiBase = PLATFORMS.gitcode.apiBase } = {}) {

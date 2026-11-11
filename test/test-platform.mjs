@@ -169,6 +169,26 @@ try {
     const r = await checkRepoPrivate('TOK', 'https://gitee.com/u/r.git')
     ok(r.ok === false && r.isPublic === true, '公共仓应拒: ' + JSON.stringify(r))
   })
+
+  await t('TLS 证书错误 → 系统 curl 回退（桩化 execFileSync，无网）', async () => {
+    const cp = require('node:child_process')
+    const origExec = cp.execFileSync
+    let curlArgs = null
+    cp.execFileSync = (cmd, args) => {
+      if (String(cmd).includes('curl')) { curlArgs = args; return '{"private":true,"default_branch":"main"}\n200' }
+      return origExec(cmd, args)
+    }
+    try {
+      globalThis.fetch = async () => { const e = new TypeError('fetch failed'); e.cause = Object.assign(new Error('cert'), { code: 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY' }); throw e }
+      const r = await checkRepoPrivate('TOK', 'https://github.com/u/r.git')
+      ok(r.ok === true && r.platform === 'github', '证书错误应回退 curl 并成功: ' + JSON.stringify(r))
+      ok(Array.isArray(curlArgs) && curlArgs[0] === '-s' && curlArgs.includes('https://api.github.com/repos/u/r'), 'curl 参数应含 -s 与目标 URL')
+      ok(curlArgs.some((x) => String(x).includes('Bearer TOK')), 'curl 应带 Bearer 头')
+    } finally {
+      cp.execFileSync = origExec
+      globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => '{"private":true}' })
+    }
+  })
 } finally {
   globalThis.fetch = origFetch
   try { rmSync(TEST_ROOT, { recursive: true, force: true }) } catch {}
