@@ -82,8 +82,8 @@ window.__ModuleLoader__.load({
       repoMaintTitle: '仓库维护',
       repoCheckBtn: '检查仓库体积',
       rebuildBtn: '删仓重建（危险）',
-      rebuildHint: '删除云端 GitCode 仓库并重建 + 重推当前基线（云端历史清零、基线 sha 不变、各端无感知）。仅在 GitCode 报体积超限且自动自愈无效时使用',
-      rebuildConfirm: '确定删除云端 GitCode 仓库并重建？\n· 云端仓历史清零（本机影子仓/各端内容不受影响，基线会立即重推）\n· 重建前自动打 bundle 保险到本地\n确定继续？',
+      rebuildHint: '删除云端仓库并重建 + 重推当前基线（云端历史清零、基线 sha 不变、各端无感知）。仅在平台报体积超限且自动自愈无效时使用。GitHub 令牌需带 delete_repo 权限',
+      rebuildConfirm: '确定删除云端仓库并重建？\n· 云端仓历史清零（本机影子仓/各端内容不受影响，基线会立即重推）\n· 重建前自动打 bundle 保险到本地\n确定继续？',
       rebuildDone: '删仓重建完成',
       rebuildFailed: '删仓重建失败',
       repoPackLine: '本地 pack',
@@ -93,7 +93,15 @@ window.__ModuleLoader__.load({
       repoCheckLines: '触发线',
       repoCheckHealthy: '✅ 健康：体积与孤儿均在触发线内，无需处理',
       repoCheckNeedGc: '⚠ 已达 gc 触发线：下次上传将自动瘦身',
-      repoNotGitCode: '非 GitCode 远端，删仓重建不可用',
+      repoNotGitCode: '不支持的平台远端，删仓重建不可用（支持 gitcode.com / github.com / gitee.com）',
+      repoPlatformLine: '平台',
+      selfHealTitle: '体积自愈',
+      selfHealHint: 'pack 体积 ≥「gc 体积线」，或 pack ≥「孤儿 gc 下限」且孤儿占比 ≥「孤儿占比线」时，上传自动 git gc 瘦身',
+      gcThresholdLabel: 'gc 体积线（MB）',
+      gcOrphanRatioLabel: '孤儿占比线（%）',
+      gcOrphanMinPackLabel: '孤儿 gc 下限（MB）',
+      rebuildAutoLabel: '自动删仓重建',
+      rebuildAutoHint: '远端报体积超限（exceeds limit）时自动「删仓重建→重推基线」；关闭后仅本地 gc 重试+报错留人工处置。手动按钮不受此开关限制。GitHub 删仓要求令牌带 delete_repo 权限',
       snapshotDelete: '删除',
       snapshotRename: '重命名',
       snapshotDeleteConfirm: '确定删除快照 {name}？此操作不可恢复。',
@@ -118,9 +126,9 @@ window.__ModuleLoader__.load({
       gitMissing: '未检测到 git',
       repoMissing: '尚未初始化，点「立即同步」',
       notConfigured: '未配置仓库地址或访问令牌',
-      tokenLabel: 'GitCode 访问令牌',
+      tokenLabel: '平台访问令牌',
       tokenConfigured: '已配置',
-      tokenHint: '需有目标私有仓库的读写权限',
+      tokenHint: '需为目标私有仓库所在平台的令牌（gitcode.com / github.com / gitee.com），且有读写权限。GitHub 删仓重建需额外带 delete_repo 权限',
       clearToken: '清除',
       autoSyncLabel: '定时自动同步',
       syncOnStartupLabel: '启动时同步',
@@ -132,7 +140,7 @@ window.__ModuleLoader__.load({
       conflictModeLabel: '冲突处理',
       conflictModeAi: 'AI 处理（推荐）',
       conflictModeManual: '人工网页合并',
-      conflictModeHint: '两台机器改了同一文件时：AI 模式弹出按钮由 AI 自动解决；人工模式 PR 挂起等你去 gitcode.com 合并',
+      conflictModeHint: '两台机器改了同一文件时：AI 模式弹出按钮由 AI 自动解决；人工模式 PR 挂起等你去平台网页合并',
       toggleSkills: '技能 skills',
             toggleMemory: '长期记忆（session-kit）',
             toggleKnowledge: '知识库（knowledge-sqlite）',
@@ -216,7 +224,7 @@ window.__ModuleLoader__.load({
       repoMaintTitle: 'Repo maintenance',
       repoCheckBtn: 'Check repo size',
       rebuildBtn: 'Rebuild cloud repo (danger)',
-      rebuildHint: 'Deletes the GitCode remote repo, recreates it and re-pushes the current baseline (remote history reset, baseline sha unchanged, other devices unaffected). Only for size-limit cases where auto self-heal failed',
+      rebuildHint: 'Deletes the remote repo, recreates it and re-pushes the current baseline (remote history reset, baseline sha unchanged, other devices unaffected). Only for size-limit cases where auto self-heal failed. GitHub tokens need delete_repo for deletion',
       rebuildConfirm: 'Delete and recreate the remote GitCode repo?\n· Remote history is reset (local shadow repo & devices unaffected, baseline re-pushed immediately)\n· A bundle backup is saved locally first\nContinue?',
       rebuildDone: 'Repo rebuilt',
       rebuildFailed: 'Rebuild failed',
@@ -227,7 +235,15 @@ window.__ModuleLoader__.load({
       repoCheckLines: 'trigger lines',
       repoCheckHealthy: '✅ Healthy: size & orphans below trigger lines',
       repoCheckNeedGc: '⚠ GC trigger reached: auto-slim on next upload',
-      repoNotGitCode: 'Non-GitCode remote: rebuild unavailable',
+      repoNotGitCode: 'Unsupported platform remote: rebuild unavailable (gitcode.com / github.com / gitee.com only)',
+      repoPlatformLine: 'Platform',
+      selfHealTitle: 'Size self-heal',
+      selfHealHint: 'Auto git gc on upload when pack ≥ size line, or pack ≥ orphan floor and orphan ratio ≥ ratio line',
+      gcThresholdLabel: 'GC size line (MB)',
+      gcOrphanRatioLabel: 'Orphan ratio line (%)',
+      gcOrphanMinPackLabel: 'Orphan GC floor (MB)',
+      rebuildAutoLabel: 'Auto repo rebuild',
+      rebuildAutoHint: 'On remote size-limit banner: auto rebuild repo + re-push baseline. Off = local gc retry + error only. Manual button unaffected. GitHub needs delete_repo token scope',
       snapshotDelete: 'Delete',
       snapshotRename: 'Rename',
       snapshotDeleteConfirm: 'Delete snapshot {name}? This cannot be undone.',
@@ -250,9 +266,9 @@ window.__ModuleLoader__.load({
       gitMissing: 'git not found',
       repoMissing: 'Not initialized — hit Sync now',
       notConfigured: 'Repo URL or access token not configured',
-      tokenLabel: 'GitCode access token',
+      tokenLabel: 'Platform access token',
       tokenConfigured: 'configured',
-      tokenHint: 'Needs read/write on the target private repo',
+      tokenHint: 'Must be a token of the platform hosting the target private repo (gitcode.com / github.com / gitee.com), with read/write access. Repo rebuild on GitHub additionally needs delete_repo',
       clearToken: 'Clear',
       autoSyncLabel: 'Auto sync on schedule',
       syncOnStartupLabel: 'Sync on startup',
@@ -264,7 +280,7 @@ window.__ModuleLoader__.load({
       conflictModeLabel: 'Conflict handling',
       conflictModeAi: 'AI resolve (recommended)',
       conflictModeManual: 'Manual web merge',
-      conflictModeHint: 'When two machines edit the same file: AI mode shows a button the AI resolves; manual mode leaves the PR open for you to merge on gitcode.com',
+      conflictModeHint: 'When two machines edit the same file: AI mode shows a button the AI resolves; manual mode leaves the PR open for you to merge on the platform web UI',
       toggleSkills: 'Skills',
             toggleMemory: 'Long-term memory (session-kit)',
             toggleKnowledge: 'Knowledge base (knowledge-sqlite)',
@@ -745,6 +761,11 @@ window.__ModuleLoader__.load({
       // [9999.9.26] 会话覆盖删除：默认 true（上传删云端多余 + 下载删本机多余，纯机械镜像）。
       const [sessionsDeleteSync, setSessionsDeleteSync] = useState(true)
       const [conflictMode, setConflictMode] = useState('ai')
+      // [2026-11-11 UI 化] 体积自愈：gc 体积线 / 孤儿占比线（UI 用 %）/ 孤儿 gc 下限 / 自动删仓重建总闸
+      const [gcThreshold, setGcThreshold] = useState(500)
+      const [gcOrphanRatioPct, setGcOrphanRatioPct] = useState(50)
+      const [gcOrphanMinPack, setGcOrphanMinPack] = useState(64)
+      const [rebuildAuto, setRebuildAuto] = useState(true)
       const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true , memory: true, knowledge: true })
       const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' , memory: 'merge', knowledge: 'merge' })
       const [snapCfg, setSnapCfg] = useState({ auto: true, skills: false, localKeep: 30 })
@@ -766,6 +787,11 @@ window.__ModuleLoader__.load({
         setSessionsParts(d.sessionsParts !== false)
         setSessionsDeleteSync(d.sessionsDeleteSync !== false)
         setConflictMode(d.conflictMode)
+        // [2026-11-11 UI 化] 体积自愈配置回填（后端缺字段按默认处理；占比 UI 存 %，后端存 0-1）
+        setGcThreshold(Number(d.repoGcThresholdMB) > 0 ? Number(d.repoGcThresholdMB) : 500)
+        setGcOrphanRatioPct(Number(d.gcOrphanRatio) > 0 ? Math.round(Number(d.gcOrphanRatio) * 100) : 50)
+        setGcOrphanMinPack(Number(d.gcOrphanMinPackMB) > 0 ? Number(d.gcOrphanMinPackMB) : 64)
+        setRebuildAuto(d.rebuildAutoEnabled !== false)
             setG(prev => ({ ...prev, skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins, ...(d.syncMemory !== undefined ? { memory: d.syncMemory } : {}), ...(d.syncKnowledge !== undefined ? { knowledge: d.syncKnowledge } : {}) }))
         if (d.strategies) setGs(prev => ({ ...prev, ...d.strategies }))
         if (d.snapshot) setSnapCfg(d.snapshot)
@@ -819,8 +845,9 @@ window.__ModuleLoader__.load({
         if (d.error) return '⚠ ' + d.error
         const pct = Math.round((d.orphanRatio || 0) * 100)
         return [
+          `${t('repoPlatformLine')}: ${d.platformLabel || '-'} · ${d.rebuildAutoEnabled === false ? '⛔ ' + t('rebuildAutoLabel') : '✔ ' + t('rebuildAutoLabel')}`,
           `${t('repoPackLine')}: ${d.mb}MB · ${d.inPack} obj · ${t('repoOrphans')} ${d.orphans}/${d.inPack} (${pct}%) · ${t('repoLoose')} ${d.loose}`,
-          `${t('repoCommit')}: ${String(d.commit || '-').slice(0, 10)} · ${t('repoCheckLines')}: ${d.gcThresholdMb}MB / ${d.orphanLinePct}%`,
+          `${t('repoCommit')}: ${String(d.commit || '-').slice(0, 10)} · ${t('repoCheckLines')}: ${d.gcThresholdMb}MB / ${d.orphanLinePct}% / ${d.gcOrphanMinPackMB ?? 64}MB`,
           d.needGc ? t('repoCheckNeedGc') : t('repoCheckHealthy'),
         ].join('\n')
       }
@@ -867,7 +894,7 @@ window.__ModuleLoader__.load({
       }
       const doSave = async () => {
         try {
-          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts, sessionsDeleteSync }
+          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts, sessionsDeleteSync, repoGcThresholdMB: gcThreshold, gcOrphanRatio: (Number(gcOrphanRatioPct) || 0) / 100, gcOrphanMinPackMB: gcOrphanMinPack, rebuildAutoEnabled: rebuildAuto }
           if (token !== '') patch.token = token
           await putSettings(patch)
           setToken('')
@@ -1040,6 +1067,23 @@ window.__ModuleLoader__.load({
                   h('label', { className: 'sk-toggle' + (conflictMode === 'manual' ? ' on' : '') },
                     h('input', { type: 'radio', checked: conflictMode === 'manual', onChange: () => setConflictMode('manual') }), t('conflictModeManual'))),
                 h('div', { className: 'sk-dir', style: { marginTop: 4 } }, t('conflictModeHint'))),
+              // [2026-11-11 UI 化] 体积自愈：gc 双触发线（体积/孤儿）+ 自动删仓重建总闸
+              h('div', null,
+                h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('selfHealTitle')),
+                h('div', { style: { display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' } },
+                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                    t('gcThresholdLabel'),
+                    h('input', { className: 'sk-input', type: 'number', min: 10, value: gcThreshold, onChange: e => setGcThreshold(Math.max(10, Number(e.target.value) || 500)), style: { width: 76 } })),
+                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                    t('gcOrphanRatioLabel'),
+                    h('input', { className: 'sk-input', type: 'number', min: 5, max: 100, value: gcOrphanRatioPct, onChange: e => setGcOrphanRatioPct(Math.min(100, Math.max(5, Number(e.target.value) || 50))), style: { width: 64 } })),
+                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                    t('gcOrphanMinPackLabel'),
+                    h('input', { className: 'sk-input', type: 'number', min: 8, value: gcOrphanMinPack, onChange: e => setGcOrphanMinPack(Math.max(8, Number(e.target.value) || 64)), style: { width: 64 } })),
+                  h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                    h('input', { type: 'checkbox', checked: rebuildAuto, onChange: e => setRebuildAuto(e.target.checked) }), t('rebuildAutoLabel'))),
+                h('div', { className: 'sk-dir', style: { marginTop: 4 } }, t('selfHealHint')),
+                h('div', { className: 'sk-dir', style: { marginTop: 2 } }, t('rebuildAutoHint'))),
               h('div', { className: 'sk-toolbar' },
                 h(ButtonLite, { onClick: doSave }, t('save')),
                 h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
@@ -1060,7 +1104,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'sk-dir', style: { margin: '4px 0' } }, t('repoMaintTitle')),
             h('div', { className: 'sk-toolbar' },
               h(ButtonLite, { disabled: repoCheckBusy, onClick: doRepoCheck }, t('repoCheckBtn')),
-              h(ButtonLite, { disabled: rebuildBusy || !status.repoUrl || !status.hasToken || (repoInfo && repoInfo.isGitCode === false), title: !status.repoUrl || !status.hasToken ? t('notConfigured') : (repoInfo && repoInfo.isGitCode === false ? t('repoNotGitCode') : t('rebuildHint')), onClick: doRepoRebuild }, t('rebuildBtn'))),
+              h(ButtonLite, { disabled: rebuildBusy || !status.repoUrl || !status.hasToken || (repoInfo && repoInfo.rebuildSupported === false), title: !status.repoUrl || !status.hasToken ? t('notConfigured') : (repoInfo && repoInfo.rebuildSupported === false ? t('repoNotGitCode') : t('rebuildHint')), onClick: doRepoRebuild }, t('rebuildBtn'))),
             repoInfo && h('div', { className: 'sk-dir', style: { whiteSpace: 'pre-wrap', margin: '4px 0 0' } }, repoInfoText(repoInfo)))),
         conflictOpen && status && status.pendingConflict && h(AgentRunDialog, {
           t, mode: 'conflict', pending: status.pendingConflict, onClose: () => setConflictOpen(false), onToast,

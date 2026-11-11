@@ -130,6 +130,16 @@ const DEFAULT_SYNC_SETTINGS = {
   // 自动执行 git gc --aggressive --prune=now（本地瘦身，降低推送包体积）。
   // GitCode 仓库配额 1GiB，默认 500MB 留足安全裕度。
   repoGcThresholdMB: 500,
+  // [2026-11-11 UI 化] 孤儿占比触发线（0-1）：refs 不可达对象占 pack 总数比例 ≥ 此值且
+  // pack ≥ gcOrphanMinPackMB 时自动 gc（9999.9.29 起写死 0.5，2026-11-11 实测 49.6% 卡线
+  // 不清的盲区后开放为配置）。默认 0.5 维持原行为。
+  gcOrphanRatio: 0.5,
+  // [2026-11-11 UI 化] 孤儿 gc 的 pack 体积下限（MB）：太小不值得 gc（防小仓空转）。默认 64。
+  gcOrphanMinPackMB: 64,
+  // [2026-11-11 UI 化] 自动删仓重建总闸：push 时远端报体积超限横幅（exceeds limit）是否自动
+  // 执行「Compact 探测 → 删仓重建 → 基线重推」。关闭后仅 gc 重试 + 报错留人工处置；
+  // 设置页手动「删仓重建」按钮不受此开关限制。默认 true 维持原行为。
+  rebuildAutoEnabled: true,
 }
 
 const STRATEGY_VALUES = ['standalone', 'merge']
@@ -175,6 +185,12 @@ function syncSettingsSchema(S) {
     maxUploadFileMB: S.number().default(64).min(1),
     // [2026-11-09 体积自愈] 推送前置体积巡检阈值（MB），默认 500，最小 10
     repoGcThresholdMB: S.number().default(500).min(10),
+    // [2026-11-11 UI 化] 孤儿占比触发线（0-1），默认 0.5；pack ≥ gcOrphanMinPackMB 且占比 ≥ 此值自动 gc
+    gcOrphanRatio: S.number().default(0.5).min(0.05).max(1),
+    // [2026-11-11 UI 化] 孤儿 gc 的 pack 体积下限（MB），默认 64，最小 8
+    gcOrphanMinPackMB: S.number().default(64).min(8),
+    // [2026-11-11 UI 化] 自动删仓重建总闸（push 超限横幅触发），默认 true；手动按钮不受限
+    rebuildAutoEnabled: S.boolean().default(true),
   })
 }
 let Config = undefined
@@ -310,7 +326,7 @@ function writeProfileFileSync(effIn, clearToken) {
   }
   const eff = effIn
   const vals = {}
-  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB']) vals[k] = eff[k]
+  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB','gcOrphanRatio','gcOrphanMinPackMB','rebuildAutoEnabled']) vals[k] = eff[k]
   for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
   for (const k of ['intervalMinutes','snapshotLocalKeep']) vals[k] = eff[k]
   if (keptToken && !vals.token) vals.token = keptToken
@@ -582,19 +598,41 @@ async function acquireLock(lockFile) {
 
 // ── GitCode REST: repo privacy check + PR create / detail / merge ──
 
-/** Parse `https://gitcode.com/<owner>/<repo>(.git)` → { owner, repo }. */
-function parseRepoUrl(url) {
-  const m = String(url || '').match(/gitcode\.com\/([^/]+)\/([^/?.]+?)(?:\.git)?(?:[/?#]|$)/i)
-  if (!m) return null
-  return { owner: m[1], repo: m[2] }
+/* [2026-11-11 多平台适配] gitcode / github / gitee 三家 API 形状高度同构
+   （Gitee v5 抄 GitHub v3，GitCode 抄 Gitee v5），差异只在 API base 与认证方式：
+   - GitCode: PRIVATE-TOKEN 头（实测子资源端点 branches/pulls 对 Authorization: Bearer
+     有 bug——带 Bearer 查 project 一律 404，匿名 / PRIVATE-TOKEN / access_token query 均正常）
+   - GitHub:  Authorization: Bearer 头（fine-grained / classic 均可；删仓需 delete_repo scope）
+   - Gitee:   access_token query 参数（v5 官方认证方式，DELETE/POST 同样走 query）
+   日常同步/squash/gc/bundle 全是纯 git 操作（authedUrl 的 oauth2:<token>@ 凭据形式三家通用），
+   平台差异只影响「云端 API 调用」：私仓校验 / compact 探测（仅 GitCode）/ 删仓重建 / 冲突 PR。 */
+const PLATFORMS = {
+  gitcode: { host: 'gitcode.com', apiBase: 'https://api.gitcode.com/api/v5', label: 'GitCode' },
+  github: { host: 'github.com', apiBase: 'https://api.github.com', label: 'GitHub' },
+  gitee: { host: 'gitee.com', apiBase: 'https://gitee.com/api/v5', label: 'Gitee' },
 }
-
-async function gitcodeRequest(token, method, path, body, { apiBase = GITCODE_API_BASE } = {}) {
-  const url = apiBase + path
-  // 认证必须用 PRIVATE-TOKEN（实测 GitCode 子资源端点 branches/pulls 对
-  // Authorization: Bearer 有 bug——带 Bearer 查 project 一律 404 not found，
-  // 匿名 / PRIVATE-TOKEN / access_token query 均正常）
-  const init = { method, headers: { 'PRIVATE-TOKEN': token, 'Content-Type': 'application/json' } }
+const PLATFORM_SUPPORT_RE = /(?:gitcode|github|gitee)\.com\/([^/\s]+)\/([^/?.\s]+?)(?:\.git)?(?:[/?#]|$)/i
+/** Parse `https://<platform-host>/<owner>/<repo>(.git)` → { platform, label, apiBase, owner, repo } | null. */
+function detectPlatform(url) {
+  const m = PLATFORM_SUPPORT_RE.exec(String(url || ''))
+  if (!m) return null
+  const key = /gitcode/i.test(m[0]) ? 'gitcode' : /github/i.test(m[0]) ? 'github' : 'gitee'
+  const p = PLATFORMS[key]
+  return { platform: key, label: p.label, apiBase: p.apiBase, owner: m[1], repo: m[2] }
+}
+/** 兼容壳：旧调用只要 { owner, repo } 判定「可解析」。 */
+function parseRepoUrl(url) {
+  const d = detectPlatform(url)
+  return d ? { owner: d.owner, repo: d.repo } : null
+}
+/** 平台化 API 请求：认证头按平台分派（见 PLATFORMS 注释）。 */
+async function platformRequest(token, platform, method, path, body, { apiBase } = {}) {
+  const base = apiBase || (PLATFORMS[platform] && PLATFORMS[platform].apiBase) || ''
+  let url = base + path
+  const init = { method, headers: { 'Content-Type': 'application/json' } }
+  if (platform === 'github') init.headers['Authorization'] = 'Bearer ' + token
+  else if (platform === 'gitee') url += (url.includes('?') ? '&' : '?') + 'access_token=' + encodeURIComponent(token)
+  else init.headers['PRIVATE-TOKEN'] = token
   if (body !== undefined) init.body = JSON.stringify(body)
   const r = await fetch(url, init)
   const text = await r.text()
@@ -602,29 +640,33 @@ async function gitcodeRequest(token, method, path, body, { apiBase = GITCODE_API
   try { json = text === '' ? null : JSON.parse(text) } catch {}
   return { ok: r.ok, status: r.status, json, text }
 }
+/** GitCode 专属薄壳（兼容保留）：PRIVATE-TOKEN 认证。 */
+async function gitcodeRequest(token, method, path, body, { apiBase = PLATFORMS.gitcode.apiBase } = {}) {
+  return platformRequest(token, 'gitcode', method, path, body, { apiBase })
+}
 
 /** Verify the configured repo exists AND is private. Public repos are refused
  *  because sync carries credentials (settings.yaml is mirrored wholesale). */
 async function checkRepoPrivate(token, repoUrl) {
-  const parsed = parseRepoUrl(repoUrl)
-  if (!parsed) return { ok: false, error: '无法解析仓库地址（需要 https://gitcode.com/<owner>/<repo>）' }
-  const r = await gitcodeRequest(token, 'GET', `/repos/${parsed.owner}/${parsed.repo}`)
+  const parsed = detectPlatform(repoUrl)
+  if (!parsed) return { ok: false, error: '无法解析仓库地址（支持 https://gitcode.com | github.com | gitee.com/<owner>/<repo> 私有仓库）' }
+  const r = await platformRequest(token, parsed.platform, 'GET', `/repos/${parsed.owner}/${parsed.repo}`, undefined, { apiBase: parsed.apiBase })
   if (!r.ok) return { ok: false, error: `无法访问仓库（HTTP ${r.status}）：${(r.json && r.json.message) || r.text.slice(0, 120)}` }
   const priv = r.json && (r.json.private === true || r.json.private === 'true')
-  if (!priv) return { ok: false, error: '检测到公共仓库。dsh-sync 会同步含凭证的 settings.yaml，必须使用私有仓库——请到 gitcode.com 将该仓库设为私有，或新建私有仓库后再填地址。', isPublic: true }
-  return { ok: true, owner: parsed.owner, repo: parsed.repo, defaultBranch: r.json && (r.json.default_branch || 'main') }
+  if (!priv) return { ok: false, error: '检测到公共仓库。dsh-sync 会同步含凭证的 settings.yaml，必须使用私有仓库——请到平台将仓库设为私有，或新建私有仓库后再填地址。', isPublic: true }
+  return { ok: true, platform: parsed.platform, owner: parsed.owner, repo: parsed.repo, defaultBranch: r.json && (r.json.default_branch || 'main') }
 }
 
-async function createPullRequest(token, owner, repo, { head, base, title, body }) {
-  return gitcodeRequest(token, 'POST', `/repos/${owner}/${repo}/pulls`, { head, base, title: title || 'dsh-sync', body: body || '' })
+async function createPullRequest(token, platform, owner, repo, { head, base, title, body, apiBase }) {
+  return platformRequest(token, platform, 'POST', `/repos/${owner}/${repo}/pulls`, { head, base, title: title || 'dsh-sync', body: body || '' }, { apiBase })
 }
 
-async function getPullRequest(token, owner, repo, number) {
-  return gitcodeRequest(token, 'GET', `/repos/${owner}/${repo}/pulls/${number}`)
+async function getPullRequest(token, platform, owner, repo, number, apiBase) {
+  return platformRequest(token, platform, 'GET', `/repos/${owner}/${repo}/pulls/${number}`, undefined, { apiBase })
 }
 
-async function mergePullRequest(token, owner, repo, number, method) {
-  return gitcodeRequest(token, 'PUT', `/repos/${owner}/${repo}/pulls/${number}/merge`, method ? { merge_method: method } : {})
+async function mergePullRequest(token, platform, owner, repo, number, method, apiBase) {
+  return platformRequest(token, platform, 'PUT', `/repos/${owner}/${repo}/pulls/${number}/merge`, method ? { merge_method: method } : {}, { apiBase })
 }
 
 // ── Sync spec: which live roots mirror into which shadow paths ──
@@ -1835,14 +1877,19 @@ async function forceRebuildCloudRepo(eff, repoDir, state, logger, reason) {
   const tag = reason || '删仓重建'
   const warn = (m) => { try { logger?.warn?.('[dsh-sync] ' + tag + ': ' + m) } catch {} }
   try {
-    const parsed = parseRepoUrl(eff.repoUrl)
-    if (!parsed) return { ok: false, mode: null, detail: 'repoUrl 非 GitCode，删仓重建不可用（仅支持 GitCode 远端）' }
+    const parsed = detectPlatform(eff.repoUrl)
+    if (!parsed) return { ok: false, mode: null, detail: 'repoUrl 不受支持，删仓重建不可用（支持 gitcode.com / github.com / gitee.com 远端）' }
     if (!eff.token) return { ok: false, mode: null, detail: '未配置令牌，无法操作云端仓库' }
     try {
-      const compact = await gitcodeRequest(eff.token, 'POST', `/repos/${parsed.owner}/${parsed.repo}/compact`)
-      if (compact.ok) {
-        warn('Compact API 可用，服务端 GC 已触发（零重传），下轮上传恢复正常速度')
-        return { ok: true, mode: 'compact', detail: 'Compact API 可用，服务端 GC 已触发（零重传，未删仓）' }
+      // [2026-11-11 多平台] Compact 是 GitCode 官方服务端 GC 端点（GitHub/Gitee 无此 API），仅 gitcode 探测
+      if (parsed.platform === 'gitcode') {
+        const compact = await gitcodeRequest(eff.token, 'POST', `/repos/${parsed.owner}/${parsed.repo}/compact`)
+        if (compact.ok) {
+          warn('Compact API 可用，服务端 GC 已触发（零重传），下轮上传恢复正常速度')
+          return { ok: true, mode: 'compact', detail: 'Compact API 可用，服务端 GC 已触发（零重传，未删仓）' }
+        }
+      } else {
+        warn(`${parsed.label} 无 Compact API，直接走删仓重建`)
       }
     } catch { /* 探测失败继续走删仓重建（2026-11-03 实测 Compact 三端点 404） */ }
     let bundlePath = ''
@@ -1851,10 +1898,10 @@ async function forceRebuildCloudRepo(eff, repoDir, state, logger, reason) {
       bundlePath = join(dshHome(), 'dsh-sync', `repo-rebuild-backup-${stamp}.bundle`)
       await gitExec(eff.gitBinary, ['bundle', 'create', bundlePath, 'HEAD'], repoDir)
     } catch (e) { warn('bundle 保险失败（继续，影子仓本地即全量）: ' + String((e && e.message) || e)) }
-    const del = await gitcodeRequest(eff.token, 'DELETE', `/repos/${parsed.owner}/${parsed.repo}`)
-    if (!del.ok && del.status !== 404) return { ok: false, mode: null, detail: `删除旧仓失败 HTTP ${del.status}${bundlePath ? `（bundle 保险已存 ${bundlePath}）` : ''}` }
+    const del = await platformRequest(eff.token, parsed.platform, 'DELETE', `/repos/${parsed.owner}/${parsed.repo}`, undefined, { apiBase: parsed.apiBase })
+    if (!del.ok && del.status !== 404) return { ok: false, mode: null, detail: `删除旧仓失败 HTTP ${del.status}${bundlePath ? `（bundle 保险已存 ${bundlePath}）` : ''}${parsed.platform === 'github' ? '（GitHub 删仓要求令牌带 delete_repo 权限，fine-grained 令牌需 Administration: write）' : ''}` }
     await new Promise((r) => setTimeout(r, 3000))
-    const create = await gitcodeRequest(eff.token, 'POST', '/user/repos', { name: parsed.repo, private: true, description: 'dsh-sync repo (rebuilt after size limit)' })
+    const create = await platformRequest(eff.token, parsed.platform, 'POST', '/user/repos', { name: parsed.repo, private: true, description: 'dsh-sync repo (rebuilt after size limit)' }, { apiBase: parsed.apiBase })
     if (!create.ok) return { ok: false, mode: null, detail: `重建仓库失败 HTTP ${create.status}: ${String((create.json && create.json.message) || create.text || '').slice(0, 120)}` }
     const remote = authedUrl(eff.repoUrl, eff.token)
     await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
@@ -1869,7 +1916,13 @@ async function rebuildCloudRepoIfBloated(pushOut, eff, repoDir, state, logger) {
   try {
     const out = String(pushOut || '')
     if (!REBUILD_WARNING_RE.test(out)) return false
-    const r = await forceRebuildCloudRepo(eff, repoDir, state, logger, 'GitCode 报告仓库物理体积超限（orphan 不释放配额）→ 自动处理')
+    // [2026-11-11 UI 总闸] 自动删仓重建开关（设置页「体积自愈」）：关闭后仅本地 gc 重试 + 报错留人工处置；
+    // 设置页手动「删仓重建」按钮走 forceRebuildCloudRepo，不受此开关限制。
+    if (eff.rebuildAutoEnabled === false) {
+      try { logger?.warn?.('[dsh-sync] 体积巡检: 远端体积超限，但「自动删仓重建」已被关闭（设置页可开），跳过自动处理') } catch {}
+      return false
+    }
+    const r = await forceRebuildCloudRepo(eff, repoDir, state, logger, '平台报告仓库物理体积超限（orphan 不释放配额）→ 自动处理')
     if (!r.ok) { try { logger?.warn?.('[dsh-sync] 体积巡检: ' + r.detail) } catch {} }
     return r.ok
   } catch (e) {
@@ -1953,11 +2006,13 @@ async function gcIfBloated(binary, repoDir, eff, logger, opts = {}) {
   try {
     const st = await packOrphanStats(binary, repoDir)
     const threshold = Number(eff.repoGcThresholdMB) > 0 ? Number(eff.repoGcThresholdMB) : 500
+    // [2026-11-11 UI 化] 双线均可配置：占比线 eff.gcOrphanRatio（默认 0.5）、体积下限 eff.gcOrphanMinPackMB（默认 64）
+    const ratioLine = Number(eff.gcOrphanRatio) > 0 ? Number(eff.gcOrphanRatio) : GC_ORPHAN_RATIO
     const floor = Number(eff.gcOrphanMinPackMB) > 0 ? Number(eff.gcOrphanMinPackMB) : GC_ORPHAN_MIN_PACK_MB
     let reason = null
     if (st.mb >= threshold) reason = `pack ${st.mb.toFixed(0)}MB ≥ ${threshold}MB`
-    else if (st.mb >= floor && st.orphanRatio >= GC_ORPHAN_RATIO)
-      reason = `pack ${st.mb.toFixed(0)}MB 孤儿占比 ${(st.orphanRatio * 100).toFixed(0)}%（${st.orphans}/${st.inPack} 对象不可达）`
+    else if (st.mb >= floor && st.orphanRatio >= ratioLine)
+      reason = `pack ${st.mb.toFixed(0)}MB 孤儿占比 ${(st.orphanRatio * 100).toFixed(0)}% ≥ ${(ratioLine * 100).toFixed(0)}%（${st.orphans}/${st.inPack} 对象不可达）`
     if (reason) {
       logger?.warn?.(`[dsh-sync] 体积巡检${phase}: ${reason}，自动 git gc --prune=now…`)
       await gitExec(binary, ['reflog', 'expire', '--expire=now', '--expire-unreachable=now', '--all'], repoDir).catch(() => {})
@@ -2491,7 +2546,9 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   await rebuildCloudRepoIfBloated(pushOutPr, eff, repoDir, state, logger)
 
   // 6. create PR + mergeable check
-  const parsed = parseRepoUrl(eff.repoUrl)
+  // [2026-11-11 多平台] detectPlatform：三家（gitcode/github/gitee）走 PR 链路（端点同构，
+  // 认证由 platformRequest 分派；Gitee/GitHub PR 链路未真机实测，失败会显式报错）；其余 prSkipped。
+  const parsed = detectPlatform(eff.repoUrl)
   if (!parsed) {
     // non-GitCode remote (local test, self-hosted git): push the branch only;
     // PR create/merge is GitCode-specific and skipped. Advance shadow onto
@@ -2505,7 +2562,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   }
   // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
   const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
-  const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, prBody)
+  const prRes = await createPullRequest(eff.token, parsed.platform, parsed.owner, parsed.repo, { ...prBody, apiBase: parsed.apiBase })
   if (!prRes.ok) {
     // 409 = branch already has an open PR (idempotent retry); try to find it
     if (prRes.status === 409) return { pushed: true, prConflict: true, message: '已有进行中的同步 PR' }
@@ -2518,13 +2575,13 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   // 7. mergeable?
   let mergeable = false, conflict = false
   try {
-    const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+    const det = await getPullRequest(eff.token, parsed.platform, parsed.owner, parsed.repo, prNumber, parsed.apiBase)
     mergeable = det.ok && det.json && det.json.mergeable === true
     conflict = det.ok && det.json && det.json.mergeable === false
   } catch {}
 
   if (mergeable) {
-    const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+    const mr = await mergePullRequest(eff.token, parsed.platform, parsed.owner, parsed.repo, prNumber, 'squash', parsed.apiBase)
     if (!mr.ok) throw new Error(`合并 PR 失败（HTTP ${mr.status}）`)
     // 合并即删远端 sync 分支（best effort）：不删的话每次同步遗留一个分支，
     // 真机仓库实测两天积了 970+ 个 sync/* 分支
@@ -2931,7 +2988,7 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
     return { promoted: false, nothingToCommit: true }
   }
   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir)
-  const parsed = parseRepoUrl(eff.repoUrl)
+  const parsed = detectPlatform(eff.repoUrl)
   if (!parsed) {
     // 非 GitCode 远端：推分支后把影子基线推进到 main（与 runPush 的 prSkipped 路径一致）
     await gitExec(binary, ['fetch', remote, eff.branch], repoDir).catch(() => {})
@@ -2940,14 +2997,14 @@ async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state,
     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
     return { promoted: true, prSkipped: true, branch }
   }
-  const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, { head: branch, base: eff.branch, title: `dsh-sync snapshot ${instanceId} ${snapName}`, body: 'snapshot → cloud archive' })
+  const prRes = await createPullRequest(eff.token, parsed.platform, parsed.owner, parsed.repo, { head: branch, base: eff.branch, title: `dsh-sync snapshot ${instanceId} ${snapName}`, body: 'snapshot → cloud archive', apiBase: parsed.apiBase })
   if (!prRes.ok) throw new Error(`创建快照 PR 失败（HTTP ${prRes.status}）：${(prRes.json && prRes.json.message) || prRes.text.slice(0, 160)}`)
   const prNumber = prRes.json && (prRes.json.number || prRes.json.id)
   let merged = false
   try {
-    const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+    const det = await getPullRequest(eff.token, parsed.platform, parsed.owner, parsed.repo, prNumber, parsed.apiBase)
     if (det.ok && det.json && det.json.mergeable === true) {
-      const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
+      const mr = await mergePullRequest(eff.token, parsed.platform, parsed.owner, parsed.repo, prNumber, 'squash', parsed.apiBase)
       merged = !!mr.ok
     }
   } catch {}
@@ -3489,7 +3546,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, pruneCloudExtras, pruneLocalOnlySessions,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectPlatform, platformRequest, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, pruneCloudExtras, pruneLocalOnlySessions,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
@@ -4707,6 +4764,11 @@ module.exports = {
               syncMemory: eff.syncMemory, syncKnowledge: eff.syncKnowledge,
               sessionsParts: eff.sessionsParts !== false,   // [2026-11-04] 设置面板开关回填依据
               sessionsDeleteSync: eff.sessionsDeleteSync !== false,   // [9999.9.26] 覆盖删除开关回填
+              // [2026-11-11 UI 化] 体积自愈配置回填（设置面板）
+              repoGcThresholdMB: eff.repoGcThresholdMB || 500,
+              gcOrphanRatio: Number(eff.gcOrphanRatio) > 0 ? Number(eff.gcOrphanRatio) : 0.5,
+              gcOrphanMinPackMB: Number(eff.gcOrphanMinPackMB) > 0 ? Number(eff.gcOrphanMinPackMB) : 64,
+              rebuildAutoEnabled: eff.rebuildAutoEnabled !== false,
               strategies: {
                 skills: STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'standalone',
                 sessions: STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'merge',
@@ -4788,6 +4850,10 @@ module.exports = {
             if (typeof body.intervalMinutes === 'number' && body.intervalMinutes >= 1) patch.intervalMinutes = body.intervalMinutes
             if (typeof body.maxUploadFileMB === 'number' && body.maxUploadFileMB >= 1) patch.maxUploadFileMB = Math.floor(body.maxUploadFileMB)
             if (typeof body.repoGcThresholdMB === 'number' && body.repoGcThresholdMB >= 10) patch.repoGcThresholdMB = Math.floor(body.repoGcThresholdMB)
+            // [2026-11-11 UI 化] 孤儿占比线（0.05-1）/体积下限（≥8MB）/自动删仓重建总闸
+            if (typeof body.gcOrphanRatio === 'number' && body.gcOrphanRatio >= 0.05 && body.gcOrphanRatio <= 1) patch.gcOrphanRatio = body.gcOrphanRatio
+            if (typeof body.gcOrphanMinPackMB === 'number' && body.gcOrphanMinPackMB >= 8) patch.gcOrphanMinPackMB = Math.floor(body.gcOrphanMinPackMB)
+            if (typeof body.rebuildAutoEnabled === 'boolean') patch.rebuildAutoEnabled = body.rebuildAutoEnabled
             // token: non-empty sets; null/'' clears. Never echoed.
             let clearToken = false
             if (typeof body.token === 'string' && body.token !== '') patch.token = body.token
@@ -4851,6 +4917,10 @@ module.exports = {
             await stateLoaded
             const eff = syncSettings()
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+            // [2026-11-11 多平台] 冲突 AI 指引（CONFLICT_PROMPT_ZH）按 GitCode 编写（PRIVATE-TOKEN 头、
+            // gitcode.com 网页导航）；非 GitCode 平台给出明确人话，不让 AI 拿着错误指引瞎跑。
+            const __pd = detectPlatform(eff.repoUrl)
+            if (__pd && __pd.platform !== 'gitcode') { sendJson(res, 400, { error: `冲突 AI 自动解决指引暂按 ${__pd.label} 未适配（现按 GitCode 编写），请到 ${__pd.label} 网页手动合并该 PR，或换回 GitCode 远端` }); return }
             const branch = body.branch || state.lastPushedBranch
             const prNumber = body.prNumber || state.lastPrNumber
             if (!branch || !prNumber) { sendJson(res, 400, { error: '没有待解决的冲突 PR' }); return }
@@ -4916,8 +4986,8 @@ module.exports = {
             await stateLoaded
             const eff = syncSettings()
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
-            const parsed = parseRepoUrl(eff.repoUrl)
-            if (!parsed) { sendJson(res, 400, { error: '仅支持 GitCode 仓库' }); return }
+            const parsed = detectPlatform(eff.repoUrl)
+            if (!parsed) { sendJson(res, 400, { error: '仅支持 gitcode.com / github.com / gitee.com 仓库' }); return }
             const hasShadow = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
             if (!hasShadow) { sendJson(res, 400, { error: '影子仓库未初始化，先同步一次' }); return }
             const remote = authedUrl(eff.repoUrl, eff.token)
@@ -4927,7 +4997,7 @@ module.exports = {
             // 收集已合并 PR 的 head 分支（翻页直到取完，上限 20 页 × 100）
             const mergedHeads = new Set()
             for (let page = 1; page <= 20; page++) {
-              const r = await gitcodeRequest(eff.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}/pulls?state=merged&per_page=100&page=${page}`)
+              const r = await platformRequest(eff.token, parsed.platform, 'GET', `/repos/${parsed.owner}/${parsed.repo}/pulls?state=merged&per_page=100&page=${page}`, undefined, { apiBase: parsed.apiBase })
               if (!r.ok || !Array.isArray(r.json) || r.json.length === 0) break
               for (const pr of r.json) { if (pr.head && pr.head.ref) mergedHeads.add(pr.head.ref) }
               if (r.json.length < 100) break
@@ -4957,15 +5027,21 @@ module.exports = {
             try {
               const st = await packOrphanStats(eff.gitBinary, repoDir)
               const gcThreshold = Number(eff.repoGcThresholdMB) > 0 ? Number(eff.repoGcThresholdMB) : 500
+              const ratioLine = Number(eff.gcOrphanRatio) > 0 ? Number(eff.gcOrphanRatio) : GC_ORPHAN_RATIO
+              const floorMb = Number(eff.gcOrphanMinPackMB) > 0 ? Number(eff.gcOrphanMinPackMB) : GC_ORPHAN_MIN_PACK_MB
               const commit = await gitCurrentCommit(eff.gitBinary, repoDir).catch(() => null)
-              const needGc = st.mb >= gcThreshold || (st.mb >= GC_ORPHAN_MIN_PACK_MB && st.orphanRatio >= GC_ORPHAN_RATIO)
+              const needGc = st.mb >= gcThreshold || (st.mb >= floorMb && st.orphanRatio >= ratioLine)
+              const pd = detectPlatform(eff.repoUrl)
               sendJson(res, 200, {
                 mb: Math.round(st.mb * 10) / 10,
                 inPack: st.inPack, loose: st.looseCount, reachable: st.reachable,
                 orphans: st.orphans, orphanRatio: Math.round(st.orphanRatio * 1000) / 1000,
-                gcThresholdMb: gcThreshold, orphanLinePct: Math.round(GC_ORPHAN_RATIO * 100),
+                gcThresholdMb: gcThreshold, orphanLinePct: Math.round(ratioLine * 100),
+                gcOrphanMinPackMB: floorMb, rebuildAutoEnabled: eff.rebuildAutoEnabled !== false,
                 needGc, commit,
-                isGitCode: !!parseRepoUrl(eff.repoUrl), hasToken: !!eff.token,
+                // [2026-11-11 多平台] 平台画像：platform/label 供维护块徽标；rebuildSupported 决定按钮可用
+                platform: pd ? pd.platform : null, platformLabel: pd ? pd.label : null,
+                rebuildSupported: !!pd, isGitCode: pd ? pd.platform === 'gitcode' : !!parseRepoUrl(eff.repoUrl), hasToken: !!eff.token,
               })
             } catch (e) { sendJson(res, 500, { error: String((e && e.message) || e) }) }
             return
@@ -4977,7 +5053,7 @@ module.exports = {
             await stateLoaded
             const eff = syncSettings()
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
-            if (!parseRepoUrl(eff.repoUrl)) { sendJson(res, 400, { error: '仅支持 GitCode 远端' }); return }
+            if (!detectPlatform(eff.repoUrl)) { sendJson(res, 400, { error: '不支持的平台（仅 gitcode.com / github.com / gitee.com 远端可删仓重建）' }); return }
             const release = await acquireLock(lockFile)
             if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
             try {

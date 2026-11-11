@@ -248,10 +248,13 @@ await t('rebuildCloudRepoIfBloated 门禁：不匹配/非 GitCode/无 token → 
   eq(await rebuildCloudRepoIfBloated('size (1.2 GiB) exceeds the limit', { repoUrl: 'https://gitcode.com/gcw_wXIDw07q/dsh-sync.git' }, 'x', {}, lg), false, '无 token 应返回 false')
 })
 
-await t('forceRebuildCloudRepo 门禁：非 GitCode/无 token → ok:false 带原因，不上网', async () => {
-  const r1 = await forceRebuildCloudRepo({ repoUrl: 'https://github.com/a/b.git', gitBinary: 'git' }, 'x', {}, null, '手动')
-  eq(r1.ok, false, '非 GitCode 应 ok:false')
-  ok(/GitCode/.test(r1.detail), '应说明仅支持 GitCode')
+await t('forceRebuildCloudRepo 门禁：非三家平台/无 token → ok:false 带原因，不上网', async () => {
+  const r1 = await forceRebuildCloudRepo({ repoUrl: 'https://git.local/a/b.git', gitBinary: 'git' }, 'x', {}, null, '手动')
+  eq(r1.ok, false, '非三家平台应 ok:false')
+  ok(/不受支持|gitcode\.com|github\.com|gitee\.com/.test(r1.detail), '应说明支持的平台范围')
+  const r1b = await forceRebuildCloudRepo({ repoUrl: 'https://github.com/a/b.git', gitBinary: 'git' }, 'x', {}, null, '手动')
+  eq(r1b.ok, false, 'github 平台解析成功但无 token 也应 ok:false')
+  ok(/令牌|token/i.test(r1b.detail), 'github 无 token 应提示配置令牌')
   const r2 = await forceRebuildCloudRepo({ repoUrl: 'https://gitcode.com/gcw_wXIDw07q/dsh-sync.git', gitBinary: 'git' }, 'x', {}, null, '手动')
   eq(r2.ok, false, '无 token 应 ok:false')
   ok(/令牌|token/i.test(r2.detail), '应提示配置令牌')
