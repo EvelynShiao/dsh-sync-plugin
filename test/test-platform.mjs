@@ -13,7 +13,7 @@ import { randomBytes } from 'node:crypto'
 
 const require = createRequire(import.meta.url)
 const mod = require('../src/index.js')
-const { detectPlatform, platformRequest, checkRepoPrivate, gcIfBloated, packOrphanStats, rebuildCloudRepoIfBloated, gitExec } = mod.__internals
+const { detectPlatform, platformRequest, checkRepoPrivate, gcIfBloated, packOrphanStats, rebuildCloudRepoIfBloated, gitExec, CONFLICT_PROMPT_GENERIC, substituteParams } = mod.__internals
 
 let pass = 0, fail = 0
 const ok = (v, msg) => { if (!v) throw new Error(msg || '断言失败') }
@@ -193,6 +193,20 @@ try {
   globalThis.fetch = origFetch
   try { rmSync(TEST_ROOT, { recursive: true, force: true }) } catch {}
 }
+
+console.log('\n=== ⑤ CONFLICT_PROMPT_GENERIC：通用冲突模板 ===')
+
+await t('通用模板参数化后含直推指令、不含 GitCode 专属认证', () => {
+  const out = substituteParams(CONFLICT_PROMPT_GENERIC, {
+    repoUrl: 'https://gitee.com/u/r.git', shadowDir: 'D:/shadow', branch: 'sync/x-1', prNumber: 7,
+    token: 'TOK', remoteUrl: 'https://oauth2:TOK@gitee.com/u/r.git', baseBranch: 'main',
+  })
+  ok(out.includes('git push https://oauth2:TOK@gitee.com/u/r.git HEAD:main'), '应含「直推 main」指令（fast-forward 合并）')
+  ok(out.includes('HEAD:sync/x-1'), '应含 push 回 sync 分支')
+  ok(!out.includes('api.gitcode.com') && !out.includes('PRIVATE-TOKEN'), '不应残留 GitCode 专属认证（PRIVATE-TOKEN/api.gitcode.com）')
+  ok(out.includes('不要用 --force') && !/push[^。\n]*--force(?!：)/.test(out.replace('不要用 --force', '禁止词')), '应禁止 force 且不出现非禁止语境的 --force')
+  ok(!out.includes('{{'), '参数应全部替换完毕')
+})
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
 process.exit(fail === 0 ? 0 : 1)
