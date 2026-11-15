@@ -75,7 +75,7 @@ if (!Schema) {
 
 const GITCODE_API_BASE = 'https://api.gitcode.com/api/v5'
 const MAX_BODY_BYTES = 64 * 1024
-const SYNC_TIMEOUT_MS = 10 * 60 * 1000
+const SYNC_TIMEOUT_MS = 30 * 60 * 1000
 const CONFLICT_RUN_TIMEOUT_MS = 30 * 60 * 1000
 const CONFLICT_RUN_OUTPUT_CAP = 256 * 1024
 
@@ -505,7 +505,7 @@ async function atomicWriteFile(file, content) {
 
 function gitExec(binary, args, cwd) {
   return new Promise((fulfil, reject) => {
-    execFile(binary, args, { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(binary, args, { cwd, timeout: 30 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) {
         const tail = String(stderr || error.message || '').split(/\r?\n/).filter(Boolean).slice(-3).join(' ')
         reject(new Error(`git ${args[0]}: ${tail || error.message}`))
@@ -524,7 +524,7 @@ function gitExec(binary, args, cwd) {
    全量（截 4000 字符，保住 remote 横幅），供 pushWithSelfHeal 自愈阶梯匹配。 */
 function gitExecOut(binary, args, cwd) {
   return new Promise((fulfil, reject) => {
-    execFile(binary, args, { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(binary, args, { cwd, timeout: 30 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
       const errText = String(stderr || '')
       if (error) {
         const flat = errText.replace(/\r/g, '').split(/\r?\n/).filter(Boolean).join(' ')
@@ -3947,7 +3947,10 @@ module.exports = {
           return { uploaded: false, nothingToCommit: true, fastPath: true }
         }
       } catch { /* 短路判定失败 → 照常走全流程 */ }
-      try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+      /* [2026-11-15 抗堵 v1] --depth 1：上传只需要云端基线 tip（覆盖语义+force push 不需要历史）。
+         对端 squash 重写后无公共对象，全量 fetch 曾达 48MB；拥塞时段 ~60KB/s 时 14min 必撞旧 10min 超时。
+         depth 1 把最坏情况锁死在 tip 快照大小。副作用：影子仓 shallow 化（squash 计数已用 state 兜底）。 */
+      try { await gitExec(eff.gitBinary, ['fetch', '--depth', '1', remote, eff.branch], repoDir) } catch (e) {
         if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
       }
       /* [skills 退役 2026-10-26] syncSkills=false 后 spec 无 skills 组，但影子仓/云端
@@ -4157,6 +4160,8 @@ module.exports = {
       }
       state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
       state.lastSyncAt = new Date().toISOString()
+      /* [2026-11-15 抗堵 v1] squash 计数器（shallow 化后 rev-list 失明，state 兜底） */
+      state.uploadsSinceSquash = (Number(state && state.uploadsSinceSquash) || 0) + 1
       await saveState()
       /* [自动瘦身 2026-10-25 v2 按用户定案收紧] 用户原话「超过1个就拍成0个」——
          云端不保留任何历史版本，每次有变化的上传后立刻归 1（git 仓最少 1 个提交，
@@ -4169,9 +4174,16 @@ module.exports = {
            上一版 countOut.stdout 恒 undefined → commitCount NaN → squash 永不触发。
            双端三次上传实测零 squash 的真因（2026-10-26 复盘）。 */
         const countOut = await gitExec(eff.gitBinary, ['rev-list', '--count', 'HEAD'], repoDir)
-        const commitCount = Number(String(countOut ?? '').trim())
-        if (Number.isFinite(commitCount) && commitCount > 1) {
-          ctx.logger?.info?.(`dsh-sync: auto-squash: 提交数 ${commitCount} > 1，重写单提交基线…`)
+        /* [2026-11-15 抗堵 v1] squash 线 1→20 次 + pack 300MB 体积线 + state 计数兜底：
+           ① fetch --depth 1 后影子仓 shallow 化，rev-list 计数失明（恒小），必须用 state.uploadsSinceSquash 兜底；
+           ② 收紧 squash 频率是多机止血的关键——对端每次 squash+force push = 本端下次 fetch 全量重下
+           （2026-11-15 实测：云端重建后 15 分钟内又被手机重写为 957691a，本端 83c13f2 立即过期）；
+           ③ 体积线兜底：两次 squash 之间 pack 只增不减，≥300MB 重拍（GitCode compact 服务端 GC 零重传）。 */
+        const commitCount = Math.max(Number(String(countOut ?? '').trim()) || 0, Number(state && state.uploadsSinceSquash) || 0)
+        let squashPackMB = 0
+        try { const coSquash = await gitExec(eff.gitBinary, ['count-objects', '-v'], repoDir); const mPack = /size-pack:\s*(\d+)/.exec(String(coSquash)); if (mPack) squashPackMB = Number(mPack[1]) / 1024 } catch { }
+        if (Number.isFinite(commitCount) && (commitCount > 20 || squashPackMB > 300)) {
+          ctx.logger?.info?.(`dsh-sync: auto-squash: 提交数 ${commitCount}>20 或 pack ${squashPackMB.toFixed(0)}MB>300，重写单提交基线…`)
           await gitExec(eff.gitBinary, ['checkout', '--orphan', '__autosquash__'], repoDir)
           await gitExec(eff.gitBinary, ['add', '-A'], repoDir)
           await gitExec(eff.gitBinary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `auto-squash: 单提交基线（原 ${commitCount} 份历史快照已合并，内容不变）`], repoDir)
@@ -4180,6 +4192,7 @@ module.exports = {
           const pushOutSq = await pushWithSelfHeal(eff.gitBinary, ['push', '-f', remote, `HEAD:${eff.branch}`], repoDir, eff, state, ctx.logger)
           await rebuildCloudRepoIfBloated(pushOutSq, eff, repoDir, state, ctx.logger)
           state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
+          state.uploadsSinceSquash = 0
           await saveState()
           ctx.logger?.info?.(`dsh-sync: auto-squash 完成：${commitCount} → 1 份基线，已 force push`)
         }
@@ -4216,7 +4229,8 @@ module.exports = {
       let finalWorkspacePath = null
       const remote = await ensureShadowRepo(eff.gitBinary, eff, repoDir)
       const spec = syncSpec(eff, defaultRoots(), state.instanceId)
-      try { await gitExec(eff.gitBinary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+      /* [2026-11-15 抗堵 v1] 下载同样只需要 tip 全树（fetch --depth 1），理由同上传侧 */
+      try { await gitExec(eff.gitBinary, ['fetch', '--depth', '1', remote, eff.branch], repoDir) } catch (e) {
         if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
         return { downloaded: false, empty: true }
       }
