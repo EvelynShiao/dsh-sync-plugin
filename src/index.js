@@ -40,7 +40,7 @@
  */
 
 const { execFile } = require('node:child_process')
-const { randomUUID } = require('node:crypto')
+const { randomUUID, createHash } = require('node:crypto')
 const fsP = require('node:fs/promises')
 const { join, relative, resolve, sep } = require('node:path')
 const { homedir, hostname } = require('node:os')
@@ -500,6 +500,16 @@ async function atomicWriteFile(file, content) {
   await fsP.writeFile(temp, content)
   await fsP.rename(temp, file)
 }
+
+/* [2026-11-15 C1 sqlite zstd 车道] 影子仓里 sqlite 只存 <to>.zst + <to>.sha1（原始内容指纹）：
+   knowledge 27.64MB→11.59MB(42%)、memory 8.97MB→2.77MB(31%)（2026-11-15 实测，node v24 zlib.zstd 默认级，
+   压缩 148ms/52ms，回读一致）。两库占 pack 73%，是仓库体积与下载传输的膨胀主因，zstd 后同幅减负。
+   规则：上传端压缩落影子仓并删除同名 raw（含 -wal/-shm 残留）；下载端 raw 优先
+   （旧版本端/快照通道写回的 raw 必比本端 .zst 新），否则解压 .zst 并校验 .sha1。
+   兼容：本端 zlib 无 zstd → 自动回落 raw 行为（上传拷 raw、下载认 raw），功能惰性失效不炸；
+   新旧版本混跑窗口：旧端读不到 .sqlite raw 会跳过该组（不坏数据，等对端下次上传即恢复）。 */
+const SQLITE_ZSTD_ENABLED = (() => { try { const z = require('node:zlib'); return typeof z.zstdCompressSync === 'function' && typeof z.zstdDecompressSync === 'function' } catch { return false } })()
+function sha1HexBuf(buf) { return createHash('sha1').update(buf).digest('hex') }
 
 // ── Git CLI (token stays out of .git/config — authed URL per command) ──
 
@@ -4003,7 +4013,17 @@ module.exports = {
             try {
               await fsP.access(src.from)
               await fsP.mkdir(join(target, '..'), { recursive: true })
-              await fsP.copyFile(src.from, target)
+              /* [2026-11-15 C1 sqlite zstd 车道] 压缩落影子仓：<to>.zst + <to>.sha1，同名 raw（含 -wal/-shm 残留）删除 */
+              if (/\.sqlite$/i.test(String(src.to)) && SQLITE_ZSTD_ENABLED) {
+                const bufUp = await fsP.readFile(src.from)
+                const zlibC = require('node:zlib')
+                await fsP.writeFile(target + '.zst', zlibC.zstdCompressSync(bufUp))
+                await fsP.writeFile(target + '.sha1', sha1HexBuf(bufUp) + '\n')
+                await fsP.rm(target, { force: true })
+                for (const ext of ['-wal', '-shm']) await fsP.rm(target + ext, { force: true })
+              } else {
+                await fsP.copyFile(src.from, target)
+              }
             } catch {}
           } else if (group.name === 'sessions') {
             if (group.strategy === 'standalone') {
@@ -4256,8 +4276,14 @@ module.exports = {
           // 「上传和下载都要真覆盖，仅工作区例外」。上传端差量镜像会维护这份备份的新鲜度，
           // 所以顺序上先上传再下载 = 云端即本机最新配置。
           // 边界仍在 fix-2：云端没有的组自然跳过（首次同步无备份时不会拿空覆盖）。
+          /* [2026-11-15 C1 sqlite zstd 车道] raw 缺失时尝试 <source>.zst（sha1 + integrity 双校验后落地）。
+             raw 优先：旧版本端/快照通道写回的 raw 必比本端上次压的 .zst 新。 */
+          const isSqliteSrc = /\.sqlite$/i.test(String(src.to))
           const haveSource = await fsP.access(source).then(() => true).catch(() => false)
-          if (!haveSource) {
+          const haveZst = !haveSource && isSqliteSrc && SQLITE_ZSTD_ENABLED
+            ? await fsP.access(source + '.zst').then(() => true).catch(() => false)
+            : false
+          if (!haveSource && !haveZst) {
             // [fix-2] 老代码直接 continue 且不吭声，于是「远端有但仓库没拉到」
             // 和「本机没装」长得一模一样——都表现为静默跳过 + 下载完成
             skipped.push(src.to + '（影子仓库缺失，可能未拉取成功）')
@@ -4266,7 +4292,23 @@ module.exports = {
           if (src.file) {
             try {
               await fsP.mkdir(join(src.from, '..'), { recursive: true })
-              await fsP.copyFile(source, src.from)
+              if (!haveSource && haveZst) {
+                const plain = require('node:zlib').zstdDecompressSync(await fsP.readFile(source + '.zst'))
+                const sidecar = String(await fsP.readFile(source + '.sha1', 'utf8').catch(() => '')).trim()
+                let hbDl = { healthy: true }
+                try { hbDl = sqliteHealthyBuf(plain) } catch { }
+                if (!sidecar || sha1HexBuf(plain) !== sidecar) {
+                  skipped.push(src.to + '.zst（sha1 校验不可用/不符，拒绝落地）')
+                  continue
+                }
+                if (!hbDl || hbDl.healthy === false) {
+                  skipped.push(src.to + '.zst（解压后 integrity 不通过，拒绝落地）')
+                  continue
+                }
+                await fsP.writeFile(src.from, plain)
+              } else {
+                await fsP.copyFile(source, src.from)
+              }
               applied.push(src.to)
             } catch {}
           } else if (group.name === 'sessions') {
