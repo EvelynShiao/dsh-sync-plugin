@@ -175,6 +175,8 @@ function syncSettingsSchema(S) {
     knowledgeStrategy: S.string(),
     memoryStrategy: S.string(),
     sessionsParts: S.boolean(),
+    // [exp/text-export 9999.9.44-exp.1] C 车道实验开关（默认关）：true=sqlite 走确定序 JSONL 导出/重建
+    sqliteJsonlLane: S.boolean(),
     sessionsDeleteSync: S.boolean(),
     uploadOverwrite: S.boolean(),
     snapshotSkills: S.boolean(),
@@ -326,7 +328,7 @@ function writeProfileFileSync(effIn, clearToken) {
   }
   const eff = effIn
   const vals = {}
-  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB','gcOrphanRatio','gcOrphanMinPackMB','rebuildAutoEnabled']) vals[k] = eff[k]
+  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB','gcOrphanRatio','gcOrphanMinPackMB','rebuildAutoEnabled','sqliteJsonlLane']) vals[k] = eff[k]
   for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
   for (const k of ['intervalMinutes','snapshotLocalKeep']) vals[k] = eff[k]
   if (keptToken && !vals.token) vals.token = keptToken
@@ -509,6 +511,9 @@ async function atomicWriteFile(file, content) {
    兼容：本端 zlib 无 zstd → 自动回落 raw 行为（上传拷 raw、下载认 raw），功能惰性失效不炸；
    新旧版本混跑窗口：旧端读不到 .sqlite raw 会跳过该组（不坏数据，等对端下次上传即恢复）。 */
 const SQLITE_ZSTD_ENABLED = (() => { try { const z = require('node:zlib'); return typeof z.zstdCompressSync === 'function' && typeof z.zstdDecompressSync === 'function' } catch { return false } })()
+/* [exp/text-export 9999.9.44-exp.1] C 车道实验模块：node:sqlite（node ≥22.5）缺失/异常时为 null，车道自动回落 raw */
+let sqliteJsonl = null
+try { sqliteJsonl = require('./sqlite-jsonl') } catch {}
 function sha1HexBuf(buf) { return createHash('sha1').update(buf).digest('hex') }
 
 // ── Git CLI (token stays out of .git/config — authed URL per command) ──
@@ -4061,10 +4066,20 @@ module.exports = {
                  代价：云端 raw blob 比 .zst 大 2.6 倍，由攒轮数手动删仓重建+gc 体积线兜底。
                  旧 .zst/.sha1 顺手清掉（删除随 commit 传导到云端）；下载端 raw 优先+
                  .zst 解压兼容分支保留不动（云端 tip 仍是旧版 .zst 时照样能拉）。 */
-              await fsP.copyFile(src.from, target)
-              if (/\.sqlite$/i.test(String(src.to))) {
+              if (/\.sqlite$/i.test(String(src.to)) && eff.sqliteJsonlLane === true && sqliteJsonl) {
+                /* [exp/text-export 9999.9.44-exp.1] C 车道（实验，默认关）：确定序 JSONL 导出，
+                   raw/.zst/.sha1 全清——逻辑内容不变时 JSONL 字节相同 → git nothing to commit → 真传 0。 */
+                await sqliteJsonl.exportSqliteJsonl(src.from, target + '.jsonl')
+                await fsP.rm(target, { force: true })
                 await fsP.rm(target + '.zst', { force: true })
                 await fsP.rm(target + '.sha1', { force: true })
+              } else {
+                await fsP.copyFile(src.from, target)
+                if (/\.sqlite$/i.test(String(src.to))) {
+                  await fsP.rm(target + '.zst', { force: true })
+                  await fsP.rm(target + '.sha1', { force: true })
+                  await fsP.rm(target + '.jsonl', { force: true })
+                }
               }
             } catch {}
           } else if (group.name === 'sessions') {
@@ -4296,7 +4311,11 @@ module.exports = {
           const haveZst = !haveSource && isSqliteSrc && SQLITE_ZSTD_ENABLED
             ? await fsP.access(source + '.zst').then(() => true).catch(() => false)
             : false
-          if (!haveSource && !haveZst) {
+          /* [exp/text-export 9999.9.44-exp.1] C 车道（实验，默认关）：raw/.zst 都缺且开关开 → 尝试 <source>.jsonl */
+          const haveJsonl = !haveSource && !haveZst && isSqliteSrc && eff.sqliteJsonlLane === true && sqliteJsonl
+            ? await fsP.access(source + '.jsonl').then(() => true).catch(() => false)
+            : false
+          if (!haveSource && !haveZst && !haveJsonl) {
             // [fix-2] 老代码直接 continue 且不吭声，于是「远端有但仓库没拉到」
             // 和「本机没装」长得一模一样——都表现为静默跳过 + 下载完成
             skipped.push(src.to + '（影子仓库缺失，可能未拉取成功）')
@@ -4319,6 +4338,19 @@ module.exports = {
                   continue
                 }
                 await fsP.writeFile(src.from, plain)
+              } else if (!haveSource && haveJsonl) {
+                /* [exp/text-export] JSONL 重建→临时库→integrity 门→落地（无 sidecar：
+                   git blob 自身一致 + integrity 双保险；FTS 族不导，宿主 initFts 自愈）。 */
+                const tmpRebuild = src.from + '.jsonl-rebuild.tmp'
+                sqliteJsonl.rebuildSqliteFromJsonl(source + '.jsonl', tmpRebuild)
+                const plainJ = await fsP.readFile(tmpRebuild)
+                let hbJ = { healthy: true }
+                try { hbJ = sqliteHealthyBuf(plainJ) } catch { }
+                if (!hbJ || hbJ.healthy === false) {
+                  skipped.push(src.to + '.jsonl（重建后 integrity 不通过，拒绝落地）')
+                  continue
+                }
+                await fsP.writeFile(src.from, plainJ)
               } else {
                 await fsP.copyFile(source, src.from)
               }
