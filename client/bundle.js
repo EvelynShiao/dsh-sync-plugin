@@ -112,6 +112,10 @@ window.__ModuleLoader__.load({
       downloadBtn: '下载',
       uploadHint: '本地 → 云端：把本机的会话、设置、插件清单、技能、知识库推上去',
       downloadHint: '云端 → 本地：从云端拉取并覆盖本地（覆盖前自动拍安全快照，可回滚）',
+      stopBtn: '停止同步',
+      stopHint: '安全停止当前同步：杀掉在跑的 git 进程树，锁与半截包自动清理，可立即重试',
+      stopDone: '已停止（终止 git 进程）',
+      stopNone: '当前没有进行中的同步',
       strategyStandalone: '各机独立（本机专属目录，与对方互不覆盖）',
       strategyMerge: '共用同一份（同一路径；上传=覆盖云端，下载=覆盖本地）',
       save: '保存',
@@ -248,6 +252,10 @@ window.__ModuleLoader__.load({
       downloadBtn: 'Download',
       uploadHint: 'Local → remote: push sessions, settings, plugins, skills and knowledge',
       downloadHint: 'Remote → local: pull and overwrite local (safety snapshot first)',
+      stopBtn: 'Stop sync',
+      stopHint: 'Safely stop the running sync: kills the git process tree; locks and partial packs are auto-cleaned, retry immediately',
+      stopDone: 'Stopped (git processes killed)',
+      stopNone: 'No sync running',
       strategyStandalone: 'Separate per machine (private dir under backup/, neither side overwrites the other)',
       strategyMerge: 'Shared (same path; upload overwrites cloud, download overwrites local)',
       save: 'Save',
@@ -829,6 +837,16 @@ window.__ModuleLoader__.load({
         } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
         finally { setBusy(false); refresh() }
       }
+      // [2026-11-15 安全停止] 杀掉在跑的 git 进程树；.lock 随原请求 finally 释放，tmp_pack 由 clearStaleGitLock 清
+      const doStop = async () => {
+        try {
+          const r = await fetch(API + '/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+          const d = await r.json().catch(() => ({}))
+          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+          onToast(t('stopDone') + ' ×' + (d.stopped || 0), 2600)
+        } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 3200) }
+        finally { refresh() }
+      }
       // [2026-11-10 仓库维护] 只读体积画像 + 手动删仓重建（危险，confirm 后走服务端同款主体）
       const repoInfoText = (d) => {
         if (d.rebuilt) return '✔ ' + (d.rebuildDetail || t('rebuildDone'))
@@ -1079,7 +1097,8 @@ window.__ModuleLoader__.load({
                 h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
                 h('span', { className: 'sk-spacer' }),
                 h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('uploadHint'), onClick: doUpload }, t('uploadBtn')),
-                h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn'))))
+                h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn')),
+                h(ButtonLite, { disabled: !busy, title: t('stopHint'), onClick: doStop }, t('stopBtn'))))
       } catch (renderErr) {
         ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))
         body = h('div', { className: 'sk-card', style: { color: 'var(--dsw-alias-state-error-primary)' } },

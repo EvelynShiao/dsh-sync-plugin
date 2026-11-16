@@ -75,7 +75,7 @@ if (!Schema) {
 
 const GITCODE_API_BASE = 'https://api.gitcode.com/api/v5'
 const MAX_BODY_BYTES = 64 * 1024
-const SYNC_TIMEOUT_MS = 30 * 60 * 1000
+const SYNC_TIMEOUT_MS = 10 * 60 * 1000
 const CONFLICT_RUN_TIMEOUT_MS = 30 * 60 * 1000
 const CONFLICT_RUN_OUTPUT_CAP = 256 * 1024
 
@@ -513,9 +513,31 @@ function sha1HexBuf(buf) { return createHash('sha1').update(buf).digest('hex') }
 
 // ── Git CLI (token stays out of .git/config — authed URL per command) ──
 
+/* [2026-11-15 安全停止] 在跑 git 子进程登记表：POST /dsh-sync/api/stop → stopActiveGitJobs()。
+   Windows 用 taskkill /T /F 树杀（连带 git-remote-https / index-pack），POSIX SIGTERM→3s 后 SIGKILL。
+   被杀 git 令 execFile 回调报错 → runUpload/runDownload 原路抛错，.lock 在 handler finally 释放；
+   半截 tmp_pack 残留由 clearStaleGitLock 扩展清理（只在持 .lock 时调用 = 必无活 git，安全）。 */
+const activeGitChildren = new Set()
+function stopActiveGitJobs() {
+  let n = 0
+  for (const ch of activeGitChildren) {
+    try {
+      if (process.platform === 'win32') {
+        require('node:child_process').spawn('taskkill', ['/PID', String(ch.pid), '/T', '/F'], { stdio: 'ignore' })
+      } else {
+        ch.kill('SIGTERM')
+        setTimeout(() => { try { ch.kill('SIGKILL') } catch { } }, 3000).unref?.()
+      }
+    } catch { }
+    n++
+  }
+  return n
+}
+
 function gitExec(binary, args, cwd) {
   return new Promise((fulfil, reject) => {
-    execFile(binary, args, { cwd, timeout: 30 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(binary, args, { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      activeGitChildren.delete(child)
       if (error) {
         const tail = String(stderr || error.message || '').split(/\r?\n/).filter(Boolean).slice(-3).join(' ')
         reject(new Error(`git ${args[0]}: ${tail || error.message}`))
@@ -523,6 +545,7 @@ function gitExec(binary, args, cwd) {
       }
       fulfil(String(stdout))
     })
+    activeGitChildren.add(child)
   })
 }
 
@@ -534,7 +557,8 @@ function gitExec(binary, args, cwd) {
    全量（截 4000 字符，保住 remote 横幅），供 pushWithSelfHeal 自愈阶梯匹配。 */
 function gitExecOut(binary, args, cwd) {
   return new Promise((fulfil, reject) => {
-    execFile(binary, args, { cwd, timeout: 30 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(binary, args, { cwd, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      activeGitChildren.delete(child)
       const errText = String(stderr || '')
       if (error) {
         const flat = errText.replace(/\r/g, '').split(/\r?\n/).filter(Boolean).join(' ')
@@ -543,16 +567,19 @@ function gitExecOut(binary, args, cwd) {
       }
       fulfil(String(stdout || '') + (errText.trim() ? '\n' + errText : ''))
     })
+    activeGitChildren.add(child)
   })
 }
 
 function gitShowBuf(binary, rev, cwd) {
   // raw bytes for binary-safe compare/copy (session logs are zstd)
   return new Promise((fulfil, reject) => {
-    execFile(binary, ['show', rev], { cwd, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }, (error, stdout) => {
+    const child = execFile(binary, ['show', rev], { cwd, maxBuffer: 64 * 1024 * 1024, encoding: 'buffer' }, (error, stdout) => {
+      activeGitChildren.delete(child)
       if (error) { reject(new Error(`git show: ${String(error.message || '')}`)); return }
       fulfil(stdout)
     })
+    activeGitChildren.add(child)
   })
 }
 
@@ -1669,8 +1696,17 @@ async function applyWorkspaceOrder(order, ctx) {
 // 同步在跑，所以此刻若 index.lock 还在 = 上次中断的残留，安全删除。
 async function clearStaleGitLock(repoDir) {
   const lock = join(repoDir, '.git', 'index.lock')
-  try { await fsP.access(lock); } catch { return false }
-  try { await fsP.unlink(lock); return true } catch { return false }
+  let removed = false
+  try { await fsP.access(lock); await fsP.unlink(lock); removed = true } catch { }
+  /* [2026-11-15 安全停止配套] 被 10min 超时/停止按钮杀掉的 fetch 会留 tmp_pack_* 半截包
+     （git 判定 garbage，喂大仓库画像）。本函数只在持有 sync .lock 时被调 = 必无活 git，清之安全。 */
+  try {
+    const packDir = join(repoDir, '.git', 'objects', 'pack')
+    for (const ent of await fsP.readdir(packDir).catch(() => [])) {
+      if (String(ent).startsWith('tmp_pack_')) await fsP.rm(join(packDir, ent), { force: true }).catch(() => { })
+    }
+  } catch { }
+  return removed
 }
 
 // ── 下载后归一化 + 去重（跨设备兼容的核心）──
@@ -4958,6 +4994,14 @@ module.exports = {
               sendJson(res, 200, { ...r, safetySnapshot: safetyName })
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
             finally { release() }
+            return
+          }
+
+          // POST /dsh-sync/api/stop → 安全停止当前同步（杀 git 进程树；.lock 随原请求 finally 释放）
+          if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/stop')) {
+            const n = stopActiveGitJobs()
+            if (n === 0) { sendJson(res, 400, { error: '当前没有正在运行的同步 git 进程' }); return }
+            sendJson(res, 200, { stopped: n })
             return
           }
 
