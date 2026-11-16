@@ -4053,16 +4053,18 @@ module.exports = {
             try {
               await fsP.access(src.from)
               await fsP.mkdir(join(target, '..'), { recursive: true })
-              /* [2026-11-15 C1 sqlite zstd 车道] 压缩落影子仓：<to>.zst + <to>.sha1，同名 raw（含 -wal/-shm 残留）删除 */
-              if (/\.sqlite$/i.test(String(src.to)) && SQLITE_ZSTD_ENABLED) {
-                const bufUp = await fsP.readFile(src.from)
-                const zlibC = require('node:zlib')
-                await fsP.writeFile(target + '.zst', zlibC.zstdCompressSync(bufUp))
-                await fsP.writeFile(target + '.sha1', sha1HexBuf(bufUp) + '\n')
-                await fsP.rm(target, { force: true })
-                for (const ext of ['-wal', '-shm']) await fsP.rm(target + ext, { force: true })
-              } else {
-                await fsP.copyFile(src.from, target)
+              /* [2026-11-16 9999.9.43 raw 直进 git·探针定案] sqlite 车道退役 zstd 打包，直接落 raw：
+                 探针实测（sqlite-delta-probe.mjs）git thin pack 客户端自动 delta——
+                 knowledge 零变化真传 0MB、memory +117 行 0.12MB，比 zstd 整包 11.59/2.79MB
+                 省 96-100%，与 patch-from/JSONL 同档而零新协议零依赖；9999.9.42 auto-squash
+                 退役后提交链保留旧版 blob = thin pack 永远有 delta 基准，差量永远成立。
+                 代价：云端 raw blob 比 .zst 大 2.6 倍，由攒轮数手动删仓重建+gc 体积线兜底。
+                 旧 .zst/.sha1 顺手清掉（删除随 commit 传导到云端）；下载端 raw 优先+
+                 .zst 解压兼容分支保留不动（云端 tip 仍是旧版 .zst 时照样能拉）。 */
+              await fsP.copyFile(src.from, target)
+              if (/\.sqlite$/i.test(String(src.to))) {
+                await fsP.rm(target + '.zst', { force: true })
+                await fsP.rm(target + '.sha1', { force: true })
               }
             } catch {}
           } else if (group.name === 'sessions') {
