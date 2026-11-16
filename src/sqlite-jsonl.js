@@ -1,6 +1,8 @@
 'use strict'
 
-/* [exp/text-export 9999.9.44-exp.1] C 车道：sqlite 确定序 JSONL 导出/重建（实验，默认关）
+/* [exp/text-export 9999.9.44-exp.2] C 车道：sqlite 确定序 JSONL 导出/重建（实验，默认关）
+ * exp.2：重建库连接关闭 FK 强制（node:sqlite 默认开，字母序插行子表先于父表必炸），
+ *        返回值带 foreign_key_check 画像——live 库悬空引用（宿主 FK 关闭删父行所留）忠实还原。
  *
  * 为什么：2026-11-16 探针（sqlite-delta-probe.mjs）显示逻辑级 diff 对 sqlite 物理页噪声
  * 免疫——knowledge 零变化时 JSONL 字节相同=真传 0，而 raw 直进 git 依赖二进制 delta 对
@@ -59,7 +61,10 @@ function rebuildSqliteFromJsonl(jsonlPath, outPath) {
   try { fs.rmSync(outPath + '-wal', { force: true }) } catch {}
   try { fs.rmSync(outPath + '-shm', { force: true }) } catch {}
   const lines = fs.readFileSync(jsonlPath, 'utf8').split('\n').filter(Boolean)
-  const db = new DatabaseSync(outPath)
+  // FK 强制必须关（9999.9.44-exp.2）：node:sqlite 默认 enableForeignKeyConstraints=true，
+  // 而行按表名字母序插，子表（memories/task_context_marks 等）会先于父表（memory_directories/tasks）
+  // 落库 → FOREIGN KEY constraint failed。schema 里 REFERENCES 定义原样保留，落地前 foreign_key_check 画像随返回值带出。
+  const db = new DatabaseSync(outPath, { enableForeignKeyConstraints: false })
   try {
     for (const line of lines) {
       const o = JSON.parse(line)
@@ -78,7 +83,8 @@ function rebuildSqliteFromJsonl(jsonlPath, outPath) {
       db.prepare(`INSERT INTO "${o.t}" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals)
       n++
     }
-    return { lines: lines.length, rows: n }
+    const fkBad = db.prepare('PRAGMA foreign_key_check').all()
+    return { lines: lines.length, rows: n, fkViolations: fkBad.length, fkDetail: fkBad.slice(0, 20) }
   } finally { db.close() }
 }
 
