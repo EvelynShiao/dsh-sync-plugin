@@ -1978,6 +1978,10 @@ async function forceRebuildCloudRepo(eff, repoDir, state, logger, reason) {
     if (!create.ok) return { ok: false, mode: null, detail: `重建仓库失败 HTTP ${create.status}: ${String((create.json && create.json.message) || create.text || '').slice(0, 120)}` }
     const remote = authedUrl(eff.repoUrl, eff.token)
     await gitExec(eff.gitBinary, ['push', remote, `HEAD:${eff.branch}`], repoDir)
+    /* [2026-11-16 9999.9.42] 重建=新基线，「距上次重建上传轮数」清零
+       （compact 模式不算重建不清零；落盘由调用方 saveState：手动按钮 handler /
+       runUpload 的计数递增段各有一次）。 */
+    state.uploadsSinceSquash = 0
     warn('删仓重建完成，基线已重推（sha 不变，各端无感知）')
     return { ok: true, mode: 'rebuild', detail: '删仓重建完成，基线已重推（sha 不变，各端无感知）' }
   } catch (e) {
@@ -4216,45 +4220,16 @@ module.exports = {
       }
       state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
       state.lastSyncAt = new Date().toISOString()
-      /* [2026-11-15 抗堵 v1] squash 计数器（shallow 化后 rev-list 失明，state 兜底） */
+      /* [2026-11-16 9999.9.42 auto-squash 退役·用户定案「攒N轮以及是否删仓由我手动控制」]
+         用户不要历史版本，squash 的唯一意义是摊薄「对端断亲→整包重下」的代价；
+         改由设置页「仓库维护」手动删仓重建接管（forceRebuildCloudRepo：
+         Compact→删仓→bundle 保险→基线重推），体积超限自动兜底
+         （rebuildCloudRepoIfBloated，rebuildAutoEnabled 可关）保留不动。
+         uploadsSinceSquash 语义改为「距上次重建上传轮数」：每轮成功上传 +1，
+         forceRebuildCloudRepo 重建成功时清零，GET /api/repo/check 暴露
+         roundsSinceRebuild 供 UI 维护块显示。 */
       state.uploadsSinceSquash = (Number(state && state.uploadsSinceSquash) || 0) + 1
       await saveState()
-      /* [自动瘦身 2026-10-25 v2 按用户定案收紧] 用户原话「超过1个就拍成0个」——
-         云端不保留任何历史版本，每次有变化的上传后立刻归 1（git 仓最少 1 个提交，
-         「0 个」的实现就是恒 1）。「有变化的会话」产生的新 blob 只活一轮：
-         下次 squash 时旧 blob 随 force push 不可达，云端体积恒 ≈ 最新快照大小。
-         安全性不变：squash 的是已推送提交；失败自动跳过下轮再试；
-         工作区内容 squash 前后逐字节不变；本地磁盘才是真源，云端零历史无回滚损失。 */
-      try {
-        /* 🔥 gitExec 返回字符串本身（String(stdout)），不是 {stdout} 对象——
-           上一版 countOut.stdout 恒 undefined → commitCount NaN → squash 永不触发。
-           双端三次上传实测零 squash 的真因（2026-10-26 复盘）。 */
-        const countOut = await gitExec(eff.gitBinary, ['rev-list', '--count', 'HEAD'], repoDir)
-        /* [2026-11-15 抗堵 v1] squash 线 1→20 次 + pack 300MB 体积线 + state 计数兜底：
-           ① fetch --depth 1 后影子仓 shallow 化，rev-list 计数失明（恒小），必须用 state.uploadsSinceSquash 兜底；
-           ② 收紧 squash 频率是多机止血的关键——对端每次 squash+force push = 本端下次 fetch 全量重下
-           （2026-11-15 实测：云端重建后 15 分钟内又被手机重写为 957691a，本端 83c13f2 立即过期）；
-           ③ 体积线兜底：两次 squash 之间 pack 只增不减，≥300MB 重拍（GitCode compact 服务端 GC 零重传）。 */
-        const commitCount = Math.max(Number(String(countOut ?? '').trim()) || 0, Number(state && state.uploadsSinceSquash) || 0)
-        let squashPackMB = 0
-        try { const coSquash = await gitExec(eff.gitBinary, ['count-objects', '-v'], repoDir); const mPack = /size-pack:\s*(\d+)/.exec(String(coSquash)); if (mPack) squashPackMB = Number(mPack[1]) / 1024 } catch { }
-        if (Number.isFinite(commitCount) && (commitCount > 20 || squashPackMB > 300)) {
-          ctx.logger?.info?.(`dsh-sync: auto-squash: 提交数 ${commitCount}>20 或 pack ${squashPackMB.toFixed(0)}MB>300，重写单提交基线…`)
-          await gitExec(eff.gitBinary, ['checkout', '--orphan', '__autosquash__'], repoDir)
-          await gitExec(eff.gitBinary, ['add', '-A'], repoDir)
-          await gitExec(eff.gitBinary, ['-c', 'user.name=dsh-sync', '-c', 'user.email=dsh-sync@local', 'commit', '-m', `auto-squash: 单提交基线（原 ${commitCount} 份历史快照已合并，内容不变）`], repoDir)
-          await gitExec(eff.gitBinary, ['branch', '-D', eff.branch], repoDir)
-          await gitExec(eff.gitBinary, ['branch', '-M', eff.branch], repoDir)
-          const pushOutSq = await pushWithSelfHeal(eff.gitBinary, ['push', '-f', remote, `HEAD:${eff.branch}`], repoDir, eff, state, ctx.logger)
-          await rebuildCloudRepoIfBloated(pushOutSq, eff, repoDir, state, ctx.logger)
-          state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
-          state.uploadsSinceSquash = 0
-          await saveState()
-          ctx.logger?.info?.(`dsh-sync: auto-squash 完成：${commitCount} → 1 份基线，已 force push`)
-        }
-      } catch (e) {
-        ctx.logger?.warn?.(`dsh-sync: auto-squash 跳过（不影响本次上传）：` + String((e && e.message) || e))
-      }
       // 无条件清理：原来 prune 只在 snapshotAuto !== false 的分支里，
       // 用户关掉每日自动快照后日常同步就永远不清理 → 上限形同虚设（曾堆到 16 份）。
       try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
@@ -5220,6 +5195,8 @@ module.exports = {
                 orphans: st.orphans, orphanRatio: Math.round(st.orphanRatio * 1000) / 1000,
                 gcThresholdMb: gcThreshold, orphanLinePct: Math.round(ratioLine * 100),
                 gcOrphanMinPackMB: floorMb, rebuildAutoEnabled: eff.rebuildAutoEnabled !== false,
+                // [2026-11-16 9999.9.42] auto-squash 退役后语义=「距上次重建上传轮数」，UI 维护块显示
+                roundsSinceRebuild: Number(state && state.uploadsSinceSquash) || 0,
                 needGc, commit,
                 // [2026-11-11 多平台] 平台画像：platform/label 供维护块徽标；rebuildSupported 决定按钮可用
                 platform: pd ? pd.platform : null, platformLabel: pd ? pd.label : null,
@@ -5240,6 +5217,9 @@ module.exports = {
             if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行，稍后再试' }); return }
             try {
               const r = await forceRebuildCloudRepo(eff, repoDir, state, ctx.logger, '手动删仓重建（设置页按钮）')
+              /* [2026-11-16 9999.9.42] rebuild 成功时 forceRebuildCloudRepo 已清零轮数计数，
+                 此处落盘（自动路径由 runUpload 计数段 saveState 兜住）。 */
+              if (r.ok) { try { await saveState() } catch {} }
               sendJson(res, r.ok ? 200 : 400, r)
             } catch (e) { sendJson(res, 500, { error: String((e && e.message) || e) }) }
             finally { release() }

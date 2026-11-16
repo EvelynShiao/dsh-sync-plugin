@@ -80,6 +80,7 @@ window.__ModuleLoader__.load({
       syncDone: '同步完成',
       syncFailed: '同步失败',
       repoMaintTitle: '仓库维护',
+      repoRoundsLine: '距上次重建',
       repoCheckBtn: '检查仓库体积',
       rebuildBtn: '删仓重建（危险）',
       rebuildHint: '删除云端仓库并重建 + 重推当前基线（云端历史清零、基线 sha 不变、各端无感知）。仅在平台报体积超限且自动自愈无效时使用。删仓重建需令牌带 delete_repo 权限',
@@ -220,6 +221,7 @@ window.__ModuleLoader__.load({
       syncDone: 'Sync complete',
       syncFailed: 'Sync failed',
       repoMaintTitle: 'Repo maintenance',
+      repoRoundsLine: 'Rounds since last rebuild',
       repoCheckBtn: 'Check repo size',
       rebuildBtn: 'Rebuild cloud repo (danger)',
       rebuildHint: 'Deletes the remote repo, recreates it and re-pushes the current baseline (remote history reset, baseline sha unchanged, other devices unaffected). Only for size-limit cases where auto self-heal failed. Repo rebuild needs a token with delete_repo',
@@ -856,6 +858,8 @@ window.__ModuleLoader__.load({
           `${t('repoPlatformLine')}: ${d.platformLabel || '-'} · ${d.rebuildAutoEnabled === false ? '⛔ ' + t('rebuildAutoLabel') : '✔ ' + t('rebuildAutoLabel')}`,
           `${t('repoPackLine')}: ${d.mb}MB · ${d.inPack} obj · ${t('repoOrphans')} ${d.orphans}/${d.inPack} (${pct}%) · ${t('repoLoose')} ${d.loose}`,
           `${t('repoCommit')}: ${String(d.commit || '-').slice(0, 10)} · ${t('repoCheckLines')}: ${d.gcThresholdMb}MB / ${d.orphanLinePct}% / ${d.gcOrphanMinPackMB ?? 64}MB`,
+          // [2026-11-16 9999.9.42] auto-squash 退役后展示「距上次重建 N 轮」，删仓时机由用户手动决定
+          `${t('repoRoundsLine')}: ${d.roundsSinceRebuild ?? '-'}`,
           d.needGc ? t('repoCheckNeedGc') : t('repoCheckHealthy'),
         ].join('\n')
       }
