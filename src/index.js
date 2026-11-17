@@ -177,6 +177,10 @@ function syncSettingsSchema(S) {
     sessionsParts: S.boolean(),
     // [exp/text-export 9999.9.44-exp.1] C 车道实验开关（默认关）：true=sqlite 走确定序 JSONL 导出/重建
     sqliteJsonlLane: S.boolean(),
+    // [exp/text-export 9999.9.44-exp.3] C 方案扩展到 sessions（2026-11-17 用户拍板"所有同步都要 C 方案"）：
+    // true=会话上传走「解多帧 .zstd → 确定序 jsonl 文本」（git 行级 delta，不再堆二进制 blob 历史），
+    // 下载走「jsonl → 重建单帧 .zstd（自证逐行一致）→ 完整性门 → 落地」
+    sessionsJsonlLane: S.boolean(),
     sessionsDeleteSync: S.boolean(),
     uploadOverwrite: S.boolean(),
     snapshotSkills: S.boolean(),
@@ -328,7 +332,7 @@ function writeProfileFileSync(effIn, clearToken) {
   }
   const eff = effIn
   const vals = {}
-  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB','gcOrphanRatio','gcOrphanMinPackMB','rebuildAutoEnabled','sqliteJsonlLane']) vals[k] = eff[k]
+  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB','gcOrphanRatio','gcOrphanMinPackMB','rebuildAutoEnabled','sqliteJsonlLane','sessionsJsonlLane']) vals[k] = eff[k]
   for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
   for (const k of ['intervalMinutes','snapshotLocalKeep']) vals[k] = eff[k]
   if (keptToken && !vals.token) vals.token = keptToken
@@ -514,6 +518,9 @@ const SQLITE_ZSTD_ENABLED = (() => { try { const z = require('node:zlib'); retur
 /* [exp/text-export 9999.9.44-exp.1] C 车道实验模块：node:sqlite（node ≥22.5）缺失/异常时为 null，车道自动回落 raw */
 let sqliteJsonl = null
 try { sqliteJsonl = require('./sqlite-jsonl') } catch {}
+/* [exp.3] 会话 JSONL 车道模块（RFC8878 帧解析导出 / 单帧重建自证） */
+let sessionsJsonl = null
+try { sessionsJsonl = require('./sessions-jsonl') } catch {}
 function sha1HexBuf(buf) { return createHash('sha1').update(buf).digest('hex') }
 
 // ── Git CLI (token stays out of .git/config — authed URL per command) ──
@@ -2730,9 +2737,17 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     const m = p.match(/^(.+)\/session\.v4\.jsonl\.zstd\.part\d{4}$/)
     if (m) partDirs.set(m[1], true)
   }
-  // 主循环：跳过 part 文件，其余按原逻辑
+  /* [exp.3 会话 JSONL 化] 预扫描 jsonl 会话路径（sessionsJsonlLane 云端形态），
+     主循环跳过、独立循环「前缀比对 → 重建单帧 .zstd（自证）→ 完整性门 → 落地」。 */
+  const jsonlDirs = new Map() // shadowRelDir -> true
+  for (const p of changed) {
+    const m = p.match(/^(sessions\/ws\/.+\/session-[^/]+)\/session\.v4\.jsonl$/)
+    if (m) jsonlDirs.set(m[1], true)
+  }
+  // 主循环：跳过 part 文件与 jsonl 会话，其余按原逻辑
   for (const p of changed) {
     if (partDirs.has(p.slice(0, p.lastIndexOf('/')))) continue
+    if (jsonlDirs.has(p.slice(0, p.lastIndexOf('/')))) continue
     const livePath = resolveLivePath(spec, p)
     if (!livePath) { skipped++; continue }
     let liveBuf = null
@@ -2806,6 +2821,39 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     if (!await gateSessionPayload(liveZstdPath, remoteBuf, logger)) { skipped++; continue }
     try {
       await atomicWriteFile(liveZstdPath, remoteBuf)
+      applied++
+    } catch { skipped++ }
+  }
+  /* [exp.3 会话 JSONL 化] 云端 jsonl → 前缀比对 → 重建单帧 .zstd（自证）→ 完整性门 → 落地。
+     live 永远是宿主原生 .zstd 形态，jsonl 不落地。
+     前缀语义：会话 append-only——本地行是云端行的前缀且更长=本地已含云端（skip 等上传）；
+     云端更长=本地缺新行→重建落地；前缀不一致=双线分叉→保守 skip 记 pendingBoth。 */
+  for (const jsonlDir of jsonlDirs.keys()) {
+    const shadowRel = jsonlDir
+    const liveZstdPath = resolveLivePath(spec, shadowRel + '/session.v4.jsonl.zstd')
+    if (!liveZstdPath) { skipped++; continue }
+    let remoteBuf = null
+    try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${shadowRel}/session.v4.jsonl`, repoDir) } catch { remoteBuf = null }
+    if (remoteBuf === null) { skipped++; continue }
+    const cloudLines = remoteBuf.toString('utf8').split('\n').filter(Boolean)
+    if (!cloudLines.length) { skipped++; continue }
+    let liveLines = []
+    try { liveLines = sessionsJsonl ? sessionsJsonl.sessionZstdLines(liveZstdPath) : [] } catch { liveLines = [] }
+    const mLen = Math.min(liveLines.length, cloudLines.length)
+    let prefixSame = true
+    for (let i = 0; i < mLen; i++) if (liveLines[i] !== cloudLines[i]) { prefixSame = false; break }
+    if (prefixSame && liveLines.length >= cloudLines.length) { skipped++; continue }
+    if (!prefixSame) {
+      const pendKey = shadowRel + '/session.v4.jsonl.zstd'
+      if (!state.pendingBoth[pendKey]) state.pendingBoth[pendKey] = lastSynced
+      skipped++
+      continue
+    }
+    let rebuilt = null
+    try { rebuilt = sessionsJsonl.buildSessionZstd(cloudLines) } catch { skipped++; continue }
+    if (!await gateSessionPayload(liveZstdPath, rebuilt, logger)) { skipped++; continue }
+    try {
+      await atomicWriteFile(liveZstdPath, rebuilt)
       applied++
     } catch { skipped++ }
   }
@@ -4111,6 +4159,34 @@ module.exports = {
                 try { filesUp = await fsP.readdir(sPath) } catch {}
                 const zst = filesUp.find(x => x.endsWith('.zstd'))
                 if (!zst) continue
+                /* [exp.3 会话 JSONL 化] sessionsJsonlLane=true：本地 .zstd 解帧 → 确定序 jsonl 上云。
+                   git pack 层自动只传新增行 delta（2026-11-17 用户拍板：所有同步都要 C 方案，
+                   会话二进制 blob 不再进历史）。云端旧 .zstd/.part* 互斥清理。
+                   门槛=解出 ≥1 行（顺带修掉「新会话内容少被 1KB 门槛跳过不上云」的旧账）。 */
+                if (eff.sessionsJsonlLane === true && sessionsJsonl) {
+                  try {
+                    const lines = sessionsJsonl.sessionZstdLines(join(sPath, zst))
+                    if (!lines.length) { skipped.push(s.name + ' (解帧 0 行，跳过)'); continue }
+                    const sha1 = sessionsJsonl.sha1Of(lines)
+                    const cloudSessJ = join(wsTarget, s.name)
+                    const cloudJsonlJ = join(cloudSessJ, 'session.v4.jsonl')
+                    let curSha1 = null
+                    try {
+                      const curText = await fsP.readFile(cloudJsonlJ, 'utf8')
+                      curSha1 = sessionsJsonl.sha1Of(curText.split('\n').filter(Boolean))
+                    } catch {}
+                    if (curSha1 !== sha1) {
+                      await fsP.mkdir(cloudSessJ, { recursive: true })
+                      /* 互斥清理：云端旧 .zstd 与 part 分片一并移除（C 形态唯一） */
+                      for (const f of await fsP.readdir(cloudSessJ).catch(() => [])) {
+                        if (f === 'session.v4.jsonl.zstd' || /^session\.v4\.jsonl\.zstd\.part\d{4}$/.test(f)) { try { await fsP.rm(join(cloudSessJ, f), { force: true }) } catch {} }
+                      }
+                      await fsP.writeFile(cloudJsonlJ, lines.join('\n'))
+                    }
+                    uploadedIds.add(s.name)
+                  } catch (e) { try { ctx.logger?.warn?.('[dsh-sync] 会话 JSONL 上传失败 ' + s.name + ': ' + String((e && e.message) || e).slice(0, 120)) } catch {} }
+                  continue
+                }
                 let st = null
                 try { st = await fsP.stat(join(sPath, zst)) } catch {}
                 if (!st || st.size < 1024) continue
