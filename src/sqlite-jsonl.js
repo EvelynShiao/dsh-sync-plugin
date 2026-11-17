@@ -88,4 +88,101 @@ function rebuildSqliteFromJsonl(jsonlPath, outPath) {
   } finally { db.close() }
 }
 
-module.exports = { exportSqliteJsonl, rebuildSqliteFromJsonl }
+/* ── [差量化路线 §B 9999.9.46] sqlite 下载端差量落地（用户拍板「就该差量」，2026-11-17）──
+ *
+ * 为什么：rebuildSqliteFromJsonl 每轮下载全量重建（11689 行逐行 INSERT+integrity），
+ * 手机写盘慢被放大。常态是 append-only：云端 jsonl 相对「上次已知状态」（lane-state 留档）
+ * 只在表尾部追加新行 → 只把尾部新行 INSERT OR REPLACE 进 live 库即可，不再重建文件、
+ * 不再覆盖主文件。任何不确定性（DDL 变化/中间行分叉/表收缩/留档缺失）→ 返回不可差量，
+ * 调用方退回现有全量重建路径（保守兜底）。
+ *
+ * 前缀判定必须【按表分组】：导出行序=表名字母序×rowid 序，多表同时增长时
+ * 整文件前缀必然断裂（tableA 新行会插在 tableB 旧行前面），逐表比前缀才是常态可成立的口径。
+ * FTS 影子表本就不导（exportSqliteJsonl 过滤）→ 留档与云端同构，天然不参与 diff。
+ */
+
+/* 解析 jsonl 文本 → { ddlLines: [原始行], tableLines: { 表名: [原始行] } }。
+   保留原始行字符串做逐行 === 比对（不 JSON.parse，11689 行解析成本省掉）。 */
+function parseJsonlStructure(text) {
+  const ddlLines = []
+  const tableLines = {}
+  for (const line of String(text || '').split('\n')) {
+    if (!line) continue
+    let o = null
+    try { o = JSON.parse(line) } catch { ddlLines.push('\u0000BAD\u0000' + line); continue }
+    if (o && o.k === 'ddl') ddlLines.push(line)
+    else if (o && o.k === 'row' && typeof o.t === 'string') {
+      (tableLines[o.t] = tableLines[o.t] || []).push(line)
+    } else ddlLines.push('\u0000BAD\u0000' + line)
+  }
+  return { ddlLines, tableLines }
+}
+
+/* 差量判定：cloudText（云端 jsonl 全文）vs archiveText（留档全文）。
+   返回 { ok: true, tail: [{ t, lines }] }（tail=各表超出留档的尾部行），
+   或 { ok: false, reason }（调用方必须退回全量重建）。 */
+function planSqliteJsonlDelta(cloudText, archiveText) {
+  let cloud, arch
+  try {
+    cloud = parseJsonlStructure(cloudText)
+    arch = parseJsonlStructure(archiveText)
+  } catch (e) { return { ok: false, reason: 'parse: ' + String((e && e.message) || e) } }
+  if (cloud.ddlLines.length !== arch.ddlLines.length) return { ok: false, reason: 'ddl-count ' + arch.ddlLines.length + '->' + cloud.ddlLines.length }
+  for (let i = 0; i < cloud.ddlLines.length; i++) {
+    if (cloud.ddlLines[i] !== arch.ddlLines[i]) return { ok: false, reason: 'ddl-diff@' + i }
+  }
+  for (const t of Object.keys(arch.tableLines)) {
+    if (!cloud.tableLines[t]) return { ok: false, reason: 'table-removed:' + t }
+  }
+  const tail = []
+  for (const t of Object.keys(cloud.tableLines)) {
+    const cl = cloud.tableLines[t]
+    const al = arch.tableLines[t] || []
+    if (al.length > cl.length) return { ok: false, reason: 'shrink:' + t + ' ' + al.length + '->' + cl.length }
+    for (let i = 0; i < al.length; i++) {
+      if (al[i] !== cl[i]) return { ok: false, reason: 'fork:' + t + '@' + i }
+    }
+    if (cl.length > al.length) tail.push({ t, lines: cl.slice(al.length) })
+  }
+  return { ok: true, tail }
+}
+
+/* 差量应用：开 live 库（与宿主多连接并发安全，WAL 模式）逐行 INSERT OR REPLACE。
+   调用方前置条件：sqliteHealthy(livePath) 已通过。
+   事务包裹：任何一行失败 → ROLLBACK → live 无损（调用方退回全量重建）。
+   成功后 wal_checkpoint(TRUNCATE) 收敛 WAL（可选尽力）。
+   返回 { applied, fkViolations }；抛错=不可差量。 */
+function applySqliteJsonlDelta(livePath, tail) {
+  const db = new DatabaseSync(livePath, { enableForeignKeyConstraints: false })
+  try {
+    db.exec('PRAGMA busy_timeout=3000')
+    db.exec('BEGIN IMMEDIATE')
+    let n = 0
+    try {
+      for (const grp of tail || []) {
+        for (const line of grp.lines) {
+          const o = JSON.parse(line)
+          if (o.k !== 'row') continue
+          const cols = Object.keys(o.r)
+          if (!cols.length) continue
+          const vals = cols.map(c => {
+            const v = o.r[c]
+            return (v && typeof v === 'object' && v.__b64 !== undefined) ? Buffer.from(v.__b64, 'base64') : v
+          })
+          db.prepare(`INSERT OR REPLACE INTO "${o.t}" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals)
+          n++
+        }
+      }
+      db.exec('COMMIT')
+    } catch (e) {
+      try { db.exec('ROLLBACK') } catch {}
+      throw e
+    }
+    try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch {}
+    let fkBad = []
+    try { fkBad = db.prepare('PRAGMA foreign_key_check').all() } catch {}
+    return { applied: n, fkViolations: fkBad.length }
+  } finally { try { db.close() } catch {} }
+}
+
+module.exports = { exportSqliteJsonl, rebuildSqliteFromJsonl, parseJsonlStructure, planSqliteJsonlDelta, applySqliteJsonlDelta }

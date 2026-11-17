@@ -4053,6 +4053,35 @@ module.exports = {
          云端新内容要等下一轮「本机有变化」时才对齐——下载永远不受影响（它有自己的流程），
          上传语义本来就是「以本机为准」，晚一轮对齐无害。 */
       try {
+        /* [差量化路线 §A 9999.9.46] 会话账本全命中判定：本机全部会话 .zstd 的 (size,mtime)
+           与账本（state.sessionsLaneBook，上轮上传成功时落盘）全同 → sessions 组视为未变。
+           为什么需要它：C 形态影子侧只有 session.v4.jsonl（.zstd 已互斥清理），
+           sessionsSignatureForUpload 只统计 .zstd/.part* → 签名永不相等 → 极速短路
+           在 C 形态下从不触发，每轮白跑 git 层（手机 fetch+reset+add ≈ 13s）。
+           诚实边界与原极速短路一致：另一端推了新内容而本机会话恰好没变 → 本轮跳过、
+           晚一轮对齐（上传语义=以本机为准，钦定 9.26）；下载不受影响。 */
+        const sessionsLaneAllHit = async (root) => {
+          try {
+            const book = state.sessionsLaneBook
+            if (!book || typeof book !== 'object') return false
+            const wsMapUp = await loadWorkspaceMap()
+            if (!wsMapUp.length) return false
+            let any = false
+            for (const m of wsMapUp) {
+              let sessUp = []
+              try { sessUp = await fsP.readdir(join(root, m.dirName), { withFileTypes: true }) } catch { continue }
+              for (const s of sessUp) {
+                if (!s.isDirectory() || !s.name.startsWith('session-')) continue
+                const stUp = await fsP.stat(join(root, m.dirName, s.name, 'session.v4.jsonl.zstd')).catch(() => null)
+                if (!stUp) continue   // 无 .zstd 的目录（异常/子代理残留）不参与判定
+                const eUp = book[m.folderKey + '/' + s.name]
+                if (!eUp || Number(eUp.size) !== stUp.size || Number(eUp.mtimeMs) !== stUp.mtimeMs) return false
+                any = true
+              }
+            }
+            return any
+          } catch { return false }
+        }
         const sessionsSignatureForUpload = async (root) => {
           /* 与上传循环完全同口径：sessions/<工作区>/<session-*>/session.v4.jsonl.zstd。
              [2026-11-09] 影子仓可能存 part 链：同时统计 .zstd 与 part* 文件（字节数累加、文件数累加）。
@@ -4094,6 +4123,8 @@ module.exports = {
             const target = join(repoDir, src.to)
             try {
               if (group.name === 'sessions') {
+                /* [差量化 §A] 账本全命中 → sessions 组视为一致（C 形态极速短路的正确口径） */
+                if (await sessionsLaneAllHit(src.from)) continue
                 const sigA = await sessionsSignatureForUpload(src.from)
                 const sigB = await sessionsSignatureForUpload(target)
                 if (sigA !== sigB) { allUnchanged = false; break }
@@ -4187,6 +4218,15 @@ module.exports = {
                    32KB/-wal 0B 长期残留）随 C 形态互斥清理一并移除（删除随 commit 传导）。 */
                 await fsP.rm(target + '-wal', { force: true })
                 await fsP.rm(target + '-shm', { force: true })
+                /* [差量化路线 §B 9999.9.46] 导出成功即留档「本机上次已知云端状态」到
+                   lane-state/<库名>.jsonl：下载端差量落地的比对基准（云端 jsonl 相对留档
+                   的尾部新增行 → 直接 INSERT 进 live，免全量重建）。原子写；写失败只损失
+                   下一轮差量机会（下载端留档缺失自动退回全量重建），不阻断上传。 */
+                try {
+                  const laneDirUp = join(syncDir, 'lane-state')
+                  await fsP.mkdir(laneDirUp, { recursive: true })
+                  await atomicWriteFile(join(laneDirUp, String(src.to).split(/[\\/]/).pop() + '.jsonl'), await fsP.readFile(target + '.jsonl'))
+                } catch (eLaneUp) { try { ctx.logger?.warn?.('[dsh-sync] lane-state 留档失败（不影响上传）: ' + String((eLaneUp && eLaneUp.message) || eLaneUp).slice(0, 120)) } catch {} }
               } else {
                 /* [2026-11-17 挂账③根修 9999.9.44-exp.4] raw copyFile 只拷主文件，-wal 里
                    未合并的写入上不了云（11-17 检验收官记忆两次丢失的根因之一）→ 上传前
@@ -4235,6 +4275,22 @@ module.exports = {
                    门槛=解出 ≥1 行（顺带修掉「新会话内容少被 1KB 门槛跳过不上云」的旧账）。 */
                 if (eff.sessionsJsonlLane === true && sessionsJsonl) {
                   try {
+                    /* [差量化路线 §A 9999.9.46] 会话级体积短路（E 线 (size,mtime) 对账的 C 形态回归，
+                       10-25 f3e8b96 机制在 C 化时丢失）：本地 .zstd 的 (size,mtime) 与账本全同
+                       且云端 jsonl 存在 → 整个会话跳过——不解行、不读云端、不算 sha1。
+                       账本缺失/文件变过 → 走下方现流程，成功后重记账本。
+                       语义对齐 B 车道 (size,mtime) 快路径：本地没变 → 不覆盖云端（云端他机更新
+                       不会被本机旧数据冲掉）；本地变了 → 本地为准（9.26 钦定）照常覆盖。 */
+                    const bookKeyU = ws.folderKey + '/' + s.name
+                    const stZc = await fsP.stat(join(sPath, zst)).catch(() => null)
+                    const bookU = (state.sessionsLaneBook && typeof state.sessionsLaneBook === 'object') ? state.sessionsLaneBook[bookKeyU] : null
+                    if (stZc && bookU && Number(bookU.size) === stZc.size && Number(bookU.mtimeMs) === stZc.mtimeMs) {
+                      const cloudJsonlU = join(wsTarget, s.name, 'session.v4.jsonl')
+                      if (await fsP.access(cloudJsonlU).then(() => true).catch(() => false)) {
+                        uploadedIds.add(s.name)
+                        continue
+                      }
+                    }
                     const lines = sessionsJsonl.sessionZstdLines(join(sPath, zst))
                     if (!lines.length) { skipped.push(s.name + ' (解帧 0 行，跳过)'); continue }
                     /* [exp.5 对齐 B] 单文件体积门对 C 车道生效（jsonl 字节数口径，与 B 段
@@ -4263,6 +4319,13 @@ module.exports = {
                         if (f === 'session.v4.jsonl.zstd' || f === 'session.lock' || /^session\.v4\.jsonl\.zstd\.part\d{4}$/.test(f)) { try { await fsP.rm(join(cloudSessJ, f), { force: true }) } catch {} }
                       }
                       await fsP.writeFile(cloudJsonlJ, lines.join('\n'))
+                    }
+                    /* [差量化 §A] 账本重记：流程走完（无论本轮写没写云端）→ 本地 (size,mtime)
+                       ↔ 云端 sha1 已对齐。写失败走 catch 不会到这里=账本不脏。
+                       落盘时机=push 成功后的 saveState（4406），push 失败账本不落盘。 */
+                    if (stZc) {
+                      if (!state.sessionsLaneBook || typeof state.sessionsLaneBook !== 'object') state.sessionsLaneBook = {}
+                      state.sessionsLaneBook[bookKeyU] = { size: stZc.size, mtimeMs: stZc.mtimeMs, cloudSha1: sha1, at: Date.now() }
                     }
                     uploadedIds.add(s.name)
                   } catch (e) { try { ctx.logger?.warn?.('[dsh-sync] 会话 JSONL 上传失败 ' + s.name + ': ' + String((e && e.message) || e).slice(0, 120)) } catch {} }
@@ -4518,6 +4581,37 @@ module.exports = {
                 }
                 await fsP.writeFile(src.from, plain)
               } else if (!haveSource && haveJsonl) {
+                /* [差量化路线 §B 9999.9.46] 优先差量：云端 jsonl vs lane-state 留档（上次已知
+                   状态）按表分组行级 diff——留档是云端前缀（append-only 常态）→ 只把尾部新行
+                   INSERT OR REPLACE 进 live 库（node:sqlite 与宿主多连接并发安全），不再重建
+                   临时库、不再覆盖主文件（11-17 15:29 事故路径整体绕开；手机写盘慢收益最大）。
+                   DDL 变化/中间行分叉/表收缩/留档缺失/live 不健康/写入异常 → 一律退回下方
+                   全量重建（保守兜底；差量路径事务包裹，失败 ROLLBACK 保证 live 无损）。
+                   云端===留档（0 行差量）→ live 一个字节不动（比全量重建更保守更安全）。 */
+                const laneBase = String(src.to).split(/[\\/]/).pop()
+                const laneArchive = join(syncDir, 'lane-state', laneBase + '.jsonl')
+                let deltaDone = false
+                try {
+                  const cloudTextJ = await fsP.readFile(source + '.jsonl', 'utf8')
+                  const archTextJ = await fsP.readFile(laneArchive, 'utf8').catch(() => null)
+                  if (archTextJ !== null && sqliteJsonl.planSqliteJsonlDelta && sqliteJsonl.applySqliteJsonlDelta) {
+                    const planJ = sqliteJsonl.planSqliteJsonlDelta(cloudTextJ, archTextJ)
+                    if (planJ.ok) {
+                      const hbPre = sqliteHealthy(src.from)
+                      if (!hbPre.healthy) throw new Error('live 库不健康（' + hbPre.detail + '），拒绝差量写入')
+                      const rDelta = sqliteJsonl.applySqliteJsonlDelta(src.from, planJ.tail)
+                      try { await atomicWriteFile(laneArchive, cloudTextJ) } catch {}
+                      try { ctx.logger?.info?.(`[dsh-sync] sqlite 差量落地: ${laneBase} 尾部 ${rDelta.applied} 行（免全量重建）`) } catch {}
+                      deltaDone = true
+                    } else {
+                      try { ctx.logger?.info?.(`[dsh-sync] sqlite 差量不可用（${planJ.reason}），走全量重建: ${laneBase}`) } catch {}
+                    }
+                  }
+                } catch (eDelta) {
+                  try { ctx.logger?.warn?.('[dsh-sync] sqlite 差量落地异常，退回全量重建: ' + String((eDelta && eDelta.message) || eDelta).slice(0, 160)) } catch {}
+                  deltaDone = false
+                }
+                if (!deltaDone) {
                 /* [exp/text-export] JSONL 重建→临时库→integrity 门→落地（无 sidecar：
                    git blob 自身一致 + integrity 双保险；FTS 族不导，宿主 initFts 自愈）。 */
                 const tmpRebuild = src.from + '.jsonl-rebuild.tmp'
@@ -4537,6 +4631,9 @@ module.exports = {
                   continue
                 }
                 await fsP.writeFile(src.from, plainJ)
+                /* [差量化 §B] 全量重建落地成功 → 同步推进留档到云端状态（下一轮起吃差量） */
+                try { await atomicWriteFile(laneArchive, await fsP.readFile(source + '.jsonl')) } catch {}
+                }
               } else {
                 await fsP.copyFile(source, src.from)
               }
@@ -4742,7 +4839,9 @@ module.exports = {
                 /* [9.26 机械覆盖] 本机 vs 云端不比内容新旧：云端有就落地（快路径
                    size 相同的上面已跳过）。maxTime 只用于云端内部多副本选份——
                    那是云端自己的事，与「谁覆盖谁」无关。 */
-                for (const cp of copies) {
+                /* [差量化 §A 9999.9.46] 单副本免 maxTime：maxTime 只用于多副本选份，
+                   单副本 best 恒为唯一副本——jsonl 副本原逻辑会对全文逐行 JSON.parse 算时间，白费。 */
+                if (copies.length > 1) for (const cp of copies) {
                   if (cp.maxTime !== null) continue
                   /* [exp.5] jsonl 副本直接按行取最大事件 time（免解 zstd 帧） */
                   if (cp.zstName === '::jsonl::') {
@@ -4770,6 +4869,20 @@ module.exports = {
                    快路径=逐行比对内容完全相同才跳过（B 段「size 相同跳过」的内容级等价物，
                    免每轮无谓 rm+重写；单帧重建字节与宿主多帧追加必然不同，不能比字节）。 */
                 if (best.zstName === '::jsonl::') {
+                  /* [差量化路线 §A 下载端 9999.9.46] 账本短路：云端 jsonl size 与上轮同
+                     （size 变=内容必变；没变=内容同）且本地 .zstd (size,mtime) 与上轮同
+                     → 上轮已验证逐行等价（或刚落地），本轮免读云端全文、免解本地帧。
+                     本地被宿主追加（用户继续聊）→ mtime/size 变 → 账本失效走现流程。
+                     单副本才记账本（多副本 best 可能换目录，size 语义不稳）。 */
+                  const bookKeyD = grp.targetDirName + '/' + sid
+                  const bookD = (state.sessionsLaneBookDl && typeof state.sessionsLaneBookDl === 'object') ? state.sessionsLaneBookDl[bookKeyD] : null
+                  if (copies.length === 1 && bookD && Number(bookD.cloudSize) === best.size && localSt
+                      && Number(bookD.liveSize) === localSt.size && Number(bookD.liveMtimeMs) === localSt.mtimeMs) {
+                    cwsSessionIds.push(sid)
+                    if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                    if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
+                    continue
+                  }
                   let cloudLines = []
                   try { cloudLines = (await fsP.readFile(join(best.sessionDir, 'session.v4.jsonl'), 'utf8')).split('\n').filter(Boolean) } catch {}
                   if (!cloudLines.length) { applied.push(src.to + ' -> SKIP ' + sid + ' (jsonl 空：' + best.dirName + ')'); continue }
@@ -4787,6 +4900,14 @@ module.exports = {
                     for (let i = 0; i < liveLines.length; i++) if (liveLines[i] !== cloudLines[i]) { sameContentJ = false; break }
                   }
                   if (sameContentJ) {
+                    /* [差量化 §A] 等价跳过 → 重记账本（下轮起短路） */
+                    if (copies.length === 1) {
+                      try {
+                        if (!state.sessionsLaneBookDl || typeof state.sessionsLaneBookDl !== 'object') state.sessionsLaneBookDl = {}
+                        const stNowJ = await fsP.stat(localZst).catch(() => null)
+                        if (stNowJ) state.sessionsLaneBookDl[bookKeyD] = { cloudSize: best.size, liveSize: stNowJ.size, liveMtimeMs: stNowJ.mtimeMs, at: Date.now() }
+                      } catch {}
+                    }
                     cwsSessionIds.push(sid)
                     if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
                     if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
@@ -4804,6 +4925,16 @@ module.exports = {
                   await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
                   await fsP.mkdir(dstSession, { recursive: true })
                   await fsP.writeFile(join(dstSession, 'session.v4.jsonl.zstd'), rebuiltJ)
+                  /* [差量化 §A] 落地成功 → 记账本（云端 size + 落地后本地 size/mtime）。
+                     注意：落地内容首行 cwd 已归一为本机路径 → 稍后 fixCwd 检测 cwd 已对
+                     不会重写文件 → mtime 稳定，账本下轮可命中。 */
+                  if (copies.length === 1) {
+                    try {
+                      if (!state.sessionsLaneBookDl || typeof state.sessionsLaneBookDl !== 'object') state.sessionsLaneBookDl = {}
+                      const stNewJ = await fsP.stat(join(dstSession, 'session.v4.jsonl.zstd')).catch(() => null)
+                      if (stNewJ) state.sessionsLaneBookDl[bookKeyD] = { cloudSize: best.size, liveSize: stNewJ.size, liveMtimeMs: stNewJ.mtimeMs, at: Date.now() }
+                    } catch {}
+                  }
                   wrote = true
                   cwsSessionIds.push(sid)
                   if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
