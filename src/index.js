@@ -139,7 +139,7 @@ const DEFAULT_SYNC_SETTINGS = {
   // [2026-11-11 UI 化] 自动删仓重建总闸：push 时远端报体积超限横幅（exceeds limit）是否自动
   // 执行「Compact 探测 → 删仓重建 → 基线重推」。关闭后仅 gc 重试 + 报错留人工处置；
   // 设置页手动「删仓重建」按钮不受此开关限制。默认 true 维持原行为。
-  rebuildAutoEnabled: true,
+  rebuildAutoEnabled: false,   /* [2026-11-17 用户拍板] 自动删仓重建默认关（自动压缩类行为默认关，UI 可开） */
 }
 
 const STRATEGY_VALUES = ['standalone', 'merge']
@@ -196,7 +196,7 @@ function syncSettingsSchema(S) {
     // [2026-11-11 UI 化] 孤儿 gc 的 pack 体积下限（MB），默认 64，最小 8
     gcOrphanMinPackMB: S.number().default(64).min(8),
     // [2026-11-11 UI 化] 自动删仓重建总闸（push 超限横幅触发），默认 true；手动按钮不受限
-    rebuildAutoEnabled: S.boolean().default(true),
+    rebuildAutoEnabled: S.boolean().default(false),
   })
 }
 let Config = undefined
@@ -2874,6 +2874,9 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
      live 永远是宿主原生 .zstd 形态，jsonl 不落地。
      前缀语义：会话 append-only——本地行是云端行的前缀且更长=本地已含云端（skip 等上传）；
      云端更长=本地缺新行→重建落地；前缀不一致=双线分叉→保守 skip 记 pendingBoth。 */
+  /* [exp.5] cwd 归一映射：shadowRel 的 ws 目录名（dirName）→ 本机工作区 path。
+     云端会话首行 cwd 是上传端本机路径，不归一则跨机前缀比对首行必不同=永远误判分叉。 */
+  const pullPathByDirName = new Map((await loadWorkspaceMap()).map((m) => [m.dirName, m.path]))
   for (const jsonlDir of jsonlDirs.keys()) {
     const shadowRel = jsonlDir
     const liveZstdPath = resolveLivePath(spec, shadowRel + '/session.v4.jsonl.zstd')
@@ -2883,6 +2886,16 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     if (remoteBuf === null) { skipped++; continue }
     const cloudLines = remoteBuf.toString('utf8').split('\n').filter(Boolean)
     if (!cloudLines.length) { skipped++; continue }
+    /* [exp.5] 首行 cwd 归一成本机工作区路径（前缀比对与重建都用归一后的行） */
+    try {
+      const dirNamePull = shadowRel.split('/')[2]
+      const wsPathPull = pullPathByDirName.get(dirNamePull)
+      const headObj = JSON.parse(cloudLines[0])
+      if (headObj && typeof headObj === 'object' && 'cwd' in headObj && wsPathPull && headObj.cwd !== wsPathPull) {
+        headObj.cwd = wsPathPull
+        cloudLines[0] = JSON.stringify(headObj)
+      }
+    } catch {}
     let liveLines = []
     try { liveLines = sessionsJsonl ? sessionsJsonl.sessionZstdLines(liveZstdPath) : [] } catch { liveLines = [] }
     const mLen = Math.min(liveLines.length, cloudLines.length)
@@ -2901,6 +2914,9 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     try {
       await atomicWriteFile(liveZstdPath, rebuilt)
       applied++
+      /* [exp.5] 落地后清对应投影缓存（标题/摘要以新内容重建，防旧投影幽灵） */
+      const sidPull = shadowRel.split('/').pop()
+      try { await fsP.rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', sidPull + '.json'), { force: true }) } catch {}
     } catch { skipped++ }
   }
   // prompts（提示词）无条件镜像已由下面的 overwriteOnDownload 强制镜像覆盖，此处不再单列。
@@ -4221,6 +4237,15 @@ module.exports = {
                   try {
                     const lines = sessionsJsonl.sessionZstdLines(join(sPath, zst))
                     if (!lines.length) { skipped.push(s.name + ' (解帧 0 行，跳过)'); continue }
+                    /* [exp.5 对齐 B] 单文件体积门对 C 车道生效（jsonl 字节数口径，与 B 段
+                       .zstd 的 maxUploadFileMB 同值同语义） */
+                    const maxMBJ = Number(eff.maxUploadFileMB) > 0 ? Number(eff.maxUploadFileMB) : 64
+                    const jsonlBytes = Buffer.byteLength(lines.join('\n'), 'utf8')
+                    if (jsonlBytes > maxMBJ * 1024 * 1024) {
+                      ctx.logger?.warn?.(`[dsh-sync] 单文件上传门: ${s.name} jsonl ${(jsonlBytes / 1048576).toFixed(1)}MB > ${maxMBJ}MB，跳过上传`)
+                      skipped.push(s.name + ` (jsonl ${(jsonlBytes / 1048576).toFixed(1)}MB > ${maxMBJ}MB)`)
+                      continue
+                    }
                     const sha1 = sessionsJsonl.sha1Of(lines)
                     const cloudSessJ = join(wsTarget, s.name)
                     const cloudJsonlJ = join(cloudSessJ, 'session.v4.jsonl')
@@ -4233,7 +4258,9 @@ module.exports = {
                       await fsP.mkdir(cloudSessJ, { recursive: true })
                       /* 互斥清理：云端旧 .zstd 与 part 分片一并移除（C 形态唯一） */
                       for (const f of await fsP.readdir(cloudSessJ).catch(() => [])) {
-                        if (f === 'session.v4.jsonl.zstd' || /^session\.v4\.jsonl\.zstd\.part\d{4}$/.test(f)) { try { await fsP.rm(join(cloudSessJ, f), { force: true }) } catch {} }
+                        /* [exp.5] session.lock 一并互斥清理：lock 是宿主运行时锁，C 形态云端
+                           不该有（raw 时代残留的死 lock 由本清理随 commit 传导清除） */
+                        if (f === 'session.v4.jsonl.zstd' || f === 'session.lock' || /^session\.v4\.jsonl\.zstd\.part\d{4}$/.test(f)) { try { await fsP.rm(join(cloudSessJ, f), { force: true }) } catch {} }
                       }
                       await fsP.writeFile(cloudJsonlJ, lines.join('\n'))
                     }
@@ -4485,7 +4512,14 @@ module.exports = {
                 let hbJ = { healthy: true }
                 try { hbJ = sqliteHealthyBuf(plainJ) } catch { }
                 if (!hbJ || hbJ.healthy === false) {
-                  skipped.push(src.to + '.jsonl（重建后 integrity 不通过，拒绝落地）')
+                  /* [exp.5 对齐 B] gate 失败时隔离云端 jsonl 副本留证（gateSqlitePayload 同语义） */
+                  try {
+                    const qDirJ = join(dshHome(), 'dsh-sync', 'quarantine')
+                    await fsP.mkdir(qDirJ, { recursive: true })
+                    const stampQ = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+                    await fsP.writeFile(join(qDirJ, stampQ + '-' + src.to.split(/[\\/]/).pop() + '.jsonl'), await fsP.readFile(source + '.jsonl'))
+                  } catch {}
+                  skipped.push(src.to + '.jsonl（重建后 integrity 不通过，云端副本已隔离，拒绝落地）')
                   continue
                 }
                 await fsP.writeFile(src.from, plainJ)
@@ -4656,12 +4690,21 @@ module.exports = {
                 try { seFiles = await fsP.readdir(join(cwsPath, se.name)) } catch {}
                 const seParts = eff.sessionsParts === true ? (await listSessionParts(join(cwsPath, se.name)) || []) : []
                 const seZst = seParts.length ? null : seFiles.find(x => x.endsWith('.zstd'))
-                if (!seZst && !seParts.length) continue
+                /* [exp.5 C 车道下载适配] 云端 C 形态唯一=session.v4.jsonl（.zstd 已互斥清理）。
+                   阶段一必须认 jsonl 副本，否则 B 段机械覆盖在 jsonl 形态下收集零副本=
+                   会话下载空转 + wsGroups 空 → pruneLocalOnlySessions 删除对账一并失效
+                   （11-17 实锤：手动按钮下载在 C 形态下会话零处理）。 */
+                const seJsonl = !seZst && !seParts.length && seFiles.includes('session.v4.jsonl')
+                if (!seZst && !seParts.length && !seJsonl) continue
                 let size = 0
-                try { size = (await fsP.stat(join(cwsPath, se.name, seZst || seParts[0]))).size } catch {}
-                if (seParts.length) { size = 0; for (const pp of seParts) { try { size += (await fsP.stat(join(cwsPath, se.name, pp))).size } catch {} } }
+                if (seJsonl) {
+                  try { size = (await fsP.stat(join(cwsPath, se.name, 'session.v4.jsonl'))).size } catch {}
+                } else {
+                  try { size = (await fsP.stat(join(cwsPath, se.name, seZst || seParts[0]))).size } catch {}
+                  if (seParts.length) { size = 0; for (const pp of seParts) { try { size += (await fsP.stat(join(cwsPath, se.name, pp))).size } catch {} } }
+                }
                 const list = grp.copies.get(se.name) || []
-                list.push({ dirName: cws.name, sessionDir: join(cwsPath, se.name), zstName: seZst || '::parts::', size, maxTime: null })
+                list.push({ dirName: cws.name, sessionDir: join(cwsPath, se.name), zstName: seJsonl ? '::jsonl::' : (seZst || '::parts::'), size, maxTime: null })
                 grp.copies.set(se.name, list)
               }
             }
@@ -4686,13 +4729,75 @@ module.exports = {
                    size 相同的上面已跳过）。maxTime 只用于云端内部多副本选份——
                    那是云端自己的事，与「谁覆盖谁」无关。 */
                 for (const cp of copies) {
-                  if (cp.maxTime === null) cp.maxTime = sessionMaxTimeBuf(await readSessionBuf(cp.sessionDir, cp.zstName))
+                  if (cp.maxTime !== null) continue
+                  /* [exp.5] jsonl 副本直接按行取最大事件 time（免解 zstd 帧） */
+                  if (cp.zstName === '::jsonl::') {
+                    let mxJ = 0
+                    try {
+                      for (const lineJ of (await fsP.readFile(join(cp.sessionDir, 'session.v4.jsonl'), 'utf8')).split('\n')) {
+                        if (!lineJ.trim()) continue
+                        try { const evJ = JSON.parse(lineJ); if (typeof evJ.time === 'number' && evJ.time > mxJ) mxJ = evJ.time } catch {}
+                      }
+                    } catch {}
+                    cp.maxTime = mxJ
+                  } else {
+                    cp.maxTime = sessionMaxTimeBuf(await readSessionBuf(cp.sessionDir, cp.zstName))
+                  }
                 }
                 const best = copies.reduce((a, b) => (b.maxTime > a.maxTime ? b : a), copies[0])
                 // 云端落地 → 过完整性门后覆盖本机
                 // 2026-11-04 修：原先这里是 `} catch {}`，门内任何异常被吞掉后仍继续往下写
                 // → 非 zstd 字节（实测 PC session-3e4b2f31 被写成 ZIP 壳 50 4b 03 04）能直接落地。
                 // 现在：读失败/门抛异常一律视为「候选不可信」，跳过本会话，绝不用未经校验的字节覆盖本机。
+                /* [exp.5 C 车道下载适配] 云端 jsonl 副本（C 形态唯一）：cwd 归一（云端首行
+                   cwd 是上传端本机路径，不归一则跨机前缀比对首行必不同=永远误判分叉）→
+                   前缀比对（会话 append-only）→ 重建单帧 .zstd（自证）→ 完整性门 → 落地。
+                   本地已含云端（本地更长或等长）→ skip 等上传；分叉 → 保守 skip。
+                   语义与 runPull jsonl 循环一致。 */
+                if (best.zstName === '::jsonl::') {
+                  let cloudLines = []
+                  try { cloudLines = (await fsP.readFile(join(best.sessionDir, 'session.v4.jsonl'), 'utf8')).split('\n').filter(Boolean) } catch {}
+                  if (!cloudLines.length) { applied.push(src.to + ' -> SKIP ' + sid + ' (jsonl 空：' + best.dirName + ')'); continue }
+                  try {
+                    const headObj = JSON.parse(cloudLines[0])
+                    if (headObj && typeof headObj === 'object' && 'cwd' in headObj && headObj.cwd !== targetWorkspacePath) {
+                      headObj.cwd = targetWorkspacePath
+                      cloudLines[0] = JSON.stringify(headObj)
+                    }
+                  } catch {}
+                  let liveLines = []
+                  try { liveLines = sessionsJsonl ? sessionsJsonl.sessionZstdLines(localZst) : [] } catch { liveLines = [] }
+                  const mLenJ = Math.min(liveLines.length, cloudLines.length)
+                  let prefixSameJ = true
+                  for (let i = 0; i < mLenJ; i++) if (liveLines[i] !== cloudLines[i]) { prefixSameJ = false; break }
+                  if (prefixSameJ && liveLines.length >= cloudLines.length) {
+                    cwsSessionIds.push(sid)
+                    if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                    if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
+                    continue
+                  }
+                  if (!prefixSameJ) {
+                    applied.push(src.to + ' -> SKIP ' + sid + ' (前缀分叉保守 skip：' + best.dirName + ')')
+                    continue
+                  }
+                  let rebuiltJ = null
+                  try { rebuiltJ = sessionsJsonl.buildSessionZstd(cloudLines) } catch (e) {
+                    applied.push(src.to + ' -> SKIP ' + sid + ' (jsonl 重建失败：' + String(e && e.message).slice(0, 100) + ')')
+                    continue
+                  }
+                  if (!await gateSessionPayload(join(dstSession, 'session.v4.jsonl.zstd'), rebuiltJ, ctx.logger)) {
+                    applied.push(src.to + ' -> SKIP ' + sid + ' (完整性门隔离：' + best.dirName + ')')
+                    continue
+                  }
+                  await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
+                  await fsP.mkdir(dstSession, { recursive: true })
+                  await fsP.writeFile(join(dstSession, 'session.v4.jsonl.zstd'), rebuiltJ)
+                  wrote = true
+                  cwsSessionIds.push(sid)
+                  if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                  if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
+                  continue
+                }
                 let candBuf = null
                 try {
                   candBuf = await readSessionBuf(best.sessionDir, best.zstName)
