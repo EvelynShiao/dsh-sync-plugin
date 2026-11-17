@@ -1090,6 +1090,9 @@ async function mirrorLiveToShadow(spec, shadowDir, eff) {
         }
         try {
           await fsP.mkdir(join(target, '..'), { recursive: true })
+          /* [2026-11-17 挂账③根修 9999.9.44-exp.4] sqlite 经 runPush/mirror 上传同理：
+             copyFile 前先 TRUNCATE checkpoint 合并 -wal，镜像到 shadow 的才是完整快照。 */
+          if (/\.sqlite$/i.test(String(src.to))) walCheckpointTruncate(src.from)
           await fsP.copyFile(src.from, target)
         } catch { try { await fsP.unlink(target) } catch {} }
       } else if (group.name === 'sessions') {
@@ -1786,6 +1789,49 @@ async function gateSessionPayload(livePath, buf, logger) {
   } catch (e) { problems.push('隔离写入失败: ' + String(e && e.message)) }
   try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] integrity gate: 隔离 ' + livePath + ' → ' + problems[0]) } catch {}
   return false
+}
+
+// ── 2026-11-17 SQLite 落地安全封装（挂账②根修，事故驱动）─────────────────────
+// 事故：11-17 15:29 syncRun 下载段 jsonl 车道 writeFile 覆盖 live memory.sqlite 时，
+// 宿主 15:27 写下的 3.9MB -wal 未清 → WAL 帧套在被覆盖的新主文件上 → malformed →
+// 记忆面板归零 + 宿主移除 11 个记忆/任务工具（交接挂账②实爆；exp.1 加 jsonl 分支时
+// 漏接了 gateSqlitePayload 的门②）。本封装把门②的"拒绝"语义升级为"空闲自动收敛"：
+//   ① 先尽力删 -wal/-shm（宿主无连接时最干净，删掉=绝对安全）；
+//   ② 删不掉（宿主连接活着）→ wal_checkpoint(TRUNCATE)：帧合并进旧主文件并截 0B，
+//     合并结果马上会被覆盖，目的只是把 WAL 清成无帧空壳；
+//   ③ TRUNCATE 后 -wal 仍 >0B（宿主恰在写，checkpoint busy）→ 拒绝落地（继承门②语义）。
+// 返回 { ok, reason }；调用方 ok=false 时 push skipped，不得继续 writeFile/copyFile。
+function walCheckpointTruncate(dbPath) {
+  try {
+    const { DatabaseSync } = require('node:sqlite')
+    const db = new DatabaseSync(dbPath)
+    try { db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() } finally { try { db.close() } catch {} }
+  } catch { /* busy/损坏：调用方以 -wal size 复核为准 */ }
+}
+
+async function safeSqliteLanding(livePath, logger) {
+  const fsx = require('node:fs')
+  const walPath = livePath + '-wal'
+  try { fsx.rmSync(walPath, { force: true }) } catch {}
+  try { fsx.rmSync(livePath + '-shm', { force: true }) } catch {}
+  let walSize = 0
+  try { walSize = fsx.statSync(walPath).size } catch {}
+  if (walSize > 0) {
+    walCheckpointTruncate(livePath)
+    try { walSize = fsx.statSync(walPath).size } catch { walSize = 0 }
+    if (walSize > 0) {
+      const msg = livePath + ' 的 WAL 在 checkpoint(TRUNCATE) 后仍 ' + walSize + 'B（DSH 正在写库），拒绝覆盖以防新旧页错位（11-17 事故配方）；请稍后重试或退出 DSH。'
+      try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] sqlite 落地安全封装: ' + msg) } catch {}
+      return { ok: false, reason: msg }
+    }
+  }
+  return { ok: true }
+}
+
+// 落地后清理：主文件已换，残留 0B -wal/-shm 空壳无帧无害，删掉更干净（尽力，busy 不报错）
+async function sqliteLandingCleanup(livePath) {
+  try { await fsP.rm(livePath + '-wal', { force: true }) } catch {}
+  try { await fsP.rm(livePath + '-shm', { force: true }) } catch {}
 }
 
 // ── 2026-11-01 SQLite 下载门（gateSqlitePayload，3.2 止血，事故驱动，别删）─────
@@ -3729,7 +3775,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectPlatform, platformRequest, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, CONFLICT_PROMPT_GENERIC, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, pruneCloudExtras, pruneLocalOnlySessions,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectPlatform, platformRequest, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, CONFLICT_PROMPT_GENERIC, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, pruneCloudExtras, pruneLocalOnlySessions, walCheckpointTruncate, safeSqliteLanding, sqliteLandingCleanup,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
@@ -4121,7 +4167,15 @@ module.exports = {
                 await fsP.rm(target, { force: true })
                 await fsP.rm(target + '.zst', { force: true })
                 await fsP.rm(target + '.sha1', { force: true })
+                /* [2026-11-17 挂账⑤] raw 时代误上云的 -wal/-shm 死文件（云端 memory.sqlite-shm
+                   32KB/-wal 0B 长期残留）随 C 形态互斥清理一并移除（删除随 commit 传导）。 */
+                await fsP.rm(target + '-wal', { force: true })
+                await fsP.rm(target + '-shm', { force: true })
               } else {
+                /* [2026-11-17 挂账③根修 9999.9.44-exp.4] raw copyFile 只拷主文件，-wal 里
+                   未合并的写入上不了云（11-17 检验收官记忆两次丢失的根因之一）→ 上传前
+                   TRUNCATE checkpoint 把 WAL 合并进主文件，copy 的即完整快照。 */
+                if (/\.sqlite$/i.test(String(src.to))) walCheckpointTruncate(src.from)
                 await fsP.copyFile(src.from, target)
                 if (/\.sqlite$/i.test(String(src.to))) {
                   await fsP.rm(target + '.zst', { force: true })
@@ -4400,6 +4454,14 @@ module.exports = {
           if (src.file) {
             try {
               await fsP.mkdir(join(src.from, '..'), { recursive: true })
+              /* [2026-11-17 挂账②根修 9999.9.44-exp.4] sqlite 三条落地路径（raw/copyFile、
+                 .zst 解压、jsonl 重建）统一先过 safeSqliteLanding：先删/收敛 live 旧 -wal，
+                 防「WAL 帧套在被覆盖的新主文件上」新旧页错位（11-17 15:29 memory.sqlite
+                 被本路径炸成 malformed 的根因；exp.1 加 jsonl 分支时漏接了门②）。 */
+              if (isSqliteSrc) {
+                const land = await safeSqliteLanding(src.from, eff && eff.logger)
+                if (!land.ok) { skipped.push(src.to + '（' + land.reason + '）'); continue }
+              }
               if (!haveSource && haveZst) {
                 const plain = require('node:zlib').zstdDecompressSync(await fsP.readFile(source + '.zst'))
                 const sidecar = String(await fsP.readFile(source + '.sha1', 'utf8').catch(() => '')).trim()
@@ -4430,6 +4492,7 @@ module.exports = {
               } else {
                 await fsP.copyFile(source, src.from)
               }
+              if (isSqliteSrc) { try { await sqliteLandingCleanup(src.from) } catch {} }
               applied.push(src.to)
             } catch {}
           } else if (group.name === 'sessions') {
