@@ -1,6 +1,6 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "9999.9.44-exp.7",
+  "version": "9999.9.45",
   "description": "dsh-sync custom build",
   "license": "MIT",
   "scripts": {
