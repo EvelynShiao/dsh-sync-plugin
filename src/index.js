@@ -2896,18 +2896,16 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
         cloudLines[0] = JSON.stringify(headObj)
       }
     } catch {}
+    /* [exp.6 用户拍板「无条件落地，少的加上多的删掉」] 回归 9.26 机械覆盖语义：
+       云端有 → 落地覆盖本机（不管内容新旧）。内容逐行完全相同才跳过（等价跳过，
+       免无谓重写）；不再区分谁长谁短/是否分叉，pendingBoth 记账随之退役。 */
     let liveLines = []
     try { liveLines = sessionsJsonl ? sessionsJsonl.sessionZstdLines(liveZstdPath) : [] } catch { liveLines = [] }
-    const mLen = Math.min(liveLines.length, cloudLines.length)
-    let prefixSame = true
-    for (let i = 0; i < mLen; i++) if (liveLines[i] !== cloudLines[i]) { prefixSame = false; break }
-    if (prefixSame && liveLines.length >= cloudLines.length) { skipped++; continue }
-    if (!prefixSame) {
-      const pendKey = shadowRel + '/session.v4.jsonl.zstd'
-      if (!state.pendingBoth[pendKey]) state.pendingBoth[pendKey] = lastSynced
-      skipped++
-      continue
+    let sameContent = liveLines.length === cloudLines.length
+    if (sameContent) {
+      for (let i = 0; i < liveLines.length; i++) if (liveLines[i] !== cloudLines[i]) { sameContent = false; break }
     }
+    if (sameContent) { skipped++; continue }
     let rebuilt = null
     try { rebuilt = sessionsJsonl.buildSessionZstd(cloudLines) } catch { skipped++; continue }
     if (!await gateSessionPayload(liveZstdPath, rebuilt, logger)) { skipped++; continue }
@@ -4749,11 +4747,12 @@ module.exports = {
                 // 2026-11-04 修：原先这里是 `} catch {}`，门内任何异常被吞掉后仍继续往下写
                 // → 非 zstd 字节（实测 PC session-3e4b2f31 被写成 ZIP 壳 50 4b 03 04）能直接落地。
                 // 现在：读失败/门抛异常一律视为「候选不可信」，跳过本会话，绝不用未经校验的字节覆盖本机。
-                /* [exp.5 C 车道下载适配] 云端 jsonl 副本（C 形态唯一）：cwd 归一（云端首行
-                   cwd 是上传端本机路径，不归一则跨机前缀比对首行必不同=永远误判分叉）→
-                   前缀比对（会话 append-only）→ 重建单帧 .zstd（自证）→ 完整性门 → 落地。
-                   本地已含云端（本地更长或等长）→ skip 等上传；分叉 → 保守 skip。
-                   语义与 runPull jsonl 循环一致。 */
+                /* [exp.6 用户拍板 2026-11-17「我就要无条件落地，少的加上多的删掉」] 会话下载
+                   回归 9.26 钦定语义：云端有 → 无条件落地覆盖本机（不管内容新旧，云端为准），
+                   删除传导靠 pruneLocalOnlySessions（本机有云端无 → 删本机）。cwd 归一保留
+                   （云端首行 cwd 是上传端本机路径，落地前必须换成本机路径，否则会话挂错工作区）。
+                   快路径=逐行比对内容完全相同才跳过（B 段「size 相同跳过」的内容级等价物，
+                   免每轮无谓 rm+重写；单帧重建字节与宿主多帧追加必然不同，不能比字节）。 */
                 if (best.zstName === '::jsonl::') {
                   let cloudLines = []
                   try { cloudLines = (await fsP.readFile(join(best.sessionDir, 'session.v4.jsonl'), 'utf8')).split('\n').filter(Boolean) } catch {}
@@ -4767,17 +4766,14 @@ module.exports = {
                   } catch {}
                   let liveLines = []
                   try { liveLines = sessionsJsonl ? sessionsJsonl.sessionZstdLines(localZst) : [] } catch { liveLines = [] }
-                  const mLenJ = Math.min(liveLines.length, cloudLines.length)
-                  let prefixSameJ = true
-                  for (let i = 0; i < mLenJ; i++) if (liveLines[i] !== cloudLines[i]) { prefixSameJ = false; break }
-                  if (prefixSameJ && liveLines.length >= cloudLines.length) {
+                  let sameContentJ = liveLines.length === cloudLines.length
+                  if (sameContentJ) {
+                    for (let i = 0; i < liveLines.length; i++) if (liveLines[i] !== cloudLines[i]) { sameContentJ = false; break }
+                  }
+                  if (sameContentJ) {
                     cwsSessionIds.push(sid)
                     if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
                     if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
-                    continue
-                  }
-                  if (!prefixSameJ) {
-                    applied.push(src.to + ' -> SKIP ' + sid + ' (前缀分叉保守 skip：' + best.dirName + ')')
                     continue
                   }
                   let rebuiltJ = null
