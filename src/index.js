@@ -140,6 +140,7 @@ const DEFAULT_SYNC_SETTINGS = {
   // 执行「Compact 探测 → 删仓重建 → 基线重推」。关闭后仅 gc 重试 + 报错留人工处置；
   // 设置页手动「删仓重建」按钮不受此开关限制。默认 true 维持原行为。
   rebuildAutoEnabled: false,   /* [2026-11-17 用户拍板] 自动删仓重建默认关（自动压缩类行为默认关，UI 可开） */
+  rebuildEveryUploads: 0,      /* [exp.7] 攒 N 轮上传自动删仓重建（0=关；用户 11-16 方向+11-17 UI 落地，重建紧跟上传成功=云端已拉平零数据损失） */
 }
 
 const STRATEGY_VALUES = ['standalone', 'merge']
@@ -197,6 +198,7 @@ function syncSettingsSchema(S) {
     gcOrphanMinPackMB: S.number().default(64).min(8),
     // [2026-11-11 UI 化] 自动删仓重建总闸（push 超限横幅触发），默认 true；手动按钮不受限
     rebuildAutoEnabled: S.boolean().default(false),
+    rebuildEveryUploads: S.number().default(0),
   })
 }
 let Config = undefined
@@ -332,7 +334,7 @@ function writeProfileFileSync(effIn, clearToken) {
   }
   const eff = effIn
   const vals = {}
-  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB','gcOrphanRatio','gcOrphanMinPackMB','rebuildAutoEnabled','sqliteJsonlLane','sessionsJsonlLane']) vals[k] = eff[k]
+  for (const k of ['repoUrl','branch','downloadWorkspacePath','gitBinary','conflictMode','token','skillsStrategy','sessionsStrategy','settingsStrategy','pluginsStrategy','knowledgeStrategy','memoryStrategy','sessionsParts','sessionsDeleteSync','maxUploadFileMB','repoGcThresholdMB','gcOrphanRatio','gcOrphanMinPackMB','rebuildAutoEnabled','rebuildEveryUploads','sqliteJsonlLane','sessionsJsonlLane']) vals[k] = eff[k]
   for (const k of ['autoSync','syncOnStartup','syncSkills','syncSessions','syncSettings','syncPlugins','syncKnowledge','syncMemory','snapshotSkills','snapshotAuto']) vals[k] = eff[k]
   for (const k of ['intervalMinutes','snapshotLocalKeep']) vals[k] = eff[k]
   if (keptToken && !vals.token) vals.token = keptToken
@@ -4402,6 +4404,20 @@ module.exports = {
          roundsSinceRebuild 供 UI 维护块显示。 */
       state.uploadsSinceSquash = (Number(state && state.uploadsSinceSquash) || 0) + 1
       await saveState()
+      /* [exp.7 用户拍板 11-16 方向+11-17 UI 落地] 攒 N 轮自动删仓重建：触发时机=本轮上传
+         刚成功=云端已被拉平（shadow=云端 tip），此刻 DELETE 仓+POST 重建+push HEAD 零数据
+         损失（11-16 定案「删仓前先拉平」天然满足）。N>0 才启用，默认 0=关。 */
+      const everyN = Number(eff.rebuildEveryUploads) > 0 ? Number(eff.rebuildEveryUploads) : 0
+      if (everyN > 0 && (Number(state.uploadsSinceSquash) || 0) >= everyN) {
+        try {
+          ctx.logger?.info?.(`[dsh-sync] 攒轮重建触发：已连续上传 ${state.uploadsSinceSquash} 轮 ≥ ${everyN}，自动删仓重建（云端已拉平，零数据损失）`)
+          const healedRound = await forceRebuildCloudRepo(eff, repoDir, state, ctx.logger, `攒 ${everyN} 轮自动重建`)
+          if (healedRound && healedRound.ok) {
+            state.uploadsSinceSquash = 0
+            await saveState()
+          }
+        } catch (e) { try { ctx.logger?.warn?.('[dsh-sync] 攒轮自动重建异常（不阻断同步）: ' + String((e && e.message) || e).slice(0, 160)) } catch {} }
+      }
       // 无条件清理：原来 prune 只在 snapshotAuto !== false 的分支里，
       // 用户关掉每日自动快照后日常同步就永远不清理 → 上限形同虚设（曾堆到 16 份）。
       try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
@@ -5190,6 +5206,7 @@ module.exports = {
               gcOrphanRatio: Number(eff.gcOrphanRatio) > 0 ? Number(eff.gcOrphanRatio) : 0.5,
               gcOrphanMinPackMB: Number(eff.gcOrphanMinPackMB) > 0 ? Number(eff.gcOrphanMinPackMB) : 64,
               rebuildAutoEnabled: eff.rebuildAutoEnabled !== false,
+              rebuildEveryUploads: Number(eff.rebuildEveryUploads) > 0 ? Math.floor(Number(eff.rebuildEveryUploads)) : 0,
               strategies: {
                 skills: STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'standalone',
                 sessions: STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'merge',

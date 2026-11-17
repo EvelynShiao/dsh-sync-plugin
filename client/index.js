@@ -93,6 +93,8 @@ const ZH = {
   gcOrphanMinPackLabel: '孤儿 gc 下限（MB）',
   rebuildAutoLabel: '自动删仓重建',
   rebuildAutoHint: '远端报体积超限（exceeds limit）时自动「删仓重建→重推基线」；关闭后仅本地 gc 重试+报错留人工处置。手动按钮不受此开关限制。删仓重建要求令牌带 delete_repo 权限',
+  rebuildEveryLabel: '攒轮自动重建',
+  rebuildEveryHint: '每 N 轮上传自动「删仓重建→重推基线」控制历史体积（0=关）。重建紧跟上传成功执行：云端先拉平再删仓，无数据损失。删仓重建要求令牌带 delete_repo 权限',
   snapshotDelete: '删除',
   snapshotRename: '重命名',
   snapshotDeleteConfirm: '确定删除快照 {name}？此操作不可恢复。',
@@ -756,6 +758,7 @@ function SettingsSection({ t }) {
   const [gcOrphanRatioPct, setGcOrphanRatioPct] = useState(50)
   const [gcOrphanMinPack, setGcOrphanMinPack] = useState(64)
   const [rebuildAuto, setRebuildAuto] = useState(true)
+  const [rebuildEvery, setRebuildEvery] = useState(0)
   const [g, setG] = useState({ skills: true, sessions: false, settings: true, plugins: true , memory: true, knowledge: true })
   const [gs, setGs] = useState({ skills: 'standalone', sessions: 'merge', settings: 'standalone', plugins: 'standalone' , memory: 'merge', knowledge: 'merge' })
   const [snapCfg, setSnapCfg] = useState({ auto: true, skills: false, localKeep: 30 })
@@ -782,6 +785,7 @@ function SettingsSection({ t }) {
     setGcOrphanRatioPct(Number(d.gcOrphanRatio) > 0 ? Math.round(Number(d.gcOrphanRatio) * 100) : 50)
     setGcOrphanMinPack(Number(d.gcOrphanMinPackMB) > 0 ? Number(d.gcOrphanMinPackMB) : 64)
     setRebuildAuto(d.rebuildAutoEnabled !== false)
+    setRebuildEvery(Number(d.rebuildEveryUploads) > 0 ? Math.floor(Number(d.rebuildEveryUploads)) : 0)
         setG(prev => ({ ...prev, skills: d.syncSkills, sessions: d.syncSessions, settings: d.syncSettings, plugins: d.syncPlugins, ...(d.syncMemory !== undefined ? { memory: d.syncMemory } : {}), ...(d.syncKnowledge !== undefined ? { knowledge: d.syncKnowledge } : {}) }))
     if (d.strategies) setGs(prev => ({ ...prev, ...d.strategies }))
     if (d.snapshot) setSnapCfg(d.snapshot)
@@ -896,7 +900,7 @@ function SettingsSection({ t }) {
   }
   const doSave = async () => {
     try {
-      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts, sessionsDeleteSync, repoGcThresholdMB: gcThreshold, gcOrphanRatio: (Number(gcOrphanRatioPct) || 0) / 100, gcOrphanMinPackMB: gcOrphanMinPack, rebuildAutoEnabled: rebuildAuto }
+      const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts, sessionsDeleteSync, repoGcThresholdMB: gcThreshold, gcOrphanRatio: (Number(gcOrphanRatioPct) || 0) / 100, gcOrphanMinPackMB: gcOrphanMinPack, rebuildAutoEnabled: rebuildAuto, rebuildEveryUploads: rebuildEvery }
       if (token !== '') patch.token = token
       await putSettings(patch)
       setToken('')
@@ -1083,9 +1087,13 @@ function SettingsSection({ t }) {
                 t('gcOrphanMinPackLabel'),
                 h('input', { className: 'sk-input', type: 'number', min: 8, value: gcOrphanMinPack, onChange: e => setGcOrphanMinPack(Math.max(8, Number(e.target.value) || 64)), style: { width: 64 } })),
               h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-                h('input', { type: 'checkbox', checked: rebuildAuto, onChange: e => setRebuildAuto(e.target.checked) }), t('rebuildAutoLabel'))),
+                h('input', { type: 'checkbox', checked: rebuildAuto, onChange: e => setRebuildAuto(e.target.checked) }), t('rebuildAutoLabel')),
+              h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                h('input', { type: 'checkbox', checked: rebuildEvery > 0, onChange: e => setRebuildEvery(e.target.checked ? 20 : 0) }), t('rebuildEveryLabel'),
+                h('input', { className: 'sk-input', type: 'number', min: 0, value: rebuildEvery, onChange: e => setRebuildEvery(Math.max(0, Math.floor(Number(e.target.value) || 0))), style: { width: 56 } }))),
             h('div', { className: 'sk-dir', style: { marginTop: 4 } }, t('selfHealHint')),
-            h('div', { className: 'sk-dir', style: { marginTop: 2 } }, t('rebuildAutoHint'))),
+            h('div', { className: 'sk-dir', style: { marginTop: 2 } }, t('rebuildAutoHint')),
+            h('div', { className: 'sk-dir', style: { marginTop: 2 } }, t('rebuildEveryHint'))),
           h('div', { className: 'sk-toolbar' },
             h(ButtonLite, { onClick: doSave }, t('save')),
             h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
