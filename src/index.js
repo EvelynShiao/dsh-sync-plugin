@@ -141,6 +141,14 @@ const DEFAULT_SYNC_SETTINGS = {
   // 设置页手动「删仓重建」按钮不受此开关限制。默认 true 维持原行为。
   rebuildAutoEnabled: false,   /* [2026-11-17 用户拍板] 自动删仓重建默认关（自动压缩类行为默认关，UI 可开） */
   rebuildEveryUploads: 0,      /* [exp.7] 攒 N 轮上传自动删仓重建（0=关；用户 11-16 方向+11-17 UI 落地，重建紧跟上传成功=云端已拉平零数据损失） */
+  /* [9999.9.47 转正补完] C 车道默认开（用户 11-17 拍板「所有同步组都用确定序 JSONL」）。
+     【事故根源】exp 时代「实验默认关」遗留：这两键不在 DEFAULT 里 → baseSettings() 的
+     拷贝循环只遍历 DEFAULT 已有键 → cordis.patch.yml 里写的 true 永远拷不进运行时；
+     schema 也无 default → 宿主重启后 settings 文档重建时键丢失 → 运行时 false →
+     上传走旧 raw 车道并触发互斥清理删光云端 jsonl（11-18 00:40 e1bf8e2 与 01:55
+     7d0b4f8 两次毁容，手机 9.45 下载因此拉不到——转正只换了分支名没换默认值的学费）。 */
+  sqliteJsonlLane: true,
+  sessionsJsonlLane: true,
 }
 
 const STRATEGY_VALUES = ['standalone', 'merge']
@@ -176,12 +184,13 @@ function syncSettingsSchema(S) {
     knowledgeStrategy: S.string(),
     memoryStrategy: S.string(),
     sessionsParts: S.boolean(),
-    // [exp/text-export 9999.9.44-exp.1] C 车道实验开关（默认关）：true=sqlite 走确定序 JSONL 导出/重建
-    sqliteJsonlLane: S.boolean(),
-    // [exp/text-export 9999.9.44-exp.3] C 方案扩展到 sessions（2026-11-17 用户拍板"所有同步都要 C 方案"）：
+    // [9999.9.47 转正补完] C 车道转正默认开（用户 11-17 拍板「所有同步组都用确定序 JSONL」）。
+    // exp 时代「实验默认关」+无 default：重启后 settings 文档重建键丢失 → 运行时 false →
+    // 上传走 raw 并互斥清理删光云端 jsonl（11-18 两次毁容事故根源，详见 DEFAULT_SYNC_SETTINGS 注释）。
+    sqliteJsonlLane: S.boolean().default(true),
     // true=会话上传走「解多帧 .zstd → 确定序 jsonl 文本」（git 行级 delta，不再堆二进制 blob 历史），
     // 下载走「jsonl → 重建单帧 .zstd（自证逐行一致）→ 完整性门 → 落地」
-    sessionsJsonlLane: S.boolean(),
+    sessionsJsonlLane: S.boolean().default(true),
     sessionsDeleteSync: S.boolean(),
     uploadOverwrite: S.boolean(),
     snapshotSkills: S.boolean(),
@@ -5338,6 +5347,9 @@ module.exports = {
               gcOrphanMinPackMB: Number(eff.gcOrphanMinPackMB) > 0 ? Number(eff.gcOrphanMinPackMB) : 64,
               rebuildAutoEnabled: eff.rebuildAutoEnabled !== false,
               rebuildEveryUploads: Number(eff.rebuildEveryUploads) > 0 ? Math.floor(Number(eff.rebuildEveryUploads)) : 0,
+              /* [9999.9.47] C 车道开关回填（11-18 毁容事故教训：运行时值不可见=排查挖了一上午 git） */
+              sqliteJsonlLane: eff.sqliteJsonlLane === true,
+              sessionsJsonlLane: eff.sessionsJsonlLane === true,
               strategies: {
                 skills: STRATEGY_VALUES.includes(eff.skillsStrategy) ? eff.skillsStrategy : 'standalone',
                 sessions: STRATEGY_VALUES.includes(eff.sessionsStrategy) ? eff.sessionsStrategy : 'merge',
