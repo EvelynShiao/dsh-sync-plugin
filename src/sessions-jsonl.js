@@ -10,14 +10,17 @@
  *   本地（live）：session.v4.jsonl.zstd —— DSH 宿主原生多帧压缩形态，不动
  *   云端（shadow）：session.v4.jsonl —— 确定序明文（行序=帧序×行序=时间序，append-only）
  *   上传：本地解帧拼接 → 与云端 jsonl 哈希不同才整文件覆盖（git pack 层自动只传新增行的 delta）
- *   下载：云端 jsonl → 重建单帧 .zstd → 自证解压行与 jsonl 一致 → 调用方过 gateSessionPayload → 落地
+ *   下载：云端 jsonl → 重建两帧 .zstd → 自证解压行与 jsonl 一致 → 调用方过 gateSessionPayload → 落地
  *
  * 帧边界：**RFC8878 帧头+块结构精确解析**（魔数扫描会撞上压缩数据里的伪魔数导致丢帧；
  * node 的 zstdDecompressSync 只解第一帧且忽略尾部垃圾，不能直接对多帧 buffer 用）。
  *  解析链：Magic(4B) → FHD(1B) → Window_Descriptor(非 single-segment 时 1B) → Dictionary_ID
  *  → Frame_Content_Size → blocks（每块 3B 头：last/类型/大小）→ Content_Checksum(4B)。
  *  每帧解析出的 [off,end) 再用 zstdDecompressSync 验证（解压成功才接受，双保险）。
- * 重建分帧：单帧。内容等价即可——宿主逐帧解压后拼接行序不变；宿主后续追加新帧不受影响。
+ * 重建分帧：两帧（头一帧、事件一帧，与宿主 materialize 同款）。**单帧会被宿主拒收**：
+ *  readFirstZstdLine → assertZstdHeaderFrame 要求第一帧恰好只有 header 一行
+ *  （dsh-session-persistence-jsonl lib/index.js:2293），单帧重建文件在 listArtifacts
+ *  扫描时被静默 continue 剔除出内存表（11-19 会话孤儿事故根因：verify 绿但侧栏不可见）。
  * 前缀性质：会话是 append-only 流，M≥N 时旧导出是新导出的前缀（跨轮 delta 天然成立）。
  */
 
@@ -102,16 +105,19 @@ function sessionZstdLines(zstdPath) {
   return textLines(sessionZstdToText(buf))
 }
 
-/* 内存重建：行数组 → 单帧 .zstd Buffer（自证解压行与源逐行一致；下载端先 gate 后落盘用） */
+/* 内存重建：行数组 → 两帧 .zstd Buffer（头一帧、事件一帧；自证用多帧逐帧解压展平比对，
+   下载端先 gate 后落盘用）。单帧形态会被宿主 assertZstdHeaderFrame 拒收（见文件头注释）。 */
 function buildSessionZstd(lines) {
   if (!lines || !lines.length) throw new Error('0 行拒绝重建')
-  const frame = zlib.zstdCompressSync(Buffer.from(lines.join('\n'), 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
-  const back = textLines(zlib.zstdDecompressSync(frame).toString('utf8'))
+  const headFrame = zlib.zstdCompressSync(Buffer.from(lines[0] + '\n', 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
+  const bodyFrame = zlib.zstdCompressSync(Buffer.from(lines.slice(1).join('\n') + '\n', 'utf8'), { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } })
+  const out = Buffer.concat([headFrame, bodyFrame])
+  const back = textLines(sessionZstdToText(out))
   if (back.length !== lines.length || back.some((l, i) => l !== lines[i])) throw new Error('会话重建自证失败：行数/内容不一致')
-  return frame
+  return out
 }
 
-/* 重建：云端 jsonl → 本地 .zstd（单帧；写盘前自证解压行与源逐行一致） */
+/* 重建：云端 jsonl → 本地 .zstd（两帧；写盘前自证解压行与源逐行一致） */
 function rebuildSessionZstd(jsonlPath, outZstdPath) {
   const lines = textLines(fs.readFileSync(jsonlPath, 'utf8'))
   const frame = buildSessionZstd(lines)

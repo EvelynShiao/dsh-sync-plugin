@@ -100,6 +100,8 @@ const DEFAULT_SYNC_SETTINGS = {
   sessionsParts: true,
   // [2026-11-05 覆盖·9999.9.26] true = 上传删云端多余会话 + 下载删本机多余会话
   // （纯机械集合镜像，用户钦定）；false = 上传只增不减、下载不删本机（旧行为）。
+  // [2026-11-19 用户再次拍板：保持默认开，勿再动] 覆盖/镜像是会话同步的根基语义
+  // （用户零容忍两份并存）；本地独有会话靠「先上传再下载」的使用纪律保命。
   sessionsDeleteSync: true,
   syncSettings: true,
   syncPlugins: true,
@@ -191,6 +193,8 @@ function syncSettingsSchema(S) {
     // true=会话上传走「解多帧 .zstd → 确定序 jsonl 文本」（git 行级 delta，不再堆二进制 blob 历史），
     // 下载走「jsonl → 重建单帧 .zstd（自证逐行一致）→ 完整性门 → 落地」
     sessionsJsonlLane: S.boolean().default(true),
+    // [2026-11-19] 保持无 default：settings 文档重建键丢失 → 运行时 undefined →
+    // `!== false` 全部放行 = 删除同步照开，与用户钦定的镜像语义同向，不会翻车反向。
     sessionsDeleteSync: S.boolean(),
     uploadOverwrite: S.boolean(),
     snapshotSkills: S.boolean(),
@@ -2881,17 +2885,23 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       applied++
     } catch { skipped++ }
   }
-  /* [exp.3 会话 JSONL 化] 云端 jsonl → 前缀比对 → 重建单帧 .zstd（自证）→ 完整性门 → 落地。
+  /* [exp.3 会话 JSONL 化] 云端 jsonl → 前缀比对 → 重建两帧 .zstd（自证）→ 完整性门 → 落地。
      live 永远是宿主原生 .zstd 形态，jsonl 不落地。
      前缀语义：会话 append-only——本地行是云端行的前缀且更长=本地已含云端（skip 等上传）；
      云端更长=本地缺新行→重建落地；前缀不一致=双线分叉→保守 skip 记 pendingBoth。 */
   /* [exp.5] cwd 归一映射：shadowRel 的 ws 目录名（dirName）→ 本机工作区 path。
      云端会话首行 cwd 是上传端本机路径，不归一则跨机前缀比对首行必不同=永远误判分叉。 */
   const pullPathByDirName = new Map((await loadWorkspaceMap()).map((m) => [m.dirName, m.path]))
+  /* [9999.9.48 落地即挂组] jsonl 车道落地会话收集表：wsPath → [sessionId]。 */
+  const jsonlByWs = new Map()
   for (const jsonlDir of jsonlDirs.keys()) {
     const shadowRel = jsonlDir
     const liveZstdPath = resolveLivePath(spec, shadowRel + '/session.v4.jsonl.zstd')
     if (!liveZstdPath) { skipped++; continue }
+    /* [9999.9.48] dirName→本机工作区 path 解析提到循环体作用域（cwd 归一与落地后
+       补挂组共用；本机无对应工作区时为 null，与阶段一「本机无同名工作区完全不碰」同规格）。 */
+    const dirNamePull = shadowRel.split('/')[2]
+    const wsPathPull = pullPathByDirName.get(dirNamePull) || null
     let remoteBuf = null
     try { remoteBuf = await gitShowBuf(binary, `FETCH_HEAD:${shadowRel}/session.v4.jsonl`, repoDir) } catch { remoteBuf = null }
     if (remoteBuf === null) { skipped++; continue }
@@ -2899,8 +2909,6 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
     if (!cloudLines.length) { skipped++; continue }
     /* [exp.5] 首行 cwd 归一成本机工作区路径（前缀比对与重建都用归一后的行） */
     try {
-      const dirNamePull = shadowRel.split('/')[2]
-      const wsPathPull = pullPathByDirName.get(dirNamePull)
       const headObj = JSON.parse(cloudLines[0])
       if (headObj && typeof headObj === 'object' && 'cwd' in headObj && wsPathPull && headObj.cwd !== wsPathPull) {
         headObj.cwd = wsPathPull
@@ -2926,7 +2934,66 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
       /* [exp.5] 落地后清对应投影缓存（标题/摘要以新内容重建，防旧投影幽灵） */
       const sidPull = shadowRel.split('/').pop()
       try { await fsP.rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', sidPull + '.json'), { force: true }) } catch {}
+      /* [9999.9.48 落地即挂组] jsonl 车道此前只写文件不挂 workspace.json → 落地即孤儿
+         （11-18 事故：6 会话文件完好、宿主拒收叠加、侧栏消失）。收集 (wsPath → sid)
+         供循环后统一补挂；本机无对应工作区的不收（与阶段一跳过规格一致）。 */
+      if (wsPathPull) {
+        let arr = jsonlByWs.get(wsPathPull)
+        if (!arr) { arr = []; jsonlByWs.set(wsPathPull, arr) }
+        if (!arr.includes(sidPull)) arr.push(sidPull)
+      }
     } catch { skipped++ }
+  }
+  /* [9999.9.48 落地即挂组] jsonl 车道补挂：先写 workspace.json（宿主重启后仍生效），
+     再 workspaceRegistry detach+attach（宿主运行期立即生效，与旧车道阶段三同款）。 */
+  if (jsonlByWs.size > 0) {
+    try {
+      const wsJsonPathJ = join(dshHome(), 'storages', 'workspace.json')
+      const wsDocJ = JSON.parse(await fsP.readFile(wsJsonPathJ, 'utf8'))
+      if (wsDocJ && wsDocJ.tables && wsDocJ.tables.workspaces) {
+        for (const [wsPathJ, sidsJ] of jsonlByWs) {
+          let wsIdJ = null
+          for (const [idJ, wJ0] of Object.entries(wsDocJ.tables.workspaces)) {
+            if (wJ0.path === wsPathJ) { wsIdJ = idJ; break }
+          }
+          if (!wsIdJ) {
+            wsIdJ = randomUUID()
+            wsDocJ.tables.workspaces[wsIdJ] = {
+              path: wsPathJ,
+              title: wsPathJ.split(/[\\/]/).filter(Boolean).pop() || 'Workspace',
+              sessionIds: [],
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            }
+            if (!Array.isArray(wsDocJ.global.workspaceIds)) wsDocJ.global.workspaceIds = []
+            if (!wsDocJ.global.workspaceIds.includes(wsIdJ)) wsDocJ.global.workspaceIds.push(wsIdJ)
+          }
+          const wJ = wsDocJ.tables.workspaces[wsIdJ]
+          if (!Array.isArray(wJ.sessionIds)) wJ.sessionIds = []
+          for (const sid of sidsJ) if (!wJ.sessionIds.includes(sid)) wJ.sessionIds.push(sid)
+          wJ.updatedAt = new Date().toISOString()
+        }
+        await fsP.writeFile(wsJsonPathJ, JSON.stringify(wsDocJ, null, 2), 'utf8')
+      }
+    } catch (e) { try { ctx.logger?.warn?.('[dsh-sync] jsonl 车道补挂 workspace.json 失败: ' + String((e && e.message) || e)) } catch {} }
+    await new Promise((resolve) => {
+      try {
+        ctx.inject(['workspaceRegistry'], async (svcs) => {
+          try {
+            const reg = svcs.workspaceRegistry
+            for (const [wsPathJ, sidsJ] of jsonlByWs) {
+              let ws = await reg.resolveByPath(wsPathJ)
+              if (!ws) ws = await reg.create(wsPathJ)
+              for (const sid of sidsJ) {
+                try { await ws.detachSession(sid) } catch {}
+                try { await ws.attachSession(sid) } catch (e) { try { ctx.logger?.warn?.('[dsh-sync] attach ' + sid + ': ' + (e && e.message)) } catch {} }
+              }
+            }
+          } catch {}
+          resolve()
+        })
+      } catch { resolve() }
+    })
   }
   // prompts（提示词）无条件镜像已由下面的 overwriteOnDownload 强制镜像覆盖，此处不再单列。
   // 覆盖·远端为准的组 + 标记 overwriteOnDownload 的配置组：整组强制镜像——不在本轮变更
