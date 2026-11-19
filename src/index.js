@@ -2891,7 +2891,12 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
      云端更长=本地缺新行→重建落地；前缀不一致=双线分叉→保守 skip 记 pendingBoth。 */
   /* [exp.5] cwd 归一映射：shadowRel 的 ws 目录名（dirName）→ 本机工作区 path。
      云端会话首行 cwd 是上传端本机路径，不归一则跨机前缀比对首行必不同=永远误判分叉。 */
-  const pullPathByDirName = new Map((await loadWorkspaceMap()).map((m) => [m.dirName, m.path]))
+  /* [9999.9.49 双键修复] 云端 shadowRel 形如 sessions/ws/<folderKey>/session-x，
+     split('/')[2] = folderKey（如 '1'）；loadWorkspaceMap().dirName 是本机编码目录名
+     （--C-Users-...--）。旧代码只按 dirName 建键 → get('1')=undefined → cwd 归一自
+     exp.5 起一直没生效（被 exp.6 机械覆盖掩盖）、9999.9.48 落地补挂组在真实路径下
+     不触发（下载落地仍孤儿）。folderKey+dirName 双键都指向 path。 */
+  const pullPathByDirName = new Map((await loadWorkspaceMap()).flatMap((m) => [[m.dirName, m.path], [m.folderKey, m.path]]))
   /* [9999.9.48 落地即挂组] jsonl 车道落地会话收集表：wsPath → [sessionId]。 */
   const jsonlByWs = new Map()
   for (const jsonlDir of jsonlDirs.keys()) {
@@ -4343,7 +4348,10 @@ module.exports = {
                 const sPath = join(src.from, ws.dirName, s.name)
                 let filesUp = []
                 try { filesUp = await fsP.readdir(sPath) } catch {}
-                const zst = filesUp.find(x => x.endsWith('.zstd'))
+                /* [9999.9.49 精确匹配] 旧 endsWith('.zstd') 会被会话目录里的备份文件
+                   （.bak-*.zstd，字母序在真身前）劫持 → 上传解的是备份内容（11-19 实锤：
+                   c54ac641 修复后 33 行，云端被写回 15 行断态）。会话主文件名恒定。 */
+                const zst = filesUp.find(x => x === 'session.v4.jsonl.zstd')
                 if (!zst) continue
                 /* [exp.3 会话 JSONL 化] sessionsJsonlLane=true：本地 .zstd 解帧 → 确定序 jsonl 上云。
                    git pack 层自动只传新增行 delta（2026-11-17 用户拍板：所有同步都要 C 方案，
@@ -4826,7 +4834,7 @@ module.exports = {
                   if (!se.isDirectory()) continue
                   let files = []
                   try { files = await fsP.readdir(join(cwsPath, se.name)) } catch {}
-                  const zst = files.find(x => x.endsWith('.zstd'))
+                  const zst = files.find(x => x === 'session.v4.jsonl.zstd')   // [9999.9.49] 防备份文件劫持
                   if (!zst) continue
                   try {
                     const buf = await fsP.readFile(join(cwsPath, se.name, zst))
@@ -4876,7 +4884,8 @@ module.exports = {
                 let seFiles = []
                 try { seFiles = await fsP.readdir(join(cwsPath, se.name)) } catch {}
                 const seParts = eff.sessionsParts === true ? (await listSessionParts(join(cwsPath, se.name)) || []) : []
-                const seZst = seParts.length ? null : seFiles.find(x => x.endsWith('.zstd'))
+                /* [9999.9.49] 精确匹配防备份劫持（同上传端 4346 注释） */
+                const seZst = seParts.length ? null : seFiles.find(x => x === 'session.v4.jsonl.zstd')
                 /* [exp.5 C 车道下载适配] 云端 C 形态唯一=session.v4.jsonl（.zstd 已互斥清理）。
                    阶段一必须认 jsonl 副本，否则 B 段机械覆盖在 jsonl 形态下收集零副本=
                    会话下载空转 + wsGroups 空 → pruneLocalOnlySessions 删除对账一并失效
