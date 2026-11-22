@@ -66,26 +66,103 @@ function rebuildSqliteFromJsonl(jsonlPath, outPath) {
   // 落库 → FOREIGN KEY constraint failed。schema 里 REFERENCES 定义原样保留，落地前 foreign_key_check 画像随返回值带出。
   const db = new DatabaseSync(outPath, { enableForeignKeyConstraints: false })
   try {
-    for (const line of lines) {
-      const o = JSON.parse(line)
-      if (o.k === 'ddl') db.exec(o.sql)
-    }
+    /* [9999.9.50 性能根修] 全部写入包进单事务。旧版逐行 autocommit：每行一次隐式提交
+       ≈ 一次刷盘，Android flash 上 13,590 行实测 203.9s（11-21「零变化下载仍卡 3 分钟」
+       主犯之一）。包事务 + 回滚日志放内存后，同数据量实测降为个位数秒。临时库用完即弃
+       （调用方 rm 后重建），进程中断留下的半成品无害。 */
+    db.exec('PRAGMA journal_mode = MEMORY')
+    db.exec('BEGIN')
     let n = 0
-    for (const line of lines) {
-      const o = JSON.parse(line)
-      if (o.k !== 'row') continue
-      const cols = Object.keys(o.r)
-      if (!cols.length) continue
-      const vals = cols.map(c => {
-        const v = o.r[c]
-        return (v && typeof v === 'object' && v.__b64 !== undefined) ? Buffer.from(v.__b64, 'base64') : v
-      })
-      db.prepare(`INSERT INTO "${o.t}" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals)
-      n++
+    try {
+      for (const line of lines) {
+        const o = JSON.parse(line)
+        if (o.k === 'ddl') db.exec(o.sql)
+      }
+      for (const line of lines) {
+        const o = JSON.parse(line)
+        if (o.k !== 'row') continue
+        const cols = Object.keys(o.r)
+        if (!cols.length) continue
+        const vals = cols.map(c => {
+          const v = o.r[c]
+          return (v && typeof v === 'object' && v.__b64 !== undefined) ? Buffer.from(v.__b64, 'base64') : v
+        })
+        db.prepare(`INSERT INTO "${o.t}" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals)
+        n++
+      }
+      db.exec('COMMIT')
+    } catch (eTx) {
+      try { db.exec('ROLLBACK') } catch {}
+      throw eTx
     }
     const fkBad = db.prepare('PRAGMA foreign_key_check').all()
     return { lines: lines.length, rows: n, fkViolations: fkBad.length, fkDetail: fkBad.slice(0, 20) }
   } finally { db.close() }
+}
+
+/* ── [9999.9.50 fork 兜底升级] SQL 级整体替换：宿主在线时替代「整文件覆盖」的安全落地 ──
+ * 背景（11-21 手机实锤）：PC 对共享 memory 车道做非 append-only 重写（改旧行）→
+ * planSqliteJsonlDelta 返回 fork → 退回全量重建 → 落地必须整文件覆盖 live 主文件。
+ * Windows 下 safeSqliteLanding 靠「rm -wal 失败=宿主在写」挡住；Android/Linux 的 unlink
+ * 对打开中文件照样成功 → 守卫失效 → 宿主活着时主文件被覆盖 + WAL 被孤儿化（11-17 事故
+ * 配方的平台变体，2026-11-21 16:50 手机实发，16:53 重启丢未 checkpoint 尾巴）。
+ * 本函数与整文件覆盖语义一致（live := 云端 jsonl 全量，含行删除/行更新），但走 SQL：
+ * 单事务 DELETE 全部导出表 + FTS 影子表 → 重插全部行 → COMMIT；任何一步失败 ROLLBACK，
+ * live 原样无损。WAL 多连接并发安全，宿主在线可用，无需退出 DSH。
+ * 前置条件：DDL 与 live 完全一致——调用方仅在 plan.reason 以 fork:/shrink: 开头（该判定
+ * 在 ddl-diff 校验之后）或重建临时库已过 integrity 门时调用。FTS 影子表本就不导，
+ * 清空后由宿主 initFts 自愈（与全量重建新建空 FTS 同语义）。 */
+function sqlReplaceLiveFromJsonl(livePath, jsonlPath) {
+  const lines = fs.readFileSync(jsonlPath, 'utf8').split('\n').filter(Boolean)
+  const db = new DatabaseSync(livePath, { enableForeignKeyConstraints: false })
+  try {
+    db.exec('PRAGMA busy_timeout=3000')
+    // 删除集合 = 云端 DDL 里的全部表（含云端已清空的零行表）∪ 出现过行线的表
+    const delTables = []
+    const seen = new Set()
+    for (const line of lines) {
+      let o = null
+      try { o = JSON.parse(line) } catch { continue }
+      if (!o || o.k !== 'ddl' || o.type !== 'table' || !o.name || seen.has(o.name)) continue
+      seen.add(o.name); delTables.push(o.name)
+    }
+    for (const line of lines) {
+      let o = null
+      try { o = JSON.parse(line) } catch { continue }
+      if (!o || o.k !== 'row' || !o.t || seen.has(o.t)) continue
+      seen.add(o.t); delTables.push(o.t)
+    }
+    /* FTS 影子族（与导出过滤同口径）一并清空：主表行全换后旧索引必脏。外部内容表可能
+       拒绝直接 DELETE → 尽力清（失败不阻断），宿主 initFts 自愈兜底。 */
+    let ftsTables = []
+    try {
+      ftsTables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'`).all().map(r => r.name).filter(n => /_fts/.test(n))
+    } catch {}
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      for (const t of ftsTables) { try { db.exec(`DELETE FROM "${t}"`) } catch {} }
+      for (const t of delTables) db.exec(`DELETE FROM "${t}"`)
+      let n = 0
+      for (const line of lines) {
+        const o = JSON.parse(line)
+        if (o.k !== 'row') continue
+        const cols = Object.keys(o.r)
+        if (!cols.length) continue
+        const vals = cols.map(c => {
+          const v = o.r[c]
+          return (v && typeof v === 'object' && v.__b64 !== undefined) ? Buffer.from(v.__b64, 'base64') : v
+        })
+        db.prepare(`INSERT OR REPLACE INTO "${o.t}" (${cols.map(c => `"${c}"`).join(',')}) VALUES (${cols.map(() => '?').join(',')})`).run(...vals)
+        n++
+      }
+      db.exec('COMMIT')
+      try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch {}
+      return { rows: n, tables: delTables.length, ftsCleared: ftsTables.length }
+    } catch (eTx) {
+      try { db.exec('ROLLBACK') } catch {}
+      throw eTx
+    }
+  } finally { try { db.close() } catch {} }
 }
 
 /* ── [差量化路线 §B 9999.9.46] sqlite 下载端差量落地（用户拍板「就该差量」，2026-11-17）──
@@ -185,4 +262,4 @@ function applySqliteJsonlDelta(livePath, tail) {
   } finally { try { db.close() } catch {} }
 }
 
-module.exports = { exportSqliteJsonl, rebuildSqliteFromJsonl, parseJsonlStructure, planSqliteJsonlDelta, applySqliteJsonlDelta }
+module.exports = { exportSqliteJsonl, rebuildSqliteFromJsonl, sqlReplaceLiveFromJsonl, parseJsonlStructure, planSqliteJsonlDelta, applySqliteJsonlDelta }

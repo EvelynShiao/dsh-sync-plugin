@@ -1824,7 +1824,53 @@ function walCheckpointTruncate(dbPath) {
   } catch { /* busy/损坏：调用方以 -wal size 复核为准 */ }
 }
 
-async function safeSqliteLanding(livePath, logger) {
+/* ── [9999.9.50 宿主在线守卫·平台语义修正] ──────────────────────────────────
+ * 旧守卫逻辑 = 「rm -wal 失败 ⇒ 宿主在写 ⇒ 拒绝」。那是 Windows 语义；Android/Linux
+ * 的 unlink 对打开中文件照样成功 → 守卫在手机上必然失效（2026-11-21 16:50 实锤：宿主
+ * 活着时 memory.sqlite 主文件被整文件覆盖、WAL 被孤儿化，16:53 重启丢未 checkpoint
+ * 尾巴 = 11-17 事故配方的平台变体）。Linux 侧改扫 /proc 各进程的 fd 链接：任何进程仍
+ * 持有 库/-wal/-shm 打开句柄即视为「宿主在线」。Windows 无 /proc，恒 false → 行为完全
+ * 退回旧 rm-fails 语义（PC 现状不变）。 */
+function sqliteHostHoldsFd(livePath) {
+  if (process.platform === 'win32') return false
+  const fsx = require('node:fs')
+  const pathMod = require('node:path')
+  let targets
+  try { targets = new Set([pathMod.resolve(livePath), pathMod.resolve(livePath + '-wal'), pathMod.resolve(livePath + '-shm')]) } catch { return false }
+  let pids = []
+  try { pids = fsx.readdirSync('/proc').filter((p) => /^\d+$/.test(p)) } catch { return false }
+  for (const pid of pids) {
+    let fds = []
+    try { fds = fsx.readdirSync('/proc/' + pid + '/fd') } catch { continue }
+    for (const fd of fds) {
+      let t = null
+      try { t = fsx.readlinkSync('/proc/' + pid + '/fd/' + fd) } catch { continue }
+      try { if (targets.has(pathMod.resolve(String(t)))) return true } catch {}
+    }
+  }
+  return false
+}
+
+/* [9999.9.50] 下载性能/结果落盘日志。ctx.logger 只进 console（手机端随重启丢失，
+ * 11-21 取证时两轮下载的日志全灭）。关键节点同步追加进 logs/dsh-sync-init.log，
+ * 用户「看看日志」才真的有得看。失败静默——日志绝不阻断同步。 */
+function syncLogLine(line) {
+  try { require('node:fs').appendFileSync(join(dshHome(), 'logs', 'dsh-sync-init.log'), new Date().toISOString() + ' ' + line + '\n') } catch {}
+}
+
+async function safeSqliteLanding(livePath, logger, opts) {
+  /* opts.strict=true（raw copyFile / .zst 落地）：宿主仍持有连接 → 拒绝整文件覆盖。
+     opts.strict=false（jsonl 差量/重建路径前置）：宿主在线时只跳过 WAL 清理
+     （差量写本就 WAL 多连接并发安全），不拦路；后续若走到「整文件覆盖」另有守卫。 */
+  const strict = !!(opts && opts.strict)
+  if (sqliteHostHoldsFd(livePath)) {
+    if (strict) {
+      const msg = livePath + ' 仍有进程持有打开句柄（宿主在线），拒绝整文件覆盖以防 WAL 孤儿/新旧页错位（11-17 事故配方·Linux 平台变体）；请稍后重试或重启 DSH。'
+      try { if (logger && typeof logger.warn === 'function') logger.warn('[dsh-sync] sqlite 落地安全封装: ' + msg) } catch {}
+      return { ok: false, reason: msg }
+    }
+    return { ok: true, hostOnline: true }
+  }
   const fsx = require('node:fs')
   const walPath = livePath + '-wal'
   try { fsx.rmSync(walPath, { force: true }) } catch {}
@@ -4592,6 +4638,8 @@ module.exports = {
       }
       const allDownloadedSessionIds = [],
         skipped = []
+      const notes = []
+      const tDl0 = Date.now()
       let finalWorkspacePath = null
       const remote = await ensureShadowRepo(eff.gitBinary, eff, repoDir)
       const spec = syncSpec(eff, defaultRoots(), state.instanceId)
@@ -4602,16 +4650,31 @@ module.exports = {
       }
       const hasRemote = await gitExec(eff.gitBinary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
       if (!hasRemote) return { downloaded: false, empty: true }
+      /* [9999.9.50 下载侧极速短路（窄版）] FETCH_HEAD == HEAD ⇒ 云端 tip 本机影子仓
+         已是同一提交。影子仓工作树只被本插件三条路写（checkout / reset --hard /
+         upload 的 commit），HEAD 即工作树内容 → checkout+reset 的全树扫描（手机实测
+         ~18s，11-21 两次下载各吃一遍）纯白做，直接跳过。唯一脏树场景 = 上传中途被杀
+         （残留的是本机自身内容，车道门会校验，后续上传自会重新收编）。车道差量逻辑
+         照常执行（本地活体可能变了），此短路只免 git 层。 */
+      let headSha = null, fetchSha = null
       try {
-        await gitExec(eff.gitBinary, ['checkout', eff.branch], repoDir)
-      } catch (e) {
-        skipped.push('checkout ' + eff.branch + ' 失败: ' + String(e && e.message))
-      }
-      try {
-        await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir)
-      } catch (e) {
-        // [fix-1] 老代码是 .catch(()=>{}) —— 失败被吞掉，界面照样报「下载完成」
-        throw new Error('影子仓库更新失败：' + String(e && e.message) + '。最常见原因是上次中断留下的 index.lock。')
+        headSha = String(await gitExec(eff.gitBinary, ['rev-parse', 'HEAD'], repoDir)).trim()
+        fetchSha = String(await gitExec(eff.gitBinary, ['rev-parse', 'FETCH_HEAD'], repoDir)).trim()
+      } catch {}
+      if (headSha && fetchSha && headSha === fetchSha) {
+        syncLogLine('下载极速短路: FETCH_HEAD==HEAD(' + headSha.slice(0, 10) + ')，免 checkout/reset 全树扫描')
+      } else {
+        try {
+          await gitExec(eff.gitBinary, ['checkout', eff.branch], repoDir)
+        } catch (e) {
+          skipped.push('checkout ' + eff.branch + ' 失败: ' + String(e && e.message))
+        }
+        try {
+          await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir)
+        } catch (e) {
+          // [fix-1] 老代码是 .catch(()=>{}) —— 失败被吞掉，界面照样报「下载完成」
+          throw new Error('影子仓库更新失败：' + String(e && e.message) + '。最常见原因是上次中断留下的 index.lock。')
+        }
       }
       const applied = []
       for (const group of spec) {
@@ -4642,12 +4705,16 @@ module.exports = {
           if (src.file) {
             try {
               await fsP.mkdir(join(src.from, '..'), { recursive: true })
+              let skipLandingCleanup = false
               /* [2026-11-17 挂账②根修 9999.9.44-exp.4] sqlite 三条落地路径（raw/copyFile、
                  .zst 解压、jsonl 重建）统一先过 safeSqliteLanding：先删/收敛 live 旧 -wal，
                  防「WAL 帧套在被覆盖的新主文件上」新旧页错位（11-17 15:29 memory.sqlite
-                 被本路径炸成 malformed 的根因；exp.1 加 jsonl 分支时漏接了门②）。 */
+                 被本路径炸成 malformed 的根因；exp.1 加 jsonl 分支时漏接了门②）。
+                 [9999.9.50] strict=!haveJsonl：jsonl 车道（差量 / SQL 级替换）WAL 多连接
+                 并发安全，宿主在线也可进行 → 前置只做 Clean-WAL 不拦路；raw/.zst 是
+                 整文件覆盖，宿主在线必须拒绝（Linux 旧守卫失效的补丁）。 */
               if (isSqliteSrc) {
-                const land = await safeSqliteLanding(src.from, eff && eff.logger)
+                const land = await safeSqliteLanding(src.from, eff && eff.logger, { strict: !haveJsonl })
                 if (!land.ok) { skipped.push(src.to + '（' + land.reason + '）'); continue }
               }
               if (!haveSource && haveZst) {
@@ -4674,30 +4741,53 @@ module.exports = {
                    云端===留档（0 行差量）→ live 一个字节不动（比全量重建更保守更安全）。 */
                 const laneBase = String(src.to).split(/[\\/]/).pop()
                 const laneArchive = join(syncDir, 'lane-state', laneBase + '.jsonl')
+                const tLane0 = Date.now()
                 let deltaDone = false
+                let forkReasonJ = null
                 try {
                   const cloudTextJ = await fsP.readFile(source + '.jsonl', 'utf8')
                   const archTextJ = await fsP.readFile(laneArchive, 'utf8').catch(() => null)
                   if (archTextJ !== null && sqliteJsonl.planSqliteJsonlDelta && sqliteJsonl.applySqliteJsonlDelta) {
                     const planJ = sqliteJsonl.planSqliteJsonlDelta(cloudTextJ, archTextJ)
-                    if (planJ.ok) {
+                    if (planJ.ok && (!planJ.tail || !planJ.tail.length)) {
+                      /* [9999.9.50 零变化 no-op] 0 行差量 = live 一个字节不用动、留档一字节
+                         不用重写。旧版这里仍会：开 live 库 BEGIN IMMEDIATE +
+                         wal_checkpoint(TRUNCATE) + 重写整份 20MB 留档；撞上宿主写锁
+                         （busy_timeout 3s）还会 throw → 静默掉进全量重建（11-21 实测
+                         knowledge 车道 5s / memory 车道 172s 的不对称即此机制）。 */
+                      if (cloudTextJ === archTextJ) {
+                        try { ctx.logger?.info?.(`[dsh-sync] sqlite 零变化: ${laneBase}（免落库免重写留档）`) } catch {}
+                        syncLogLine(`sqlite 零变化 no-op: ${laneBase} ${Date.now() - tLane0}ms`)
+                        notes.push(`${laneBase}: 零变化（no-op）`)
+                      } else {
+                        try { await atomicWriteFile(laneArchive, cloudTextJ) } catch {}
+                        syncLogLine(`sqlite 零行差量(仅对齐留档字节): ${laneBase} ${Date.now() - tLane0}ms`)
+                        notes.push(`${laneBase}: 0 行差量`)
+                      }
+                      deltaDone = true
+                    } else if (planJ.ok) {
                       const hbPre = sqliteHealthy(src.from)
                       if (!hbPre.healthy) throw new Error('live 库不健康（' + hbPre.detail + '），拒绝差量写入')
                       const rDelta = sqliteJsonl.applySqliteJsonlDelta(src.from, planJ.tail)
                       try { await atomicWriteFile(laneArchive, cloudTextJ) } catch {}
                       try { ctx.logger?.info?.(`[dsh-sync] sqlite 差量落地: ${laneBase} 尾部 ${rDelta.applied} 行（免全量重建）`) } catch {}
+                      syncLogLine(`sqlite 差量落地: ${laneBase} rows=${rDelta.applied} ${Date.now() - tLane0}ms`)
+                      notes.push(`${laneBase}: 差量落地 ${rDelta.applied} 行`)
                       deltaDone = true
                     } else {
+                      forkReasonJ = planJ.reason
                       try { ctx.logger?.info?.(`[dsh-sync] sqlite 差量不可用（${planJ.reason}），走全量重建: ${laneBase}`) } catch {}
                     }
                   }
                 } catch (eDelta) {
                   try { ctx.logger?.warn?.('[dsh-sync] sqlite 差量落地异常，退回全量重建: ' + String((eDelta && eDelta.message) || eDelta).slice(0, 160)) } catch {}
+                  syncLogLine(`sqlite 差量异常退回全量重建: ${laneBase} err=${String((eDelta && eDelta.message) || eDelta).slice(0, 120)}`)
                   deltaDone = false
                 }
                 if (!deltaDone) {
                 /* [exp/text-export] JSONL 重建→临时库→integrity 门→落地（无 sidecar：
-                   git blob 自身一致 + integrity 双保险；FTS 族不导，宿主 initFts 自愈）。 */
+                   git blob 自身一致 + integrity 双保险；FTS 族不导，宿主 initFts 自愈）。
+                   [9999.9.50] 重建本体已包单事务（原逐行 autocommit 手机实测 203.9s → 秒级）。 */
                 const tmpRebuild = src.from + '.jsonl-rebuild.tmp'
                 sqliteJsonl.rebuildSqliteFromJsonl(source + '.jsonl', tmpRebuild)
                 const plainJ = await fsP.readFile(tmpRebuild)
@@ -4712,18 +4802,51 @@ module.exports = {
                     await fsP.writeFile(join(qDirJ, stampQ + '-' + src.to.split(/[\\/]/).pop() + '.jsonl'), await fsP.readFile(source + '.jsonl'))
                   } catch {}
                   skipped.push(src.to + '.jsonl（重建后 integrity 不通过，云端副本已隔离，拒绝落地）')
+                  syncLogLine(`sqlite 全量重建 integrity 拒绝: ${laneBase}（云端副本已隔离）`)
                   continue
                 }
-                await fsP.writeFile(src.from, plainJ)
+                /* [9999.9.50 宿主在线守卫] 整文件覆盖前：任何进程仍持有该库句柄（Linux 下
+                   旧「rm -wal 失败」守卫必然失效，11-21 手机实发覆盖+孤儿 WAL）→ 改走
+                   SQL 级整体替换（同语义、WAL 并发安全、宿主无需退出）；SQL 替换也失败
+                   才拒跳并明说原因——不再静默吞，更不再带病覆盖。 */
+                if (sqliteHostHoldsFd(src.from)) {
+                  let sqlErr = null
+                  try {
+                    if (!sqliteJsonl.sqlReplaceLiveFromJsonl) throw new Error('sqlReplaceLiveFromJsonl 不可用（旧版模块）')
+                    const rrSql = sqliteJsonl.sqlReplaceLiveFromJsonl(src.from, source + '.jsonl')
+                    try { ctx.logger?.info?.(`[dsh-sync] sqlite SQL级整体替换(宿主在线): ${laneBase} rows=${rrSql.rows} tables=${rrSql.tables} ftsCleared=${rrSql.ftsCleared}`) } catch {}
+                    syncLogLine(`sqlite SQL级整体替换(宿主在线): ${laneBase} rows=${rrSql.rows} ${Date.now() - tLane0}ms (fork=${forkReasonJ || 'rebuild'})`)
+                    notes.push(`${laneBase}: SQL级整体替换 ${rrSql.rows} 行（宿主在线）`)
+                  } catch (eSql) { sqlErr = eSql }
+                  if (sqlErr) {
+                    const msgSql = `${laneBase}（fork=${forkReasonJ || 'n/a'}）：宿主在线禁止整文件覆盖，SQL 级替换也失败（${String((sqlErr && sqlErr.message) || sqlErr).slice(0, 140)}）→ 本轮不落地、留档不推进；重启 DSH 后再点下载即可整文件落地。`
+                    skipped.push(src.to + '（' + msgSql + '）')
+                    try { ctx.logger?.warn?.('[dsh-sync] sqlite 落地拒绝: ' + msgSql) } catch {}
+                    syncLogLine('sqlite 落地拒绝: ' + msgSql)
+                    continue
+                  }
+                  skipLandingCleanup = true   /* SQL 替换走正常 WAL 提交，-wal 是活数据，绝不能删 */
+                } else {
+                  await fsP.writeFile(src.from, plainJ)
+                }
                 /* [差量化 §B] 全量重建落地成功 → 同步推进留档到云端状态（下一轮起吃差量） */
                 try { await atomicWriteFile(laneArchive, await fsP.readFile(source + '.jsonl')) } catch {}
+                syncLogLine(`sqlite 全量重建落地: ${laneBase} ${Date.now() - tLane0}ms (fork=${forkReasonJ || '差量不可用'})`)
+                notes.push(`${laneBase}: 全量重建落地（${forkReasonJ || '差量不可用'}）`)
                 }
               } else {
                 await fsP.copyFile(source, src.from)
               }
-              if (isSqliteSrc) { try { await sqliteLandingCleanup(src.from) } catch {} }
+              if (isSqliteSrc && !skipLandingCleanup) { try { await sqliteLandingCleanup(src.from) } catch {} }
               applied.push(src.to)
-            } catch {}
+            } catch (eSrc) {
+              /* [9999.9.50] 旧版纯静默——11-21「下载完成但巨慢、悄悄没落地」用户只能干等。
+                 现在进 skipped 回执 + 落盘日志，失败可见（同 fix-1/fix-2 红线语义）。 */
+              const msgSrc = String((eSrc && eSrc.message) || eSrc).slice(0, 200)
+              skipped.push(src.to + '（处理异常: ' + msgSrc + '）')
+              try { ctx.logger?.warn?.('[dsh-sync] 条目处理异常 ' + src.to + ': ' + msgSrc) } catch {}
+              syncLogLine('条目处理异常: ' + src.to + ' err=' + msgSrc)
+            }
           } else if (group.name === 'sessions') {
             const zlib2 = require('node:zlib')
             const downloadedSessionIds = []
@@ -5259,7 +5382,8 @@ module.exports = {
       try { ctx.logger?.info?.('dsh-sync: download done, sessions refresh dispatched') } catch {}
       state.lastSyncAt = new Date().toISOString()
       await saveState()
-      return { downloaded: true, applied, skipped }
+      syncLogLine(`下载完成: applied=${applied.length} skipped=${skipped.length} 总耗时${((Date.now() - tDl0) / 1000).toFixed(1)}s`)
+      return { downloaded: true, applied, skipped, notes }
     }
     // ── Agent-run jobs (action buttons → apiproxy 主对话级 session) ──
     // conflictRunJobs: 冲突 PR 解决；alignRunJobs: AI 智能对齐（语义合并双方改动）
