@@ -138,10 +138,8 @@ window.__ModuleLoader__.load({
       autoSyncLabel: '定时自动同步',
       syncOnStartupLabel: '启动时同步',
       intervalLabel: '同步间隔（分钟）',
-      sessionsPartsLabel: '会话增量上传',
-      sessionsPartsHint: '会话按增量分片上传，云端历史垃圾降 3-4 个数量级（省流量、省仓库体积）。要求两端插件都 ≥9999.9.20',
-      sessionsDeleteSyncLabel: '会话覆盖删除',
-      sessionsDeleteSyncHint: '纯机械镜像：上传=本地为准，云端有本机没有的直接删；下载=云端为准，本机有云端没有的直接删、云端有的直接覆盖本机。不判断新旧、无豁免',
+      sessionsDeleteSyncLabel: '会话删除传导',
+      sessionsDeleteSyncHint: '开启后：上传时本机已删的会话会同步删云端；下载时云端已删的会话会同步删本机。关闭则删除操作互不影响（同名会话的覆盖同步不受此开关控制）。有防回滚/防误删守卫',
       conflictModeLabel: '冲突处理',
       conflictModeAi: 'AI 处理（推荐）',
       conflictModeManual: '人工网页合并',
@@ -279,10 +277,8 @@ window.__ModuleLoader__.load({
       autoSyncLabel: 'Auto sync on schedule',
       syncOnStartupLabel: 'Sync on startup',
       intervalLabel: 'Interval (minutes)',
-      sessionsPartsLabel: 'Incremental session upload',
-      sessionsPartsHint: 'Upload sessions as incremental parts — cloud garbage drops by 3-4 orders of magnitude. Requires both ends on plugin >= 9999.9.20',
-      sessionsDeleteSyncLabel: 'Session deletion sync (tombstones)',
-      sessionsDeleteSyncHint: 'Sessions deleted locally are tombstoned and removed from the cloud; download no longer resurrects them. Newer cloud copies (peer kept chatting after deletion) win over tombstones. Tombstones expire after 30 days',
+      sessionsDeleteSyncLabel: 'Session deletion sync',
+      sessionsDeleteSyncHint: 'When on: uploading deletes cloud sessions removed locally; downloading deletes local sessions removed from cloud. When off, deletions do not propagate (overwrite of same-id sessions is unaffected). Rollback and accidental-deletion guards apply',
       conflictModeLabel: 'Conflict handling',
       conflictModeAi: 'AI resolve (recommended)',
       conflictModeManual: 'Manual web merge',
@@ -759,7 +755,6 @@ window.__ModuleLoader__.load({
       const [autoSync, setAutoSync] = useState(true)
       const [syncOnStartup, setSyncOnStartup] = useState(false)
       // [2026-11-04] 会话增量上传：默认 true（用户钦定默认开，可在面板关）。
-      const [sessionsParts, setSessionsParts] = useState(true)
       // [9999.9.26] 会话覆盖删除：默认 true（上传删云端多余 + 下载删本机多余，纯机械镜像）。
       const [sessionsDeleteSync, setSessionsDeleteSync] = useState(true)
       const [conflictMode, setConflictMode] = useState('ai')
@@ -787,7 +782,6 @@ window.__ModuleLoader__.load({
         setAutoSync(d.autoSync)
         setSyncOnStartup(d.syncOnStartup)
         // 后端缺字段（旧版宿主半）时按默认开处理，避免面板显示成关
-        setSessionsParts(d.sessionsParts !== false)
         setSessionsDeleteSync(d.sessionsDeleteSync !== false)
         setConflictMode(d.conflictMode)
         // [2026-11-11 UI 化] 体积自愈配置回填（后端缺字段按默认处理；占比 UI 存 %，后端存 0-1）
@@ -910,7 +904,7 @@ window.__ModuleLoader__.load({
       }
       const doSave = async () => {
         try {
-          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsParts, sessionsDeleteSync, repoGcThresholdMB: gcThreshold, gcOrphanRatio: (Number(gcOrphanRatioPct) || 0) / 100, gcOrphanMinPackMB: gcOrphanMinPack, rebuildAutoEnabled: rebuildAuto, rebuildEveryUploads: rebuildEvery }
+          const patch = { repoUrl, branch, intervalMinutes, autoSync, syncOnStartup, conflictMode, syncSkills: g.skills, syncSessions: g.sessions, syncSettings: g.settings, syncPlugins: g.plugins, syncMemory: g.memory, syncKnowledge: g.knowledge, memoryStrategy: gs.memory, knowledgeStrategy: gs.knowledge, skillsStrategy: gs.skills, sessionsStrategy: gs.sessions, settingsStrategy: gs.settings, pluginsStrategy: gs.plugins, snapshotAuto: snapCfg.auto, snapshotSkills: snapCfg.skills, snapshotLocalKeep: snapCfg.localKeep, sessionsDeleteSync, repoGcThresholdMB: gcThreshold, gcOrphanRatio: (Number(gcOrphanRatioPct) || 0) / 100, gcOrphanMinPackMB: gcOrphanMinPack, rebuildAutoEnabled: rebuildAuto, rebuildEveryUploads: rebuildEvery }
           if (token !== '') patch.token = token
           await putSettings(patch)
           setToken('')
@@ -1029,9 +1023,6 @@ window.__ModuleLoader__.load({
                   h('input', { type: 'checkbox', checked: autoSync, onChange: e => setAutoSync(e.target.checked) }), t('autoSyncLabel')),
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   h('input', { type: 'checkbox', checked: syncOnStartup, onChange: e => setSyncOnStartup(e.target.checked) }), t('syncOnStartupLabel')),
-                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
-                  h('input', { type: 'checkbox', checked: sessionsParts, onChange: e => setSessionsParts(e.target.checked) }), t('sessionsPartsLabel')),
-                h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('sessionsPartsHint')),
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   h('input', { type: 'checkbox', checked: sessionsDeleteSync, onChange: e => setSessionsDeleteSync(e.target.checked) }), t('sessionsDeleteSyncLabel')),
                 h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('sessionsDeleteSyncHint')),
