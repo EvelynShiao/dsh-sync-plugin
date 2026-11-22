@@ -755,7 +755,7 @@ window.__ModuleLoader__.load({
       const [autoSync, setAutoSync] = useState(true)
       const [syncOnStartup, setSyncOnStartup] = useState(false)
       // [2026-11-04] 会话增量上传：默认 true（用户钦定默认开，可在面板关）。
-      // [9999.9.26] 会话覆盖删除：默认 true（上传删云端多余 + 下载删本机多余，纯机械镜像）。
+      // 会话删除传导：默认 true（上传删云端多余 + 下载删本机多余；有防回滚/prune 白名单守卫）。
       const [sessionsDeleteSync, setSessionsDeleteSync] = useState(true)
       const [conflictMode, setConflictMode] = useState('ai')
       // [2026-11-11 UI 化] 体积自愈：gc 体积线 / 孤儿占比线（UI 用 %）/ 孤儿 gc 下限 / 自动删仓重建总闸
