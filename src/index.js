@@ -1824,7 +1824,7 @@ function walCheckpointTruncate(dbPath) {
   } catch { /* busy/损坏：调用方以 -wal size 复核为准 */ }
 }
 
-/* ── [9999.9.50 宿主在线守卫·平台语义修正] ──────────────────────────────────
+/* ── [9999.9.9 宿主在线守卫·平台语义修正] ──────────────────────────────────
  * 旧守卫逻辑 = 「rm -wal 失败 ⇒ 宿主在写 ⇒ 拒绝」。那是 Windows 语义；Android/Linux
  * 的 unlink 对打开中文件照样成功 → 守卫在手机上必然失效（2026-11-21 16:50 实锤：宿主
  * 活着时 memory.sqlite 主文件被整文件覆盖、WAL 被孤儿化，16:53 重启丢未 checkpoint
@@ -1851,7 +1851,7 @@ function sqliteHostHoldsFd(livePath) {
   return false
 }
 
-/* [9999.9.50] 下载性能/结果落盘日志。ctx.logger 只进 console（手机端随重启丢失，
+/* [9999.9.9] 下载性能/结果落盘日志。ctx.logger 只进 console（手机端随重启丢失，
  * 11-21 取证时两轮下载的日志全灭）。关键节点同步追加进 logs/dsh-sync-init.log，
  * 用户「看看日志」才真的有得看。失败静默——日志绝不阻断同步。 */
 function syncLogLine(line) {
@@ -4650,7 +4650,7 @@ module.exports = {
       }
       const hasRemote = await gitExec(eff.gitBinary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
       if (!hasRemote) return { downloaded: false, empty: true }
-      /* [9999.9.50 下载侧极速短路（窄版）] FETCH_HEAD == HEAD ⇒ 云端 tip 本机影子仓
+      /* [9999.9.9 下载侧极速短路（窄版）] FETCH_HEAD == HEAD ⇒ 云端 tip 本机影子仓
          已是同一提交。影子仓工作树只被本插件三条路写（checkout / reset --hard /
          upload 的 commit），HEAD 即工作树内容 → checkout+reset 的全树扫描（手机实测
          ~18s，11-21 两次下载各吃一遍）纯白做，直接跳过。唯一脏树场景 = 上传中途被杀
@@ -4710,7 +4710,7 @@ module.exports = {
                  .zst 解压、jsonl 重建）统一先过 safeSqliteLanding：先删/收敛 live 旧 -wal，
                  防「WAL 帧套在被覆盖的新主文件上」新旧页错位（11-17 15:29 memory.sqlite
                  被本路径炸成 malformed 的根因；exp.1 加 jsonl 分支时漏接了门②）。
-                 [9999.9.50] strict=!haveJsonl：jsonl 车道（差量 / SQL 级替换）WAL 多连接
+                 [9999.9.9] strict=!haveJsonl：jsonl 车道（差量 / SQL 级替换）WAL 多连接
                  并发安全，宿主在线也可进行 → 前置只做 Clean-WAL 不拦路；raw/.zst 是
                  整文件覆盖，宿主在线必须拒绝（Linux 旧守卫失效的补丁）。 */
               if (isSqliteSrc) {
@@ -4750,7 +4750,7 @@ module.exports = {
                   if (archTextJ !== null && sqliteJsonl.planSqliteJsonlDelta && sqliteJsonl.applySqliteJsonlDelta) {
                     const planJ = sqliteJsonl.planSqliteJsonlDelta(cloudTextJ, archTextJ)
                     if (planJ.ok && (!planJ.tail || !planJ.tail.length)) {
-                      /* [9999.9.50 零变化 no-op] 0 行差量 = live 一个字节不用动、留档一字节
+                      /* [9999.9.9 零变化 no-op] 0 行差量 = live 一个字节不用动、留档一字节
                          不用重写。旧版这里仍会：开 live 库 BEGIN IMMEDIATE +
                          wal_checkpoint(TRUNCATE) + 重写整份 20MB 留档；撞上宿主写锁
                          （busy_timeout 3s）还会 throw → 静默掉进全量重建（11-21 实测
@@ -4787,7 +4787,7 @@ module.exports = {
                 if (!deltaDone) {
                 /* [exp/text-export] JSONL 重建→临时库→integrity 门→落地（无 sidecar：
                    git blob 自身一致 + integrity 双保险；FTS 族不导，宿主 initFts 自愈）。
-                   [9999.9.50] 重建本体已包单事务（原逐行 autocommit 手机实测 203.9s → 秒级）。 */
+                   [9999.9.9] 重建本体已包单事务（原逐行 autocommit 手机实测 203.9s → 秒级）。 */
                 const tmpRebuild = src.from + '.jsonl-rebuild.tmp'
                 sqliteJsonl.rebuildSqliteFromJsonl(source + '.jsonl', tmpRebuild)
                 const plainJ = await fsP.readFile(tmpRebuild)
@@ -4805,7 +4805,7 @@ module.exports = {
                   syncLogLine(`sqlite 全量重建 integrity 拒绝: ${laneBase}（云端副本已隔离）`)
                   continue
                 }
-                /* [9999.9.50 宿主在线守卫] 整文件覆盖前：任何进程仍持有该库句柄（Linux 下
+                /* [9999.9.9 宿主在线守卫] 整文件覆盖前：任何进程仍持有该库句柄（Linux 下
                    旧「rm -wal 失败」守卫必然失效，11-21 手机实发覆盖+孤儿 WAL）→ 改走
                    SQL 级整体替换（同语义、WAL 并发安全、宿主无需退出）；SQL 替换也失败
                    才拒跳并明说原因——不再静默吞，更不再带病覆盖。 */
@@ -4840,7 +4840,7 @@ module.exports = {
               if (isSqliteSrc && !skipLandingCleanup) { try { await sqliteLandingCleanup(src.from) } catch {} }
               applied.push(src.to)
             } catch (eSrc) {
-              /* [9999.9.50] 旧版纯静默——11-21「下载完成但巨慢、悄悄没落地」用户只能干等。
+              /* [9999.9.9] 旧版纯静默——11-21「下载完成但巨慢、悄悄没落地」用户只能干等。
                  现在进 skipped 回执 + 落盘日志，失败可见（同 fix-1/fix-2 红线语义）。 */
               const msgSrc = String((eSrc && eSrc.message) || eSrc).slice(0, 200)
               skipped.push(src.to + '（处理异常: ' + msgSrc + '）')

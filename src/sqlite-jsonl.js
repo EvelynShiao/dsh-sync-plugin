@@ -66,7 +66,7 @@ function rebuildSqliteFromJsonl(jsonlPath, outPath) {
   // 落库 → FOREIGN KEY constraint failed。schema 里 REFERENCES 定义原样保留，落地前 foreign_key_check 画像随返回值带出。
   const db = new DatabaseSync(outPath, { enableForeignKeyConstraints: false })
   try {
-    /* [9999.9.50 性能根修] 全部写入包进单事务。旧版逐行 autocommit：每行一次隐式提交
+    /* [9999.9.9 性能根修] 全部写入包进单事务。旧版逐行 autocommit：每行一次隐式提交
        ≈ 一次刷盘，Android flash 上 13,590 行实测 203.9s（11-21「零变化下载仍卡 3 分钟」
        主犯之一）。包事务 + 回滚日志放内存后，同数据量实测降为个位数秒。临时库用完即弃
        （调用方 rm 后重建），进程中断留下的半成品无害。 */
@@ -100,7 +100,7 @@ function rebuildSqliteFromJsonl(jsonlPath, outPath) {
   } finally { db.close() }
 }
 
-/* ── [9999.9.50 fork 兜底升级] SQL 级整体替换：宿主在线时替代「整文件覆盖」的安全落地 ──
+/* ── [9999.9.9 fork 兜底升级] SQL 级整体替换：宿主在线时替代「整文件覆盖」的安全落地 ──
  * 背景（11-21 手机实锤）：PC 对共享 memory 车道做非 append-only 重写（改旧行）→
  * planSqliteJsonlDelta 返回 fork → 退回全量重建 → 落地必须整文件覆盖 live 主文件。
  * Windows 下 safeSqliteLanding 靠「rm -wal 失败=宿主在写」挡住；Android/Linux 的 unlink
