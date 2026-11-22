@@ -2383,9 +2383,47 @@ async function pruneCloudExtras(repoDir, eff, logger) {
    「本机新建没同步过的会话下载肯定删阿，不然我TM覆盖啥子」「不管啥内容新不新，
    机械覆盖」）。工作区级保护照旧：云端没有该工作区目录的工作区根本不进 wsGroups
    （一个字节不碰，10-14 规格延续）。 */
-async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger }) {
-  const out = { pruned: 0, prunedIds: [] }
+/* ── [9999.9.9 防再犯·11-22 下载冲会话事故] 下载落地守卫：宿主内存是最新权威 ─────────
+ * 事故：11-22 15:59 下载把本机领先云端的会话回滚成云端旧版（机械覆盖无条件落地），
+ * 宿主内存还按原 seq 续写 → 磁盘 seq 断口（ab53ba6e 缺 286-567 等 3 个会话），
+ * 本机独有会话 b8f283bb 被 prune 整删。根因：下载版本比对的参照物错了——磁盘文件
+ * 可能断口/陈旧，宿主内存 cursor 才是本会话最新进度。
+ * 本函数返回宿主内存版的 lines（优先）或磁盘版（未加载）；调用方：
+ * 宿主/磁盘最新 seq > 云端 seq → 落地会丢事件 → 返回 guarded 拒绝，绝不覆盖。 */
+async function readLiveSessionLines(ctx, sessionId, localZstPath, sessionsJsonl) {
+  // ① 宿主内存（最新权威，含未落盘尾巴）
+  try {
+    if (ctx && typeof ctx.inject === 'function') {
+      let memLines = null
+      await ctx.inject(['sessions'], async (svcs) => {
+        try {
+          const s = svcs?.sessions?.get(sessionId)
+          if (s && typeof s.snapshotEvents === 'function') {
+            const evs = s.snapshotEvents()
+            if (Array.isArray(evs) && evs.length) memLines = evs.map(e => JSON.stringify(e))
+          }
+        } catch {}
+      })
+      if (memLines) return { lines: memLines, source: 'host-memory' }
+    }
+  } catch {}
+  // ② 磁盘（可能断口/陈旧，但比没有强）
+  try {
+    if (sessionsJsonl) return { lines: sessionsJsonl.sessionZstdLines(localZstPath), source: 'disk' }
+  } catch {}
+  return { lines: [], source: 'none' }
+}
+
+async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger, ctx, state }) {
+  const out = { pruned: 0, prunedIds: [], guarded: [] }
   if (!eff || eff.sessionsDeleteSync === false || eff.sessionsStrategy === 'standalone') return out
+  /* [9999.9.9 防再犯] 白名单制：只删「上次上传时确实在云端」的会话。
+     旧逻辑「本机有云端无→删」把从未上传过的本地新会话当冗余杀掉（11-22 b8f283bb）。
+     现在：lastCloudSessions 是上次上传时云端实际包含的会话全集，不在名单里=本机
+     从未上传过（新会话）或上传后云端才删（别端删除传导）——后者仍该删，但前者
+     必须活。判定：在 lastCloudSessions 且现在云端无 = 云端确实删了它，可以删本机；
+     不在 lastCloudSessions = 从未上传过，跳过不删，等下次上传把它推上去。 */
+  const lastCloud = (state && state.lastCloudSessions && typeof state.lastCloudSessions === 'object') ? state.lastCloudSessions : null
   try {
     const keyByPath = new Map((await loadWorkspaceMap()).map((m) => [m.path, m.folderKey]))
     for (const grp of (wsGroups instanceof Map ? wsGroups.values() : [])) {
@@ -2406,6 +2444,19 @@ async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger }) {
       for (const le of localEnts) {
         if (!le.isDirectory() || !le.name.startsWith('session-')) continue
         if (cloudSet.has(le.name)) continue          // 云端还有 → 已按镜像落地
+        // 白名单守卫：从未上传过的本地会话不删
+        if (lastCloud && !lastCloud[le.name]) {
+          out.guarded.push(le.name + '(本机独有/未上传,保留)')
+          continue
+        }
+        // 二次确认：宿主内存里它是活的且有内容 → 也保留（防断口态误删活跃会话）
+        try {
+          const live = await readLiveSessionLines(ctx, le.name, join(wsDir, le.name, 'session.v4.jsonl.zstd'), null)
+          if (live.source === 'host-memory' && live.lines.length > 0) {
+            out.guarded.push(le.name + '(宿主内存活跃,保留)')
+            continue
+          }
+        } catch {}
         await fsP.rm(join(wsDir, le.name), { recursive: true, force: true }).catch(() => {})
         try { await fsP.rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', le.name + '.json'), { force: true }).catch(() => {}) } catch {}
         out.pruned++
@@ -2414,6 +2465,9 @@ async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger }) {
     }
     if (out.pruned > 0) {
       try { logger?.info?.('[dsh-sync] 覆盖(下载): 云端为准，删本机多余 ' + out.pruned + ' 个会话: ' + out.prunedIds.join(', ')) } catch {}
+    }
+    if (out.guarded.length > 0) {
+      try { logger?.info?.('[dsh-sync] prune 白名单守卫: 保留 ' + out.guarded.length + ' 个（' + out.guarded.slice(0, 3).join('; ') + (out.guarded.length > 3 ? '…' : '') + '）') } catch {}
     }
   } catch (e) {
     try { (logger || console)?.warn?.('[dsh-sync] 覆盖(下载)失败: ' + String((e && e.stack) || e)) } catch {}
@@ -4046,7 +4100,7 @@ module.exports = {
     } catch { /* 事件订阅不可用：写回后靠 settingsOverrides 维持本次运行 */ }
 
     // ── State (instanceId + lastSyncedCommit + lastResult) ──
-    let state = { instanceId: undefined, lastSyncedCommit: undefined, lastSyncAt: undefined, lastResult: undefined, cloudSnapshots: [], lastAutoSnapshotDate: undefined }
+    let state = { instanceId: undefined, lastSyncedCommit: undefined, lastSyncAt: undefined, lastResult: undefined, cloudSnapshots: [], lastAutoSnapshotDate: undefined, lastCloudSessions: undefined }
     const stateLoaded = fsP.readFile(stateFile, 'utf8').then(raw => {
       try { Object.assign(state, JSON.parse(raw)) } catch {}
     }).catch(() => {})
@@ -4587,6 +4641,20 @@ module.exports = {
       }
       state.lastSyncedCommit = await gitCurrentCommit(eff.gitBinary, repoDir)
       state.lastSyncAt = new Date().toISOString()
+      /* [9999.9.9 防再犯] 记录本次上传后云端实际包含的会话全集 → prune 白名单。
+         下次下载只删「上次上传时在云端、现在云端没了」的会话；本机新建未上传的
+         不在名单里，下载绝不删它。 */
+      try {
+        const cloudNow = {}
+        const wsRoot = join(repoDir, 'sessions', 'ws')
+        for (const wk of await fsP.readdir(wsRoot, { withFileTypes: true }).catch(() => [])) {
+          if (!wk.isDirectory()) continue
+          for (const se of await fsP.readdir(join(wsRoot, wk.name), { withFileTypes: true }).catch(() => [])) {
+            if (se.isDirectory() && se.name.startsWith('session-')) cloudNow[se.name] = wk.name
+          }
+        }
+        state.lastCloudSessions = cloudNow
+      } catch {}
       /* [2026-11-16 9999.9.42 auto-squash 退役·用户定案「攒N轮以及是否删仓由我手动控制」]
          用户不要历史版本，squash 的唯一意义是摊薄「对端断亲→整包重下」的代价；
          改由设置页「仓库维护」手动删仓重建接管（forceRebuildCloudRepo：
@@ -5121,6 +5189,23 @@ module.exports = {
                     if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
                     continue
                   }
+                  /* [9999.9.9 防再犯] 落地前验宿主内存：本机（内存或磁盘）seq 已领先云端
+                     → 落地=回滚丢事件（11-22 断口事故配方），跳过。 */
+                  try {
+                    const liveChk = await readLiveSessionLines(ctx, sid, localZst, sessionsJsonl)
+                    const liveSeqs = liveChk.lines.map(l => { try { return JSON.parse(l).seq } catch { return null } }).filter(x => typeof x === 'number')
+                    const liveMaxSeq = liveSeqs.length ? Math.max(...liveSeqs) : -1
+                    const cloudSeqs = cloudLines.map(l => { try { return JSON.parse(l).seq } catch { return null } }).filter(x => typeof x === 'number')
+                    const cloudMaxSeq = cloudSeqs.length ? Math.max(...cloudSeqs) : -1
+                    if (liveMaxSeq > cloudMaxSeq) {
+                      applied.push(src.to + ' -> SKIP ' + sid + ' (防回滚: 本机 seq ' + liveMaxSeq + ' > 云端 ' + cloudMaxSeq + ' [' + liveChk.source + ']，云端旧版不落地)')
+                      syncLogLine('防回滚跳过: ' + sid + ' liveSeq=' + liveMaxSeq + ' cloudSeq=' + cloudMaxSeq + ' src=' + liveChk.source)
+                      cwsSessionIds.push(sid)
+                      if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                      if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
+                      continue
+                    }
+                  } catch {}
                   let rebuiltJ = null
                   try { rebuiltJ = sessionsJsonl.buildSessionZstd(cloudLines) } catch (e) {
                     applied.push(src.to + ' -> SKIP ' + sid + ' (jsonl 重建失败：' + String(e && e.message).slice(0, 100) + ')')
@@ -5169,6 +5254,27 @@ module.exports = {
                   applied.push(src.to + ' -> SKIP ' + sid + ' (非 zstd 魔数：' + candBuf.subarray(0, 4).toString('hex') + ')')
                   continue
                 }
+                /* [9999.9.9 防再犯] raw 车道同款防回滚守卫（内存解压 candBuf 取 seq，零临时文件） */
+                try {
+                  const liveChk2 = await readLiveSessionLines(ctx, sid, localZst, sessionsJsonl)
+                  const liveSeqs2 = liveChk2.lines.map(l => { try { return JSON.parse(l).seq } catch { return null } }).filter(x => typeof x === 'number')
+                  const liveMaxSeq2 = liveSeqs2.length ? Math.max(...liveSeqs2) : -1
+                  let candMaxSeq = -1
+                  try {
+                    const cText = sessionsJsonl.sessionZstdToText(candBuf)
+                    const cLines = cText.split('\n').filter(Boolean)
+                    const cs = cLines.map(l => { try { return JSON.parse(l).seq } catch { return null } }).filter(x => typeof x === 'number')
+                    candMaxSeq = cs.length ? Math.max(...cs) : -1
+                  } catch {}
+                  if (liveMaxSeq2 > candMaxSeq && candMaxSeq >= 0) {
+                    applied.push(src.to + ' -> SKIP ' + sid + ' (防回滚: 本机 seq ' + liveMaxSeq2 + ' > 云端 ' + candMaxSeq + ' [' + liveChk2.source + '])')
+                    syncLogLine('防回滚跳过(raw): ' + sid + ' liveSeq=' + liveMaxSeq2 + ' candSeq=' + candMaxSeq)
+                    cwsSessionIds.push(sid)
+                    if (!downloadedSessionIds.includes(sid)) downloadedSessionIds.push(sid)
+                    if (!allDownloadedSessionIds.includes(sid)) allDownloadedSessionIds.push(sid)
+                    continue
+                  }
+                } catch {}
                 await fsP.rm(dstSession, { recursive: true, force: true }).catch(() => {})
                 /* [parts] 云端可能是 part 链 → 本机落地恒为拼接后的单文件（原 copyTree 复制 parts 目录会带病） */
                 await fsP.mkdir(dstSession, { recursive: true })
@@ -5202,7 +5308,10 @@ module.exports = {
                根本不进 wsGroups，这里一个字节都碰不到（10-14 规格延续）。 */
             if (eff.sessionsDeleteSync !== false && eff.sessionsStrategy !== 'standalone' && wsGroups.size > 0) {
               try {
-                const pruneR = await pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger: ctx.logger })
+                const pruneR = await pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger: ctx.logger, ctx, state })
+                if (pruneR.guarded && pruneR.guarded.length > 0) {
+                  applied.push(src.to + ' -> prune 白名单守卫: 保留 ' + pruneR.guarded.length + ' 个本机独有/活跃会话')
+                }
                 if (pruneR.pruned > 0) {
                   applied.push(src.to + ' -> 覆盖(下载): 删本机 ' + pruneR.pruned + ' 个云端已无会话: ' + pruneR.prunedIds.join(', '))
                   /* workspace.json 的 sessionIds 同步摘除（防幽灵条目） */
