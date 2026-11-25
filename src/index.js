@@ -2414,7 +2414,7 @@ async function readLiveSessionLines(ctx, sessionId, localZstPath, sessionsJsonl)
   return { lines: [], source: 'none' }
 }
 
-async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger, ctx, state }) {
+async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger, ctx, state, force = false }) {
   const out = { pruned: 0, prunedIds: [], guarded: [] }
   if (!eff || eff.sessionsDeleteSync === false || eff.sessionsStrategy === 'standalone') return out
   /* [9999.9.9 防再犯] 白名单制：只删「上次上传时确实在云端」的会话。
@@ -2445,16 +2445,18 @@ async function pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger, ctx, sta
         if (!le.isDirectory() || !le.name.startsWith('session-')) continue
         if (cloudSet.has(le.name)) continue          // 云端还有 → 已按镜像落地
         // 白名单守卫：从未上传过的本地会话不删
-        if (lastCloud && !lastCloud[le.name]) {
+        if (!force && lastCloud && !lastCloud[le.name]) {
           out.guarded.push(le.name + '(本机独有/未上传,保留)')
           continue
         }
         // 二次确认：宿主内存里它是活的且有内容 → 也保留（防断口态误删活跃会话）
         try {
-          const live = await readLiveSessionLines(ctx, le.name, join(wsDir, le.name, 'session.v4.jsonl.zstd'), null)
-          if (live.source === 'host-memory' && live.lines.length > 0) {
-            out.guarded.push(le.name + '(宿主内存活跃,保留)')
-            continue
+          if (!force) {
+            const live = await readLiveSessionLines(ctx, le.name, join(wsDir, le.name, 'session.v4.jsonl.zstd'), null)
+            if (live.source === 'host-memory' && live.lines.length > 0) {
+              out.guarded.push(le.name + '(宿主内存活跃,保留)')
+              continue
+            }
           }
         } catch {}
         await fsP.rm(join(wsDir, le.name), { recursive: true, force: true }).catch(() => {})
@@ -4686,7 +4688,7 @@ module.exports = {
     }
 
     // ── 下载：云 → 本地（单向，覆盖本地） ──
-    const runDownload = async (eff) => {
+    const runDownload = async (eff, { force = false } = {}) => {
       // [fix-4] 残留 index.lock 自检：上次上传被强杀时 git 会留下锁，
       // 不处理的话后面 reset --hard 必失败——而老代码把那句失败吞了，
       // 于是出现「下载完成」但仓库没更新的假成功。
@@ -5197,7 +5199,7 @@ module.exports = {
                     const liveMaxSeq = liveSeqs.length ? Math.max(...liveSeqs) : -1
                     const cloudSeqs = cloudLines.map(l => { try { return JSON.parse(l).seq } catch { return null } }).filter(x => typeof x === 'number')
                     const cloudMaxSeq = cloudSeqs.length ? Math.max(...cloudSeqs) : -1
-                    if (liveMaxSeq > cloudMaxSeq) {
+                    if (!force && liveMaxSeq > cloudMaxSeq) {
                       applied.push(src.to + ' -> SKIP ' + sid + ' (防回滚: 本机 seq ' + liveMaxSeq + ' > 云端 ' + cloudMaxSeq + ' [' + liveChk.source + ']，云端旧版不落地)')
                       syncLogLine('防回滚跳过: ' + sid + ' liveSeq=' + liveMaxSeq + ' cloudSeq=' + cloudMaxSeq + ' src=' + liveChk.source)
                       cwsSessionIds.push(sid)
@@ -5266,7 +5268,7 @@ module.exports = {
                     const cs = cLines.map(l => { try { return JSON.parse(l).seq } catch { return null } }).filter(x => typeof x === 'number')
                     candMaxSeq = cs.length ? Math.max(...cs) : -1
                   } catch {}
-                  if (liveMaxSeq2 > candMaxSeq && candMaxSeq >= 0) {
+                  if (!force && liveMaxSeq2 > candMaxSeq && candMaxSeq >= 0) {
                     applied.push(src.to + ' -> SKIP ' + sid + ' (防回滚: 本机 seq ' + liveMaxSeq2 + ' > 云端 ' + candMaxSeq + ' [' + liveChk2.source + '])')
                     syncLogLine('防回滚跳过(raw): ' + sid + ' liveSeq=' + liveMaxSeq2 + ' candSeq=' + candMaxSeq)
                     cwsSessionIds.push(sid)
@@ -5308,7 +5310,7 @@ module.exports = {
                根本不进 wsGroups，这里一个字节都碰不到（10-14 规格延续）。 */
             if (eff.sessionsDeleteSync !== false && eff.sessionsStrategy !== 'standalone' && wsGroups.size > 0) {
               try {
-                const pruneR = await pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger: ctx.logger, ctx, state })
+                const pruneR = await pruneLocalOnlySessions(repoDir, wsGroups, { eff, logger: ctx.logger, ctx, state, force })
                 if (pruneR.guarded && pruneR.guarded.length > 0) {
                   applied.push(src.to + ' -> prune 白名单守卫: 保留 ' + pruneR.guarded.length + ' 个本机独有/活跃会话')
                 }
@@ -5491,8 +5493,8 @@ module.exports = {
       try { ctx.logger?.info?.('dsh-sync: download done, sessions refresh dispatched') } catch {}
       state.lastSyncAt = new Date().toISOString()
       await saveState()
-      syncLogLine(`下载完成: applied=${applied.length} skipped=${skipped.length} 总耗时${((Date.now() - tDl0) / 1000).toFixed(1)}s`)
-      return { downloaded: true, applied, skipped, notes }
+      syncLogLine(`下载完成${force ? '(强制覆盖)' : ''}: applied=${applied.length} skipped=${skipped.length} 总耗时${((Date.now() - tDl0) / 1000).toFixed(1)}s`)
+      return { downloaded: true, forced: force, applied, skipped, notes }
     }
     // ── Agent-run jobs (action buttons → apiproxy 主对话级 session) ──
     // conflictRunJobs: 冲突 PR 解决；alignRunJobs: AI 智能对齐（语义合并双方改动）
@@ -5701,14 +5703,41 @@ module.exports = {
             const release = await acquireLock(lockFile)
             if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行' }); return }
             try {
-              // pre-download 安全快照改 opt-in（snapshotSafety===true 才建）：它每次下载都建、
-              // 越积越多，用户不要自动快照。云端仍有原始数据，下载失败可重新下载。
+              // 强制覆盖是用户显式确认的单次操作：必须先把本机 sessions 整组原样备份，
+              // 包括尚未落盘的宿主内存尾巴。普通下载仍按 snapshotSafety 配置，不堆自动快照。
+              const body = await readJsonBody(req)
+              const force = body.force === true
               let safetyName
-              if (eff.snapshotSafety === true) {
+              if (force) {
+                safetyName = `pre-force-download-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
+                try {
+                  const liveSessions = join(dshHome(), 'sessions')
+                  const liveBackup = join(syncDir, 'snapshots', safetyName, 'sessions')
+                  await fsP.mkdir(liveBackup, { recursive: true })
+                  await copyTree(liveSessions, liveBackup, {})
+                  await ctx.inject(['sessions'], async (svcs) => {
+                    for (const sid of Object.keys(state.lastCloudSessions || {})) {
+                      try {
+                        const s = svcs?.sessions?.get(sid)
+                        if (!s || typeof s.snapshotEvents !== 'function' || !sessionsJsonl) continue
+                        const evs = s.snapshotEvents()
+                        if (!Array.isArray(evs) || !evs.length || typeof s.header?.cwd !== 'string') continue
+                        const memLines = [JSON.stringify(s.header), ...evs.map(e => JSON.stringify(e))]
+                        const memPath = join(liveBackup, encodeWorkspaceDir(s.header.cwd), sid, 'session.v4.jsonl.zstd')
+                        await fsP.mkdir(join(memPath, '..'), { recursive: true })
+                        await fsP.writeFile(memPath, sessionsJsonl.buildSessionZstd(memLines))
+                      } catch (e) { try { ctx.logger?.warn?.('dsh-sync: 强制覆盖内存备份 ' + sid + ': ' + String((e && e.message) || e)) } catch {} }
+                    }
+                  })
+                } catch (e) {
+                  sendJson(res, 400, { error: '强制覆盖前备份失败，已取消下载：' + String((e && e.message) || e) })
+                  return
+                }
+              } else if (eff.snapshotSafety === true) {
                 safetyName = `pre-download-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
                 try { await createLocalSnapshot(eff, safetyName) } catch {}
               }
-              const r = await runDownload(eff)
+              const r = await runDownload(eff, { force })
               sendJson(res, 200, { ...r, safetySnapshot: safetyName })
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
             finally { release() }

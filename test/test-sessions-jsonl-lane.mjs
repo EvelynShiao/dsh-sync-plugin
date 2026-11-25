@@ -81,5 +81,17 @@ if (realZ) {
   ok(false, '真数据 roundtrip：未找到 >500KB 的本地会话')
 }
 
+// 7. 同 seq 不同内容：不是追加/新旧关系，强制覆盖必须保留云端原文，不能合并或按长度判输赢
+const forkLocal = [frame1, '{"seq":3,"type":"assistant","text":"本机改写"}', '{"seq":4,"type":"step/end"}'].join('\n').split('\n')
+const forkCloud = [frame1, '{"seq":3,"type":"user","text":"云端不同内容"}'].join('\n').split('\n')
+const forkZ = path.join(TMP, 'fork-local.zstd')
+fs.writeFileSync(forkZ, mkMultiFrameZstd([forkLocal.join('\n')]))
+const forkJsonl = path.join(TMP, 'fork-cloud.jsonl')
+fs.writeFileSync(forkJsonl, forkCloud.join('\n'))
+rebuildSessionZstd(forkJsonl, path.join(TMP, 'fork-forced.zstd'))
+const forcedLines = sessionZstdLines(path.join(TMP, 'fork-forced.zstd'))
+ok(JSON.stringify(forcedLines) === JSON.stringify(forkCloud), '同 seq 内容分叉：强制覆盖逐行等于云端，不按长度或 seq 合并')
+ok(forcedLines.length < forkLocal.length && forcedLines.some(l => l.includes('云端不同内容')), '云端更短且同 seq 不同内容仍完整落地')
+
 console.log(`\n=== 会话 JSONL 车道：${pass} 通过 / ${fail} 失败 ===`)
 process.exit(fail ? 1 : 0)

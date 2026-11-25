@@ -104,7 +104,11 @@ const ZH = {
   uploadBtn: '上传',
   downloadBtn: '下载',
   uploadHint: '本地 → 云端：把本机的会话、设置、插件清单、技能、知识库推上去',
-  downloadHint: '云端 → 本地：从云端拉取并覆盖本地（覆盖前自动拍安全快照，可回滚）',
+  downloadHint: '云端 → 本地：普通下载会保留本机领先云端的会话，防止未上传内容被旧版回滚',
+  forceDownloadBtn: '强制云端覆盖',
+  forceDownloadHint: '按云端整份替换本地：不分叉、内容或长短，先备份本机会话再覆盖，并解除删除保护',
+  forceDownloadConfirm: '确定用云端版本覆盖本机？\n· 两边内容不同也按云端为准，包括分叉、同序号不同内容、较短版本\n· 本机有而云端没有的会话也会删除\n· 操作前会备份本机会话到 pre-force-download 快照，之后可恢复\n· 覆盖后需重启 DSH，避免已打开会话的内存旧状态写回磁盘\n确定继续？',
+  forceDownloadDone: '强制覆盖完成（重启 DSH 后使用云端会话版本）',
   stopBtn: '停止同步',
   stopHint: '安全停止当前同步：杀掉在跑的 git 进程树，锁与半截包自动清理，可立即重试',
   stopDone: '已停止（终止 git 进程）',
@@ -243,7 +247,11 @@ const EN = {
   uploadBtn: 'Upload',
   downloadBtn: 'Download',
   uploadHint: 'Local → remote: push sessions, settings, plugins, skills and knowledge',
-  downloadHint: 'Remote → local: pull and overwrite local (safety snapshot first)',
+  downloadHint: 'Remote → local: safe download preserves local sessions ahead of the cloud to prevent rollback',
+  forceDownloadBtn: 'Force cloud overwrite',
+  forceDownloadHint: 'Replace local content with the cloud version regardless of forks or length; back up local sessions first and bypass deletion guards',
+  forceDownloadConfirm: 'Overwrite local content with the cloud version?\n· Cloud wins for all differences: forks, same-seq edits, and shorter versions\n· Local-only sessions will be deleted\n· Local sessions are backed up to a pre-force-download snapshot first\n· Restart DSH afterward so in-memory state cannot write old content back\nContinue?',
+  forceDownloadDone: 'Forced overwrite complete (restart DSH to use cloud session versions)',
   stopBtn: 'Stop sync',
   stopHint: 'Safely stop the running sync: kills the git process tree; locks and partial packs are auto-cleaned, retry immediately',
   stopDone: 'Stopped (git processes killed)',
@@ -827,6 +835,18 @@ function SettingsSection({ t }) {
     } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
     finally { setBusy(false); refresh() }
   }
+  // 强制覆盖只对本请求生效：不改成持久配置，普通下载的防回滚保护继续存在。
+  const doForceDownload = async () => {
+    if (typeof window !== 'undefined' && typeof window.confirm === 'function' && !window.confirm(t('forceDownloadConfirm'))) return
+    setBusy(true)
+    try {
+      const r = await fetch(API + '/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: true }) })
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
+      onToast(t('forceDownloadDone'), 5000)
+    } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 5000) }
+    finally { setBusy(false); refresh() }
+  }
   // [2026-11-15 安全停止] 杀掉在跑的 git 进程树；.lock 随原请求 finally 释放，tmp_pack 由 clearStaleGitLock 清
   const doStop = async () => {
     try {
@@ -1091,6 +1111,7 @@ function SettingsSection({ t }) {
             h('span', { className: 'sk-spacer' }),
             h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('uploadHint'), onClick: doUpload }, t('uploadBtn')),
             h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn')),
+            h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('forceDownloadHint'), onClick: doForceDownload }, t('forceDownloadBtn')),
             h(ButtonLite, { disabled: !busy, title: t('stopHint'), onClick: doStop }, t('stopBtn'))))
   } catch (renderErr) {
     ;(globalThis.__skErrors = globalThis.__skErrors || []).push('body: ' + (renderErr && renderErr.message))

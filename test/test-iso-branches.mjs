@@ -94,6 +94,20 @@ resetScenario()
   check('开关关：本机独有保留', exists(path.join(LIVE_WS, 'session-live-only')), JSON.stringify(r.down))
 }
 
+console.log(`\n=== [${LABEL}] 强制覆盖解除普通删除守卫 ===`)
+for (const p of fs.readdirSync(LIVE_WS)) fs.rmSync(path.join(LIVE_WS, p), { recursive: true, force: true })
+for (const p of fs.readdirSync(path.join(REPODIR, 'sessions', 'ws', WSKEY))) fs.rmSync(path.join(REPODIR, 'sessions', 'ws', WSKEY, p), { recursive: true, force: true })
+resetScenario()
+{
+  const wsGroups = new Map()
+  wsGroups.set(LIVE_WS, { targetWs: { path: WS_PATH.replace(/\\/g, '/'), id: 'w1', title: 'alpha' }, targetWsDir: LIVE_WS, targetDirName: LIVE_DIRNAME, cloudBases: [WSKEY], copies: new Map() })
+  const normal = await I.pruneLocalOnlySessions(REPODIR, wsGroups, { eff: effBase, logger, ctx: null, state: { lastCloudSessions: {} } })
+  check('普通下载：未上传本机独有会话保留', exists(path.join(LIVE_WS, 'session-live-only')), JSON.stringify(normal))
+  fs.rmSync(path.join(REPODIR, 'sessions', 'ws', WSKEY, 'session-cloud-only'), { recursive: true, force: true })
+  const forced = await I.pruneLocalOnlySessions(REPODIR, wsGroups, { eff: effBase, logger, ctx: null, state: { lastCloudSessions: {} }, force: true })
+  check('强制覆盖：本机独有会话按云端集合删除', !exists(path.join(LIVE_WS, 'session-live-only')), JSON.stringify({ forced, liveWs: fs.readdirSync(LIVE_WS), cloudWs: fs.readdirSync(path.join(REPODIR, 'sessions', 'ws', WSKEY)), wsKey: WSKEY }))
+}
+
 console.log(`\n=== [${LABEL}] part 开关 ===`)
 if (I.upsertSessionToShadowParts) {
   // 空云端场景：强制真写入，验证分片链形态（不走相等短路）
