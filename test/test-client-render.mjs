@@ -115,5 +115,14 @@ await t('防回滚是默认勾选的 checkbox，不再有独立强制覆盖按�
   ok(ZH.forceDownloadConfirm.includes('分叉') && ZH.forceDownloadConfirm.includes('较短版本'), '取消勾选后的确认文案未覆盖分叉和较短版本')
 })
 
+await t('自动动作改成定时上传+启动下载，旧立即同步入口退役', async () => {
+  injectSeq = { 0: STATUS_OK }; seq = 0
+  const tree = SettingsSection({ t: (k) => k })
+  ok(findText(tree, 'autoSyncLabel') && findText(tree, 'syncOnStartupLabel'), '两个独立自动动作未渲染')
+  ok(!findText(tree, 'syncNow'), '旧立即同步入口仍存在')
+  const clientText = require('node:fs').readFileSync(require.resolve('../client/index.js'), 'utf8')
+  ok(!clientText.includes("fetch(API + '/sync'") && !clientText.includes('const doSync'), 'client 仍调用旧 /sync 双向同步接口')
+})
+
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
 process.exit(fail === 0 ? 0 : 1)
