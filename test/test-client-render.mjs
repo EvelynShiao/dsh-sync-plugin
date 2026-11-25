@@ -100,16 +100,17 @@ await t('isGitCode=false：重建按钮禁用', async () => {
   ok(rebuild, '重建按钮应存在')
 })
 
-await t('强制云端覆盖按钮渲染在 sk-body 树内，并有独立确认文案', async () => {
+await t('防回滚是默认勾选的 checkbox，不再有独立强制覆盖按钮', async () => {
   injectSeq = { 0: STATUS_OK }; seq = 0
   const tree = SettingsSection({ t: (k) => k })
-  const force = findText(tree, 'forceDownloadBtn')
-  ok(force, '强制覆盖按钮未渲染')
-  ok(hasAncestor(force, (n) => n.type === 'div' && n.props && n.props.className === 'sk-body'), '强制覆盖按钮不在 sk-body 树内')
-  const button = force.ancestors.findLast((n) => n.props && typeof n.props.onClick === 'function')
-  ok(button && button.props.title === 'forceDownloadHint', '按钮缺少独立强制覆盖提示')
+  const label = findText(tree, 'rollbackGuardLabel')
+  ok(label, '防回滚勾选标签未渲染')
+  ok(hasAncestor(label, (n) => n.type === 'div' && n.props && n.props.className === 'sk-body'), '勾选框不在 sk-body 树内')
+  const checkbox = label.ancestors.flatMap(n => n.kids || []).find(n => n && n.type === 'input' && n.props?.type === 'checkbox')
+  ok(checkbox && checkbox.props.checked === true && typeof checkbox.props.onChange === 'function', '防回滚不是默认勾选的交互 checkbox')
+  ok(!findText(tree, 'forceDownloadBtn'), '不应再渲染独立强制覆盖按钮')
   const { ZH } = __internals
-  ok(ZH.forceDownloadConfirm.includes('分叉') && ZH.forceDownloadConfirm.includes('较短版本'), '确认文案未覆盖分叉和较短版本')
+  ok(ZH.forceDownloadConfirm.includes('分叉') && ZH.forceDownloadConfirm.includes('较短版本'), '取消勾选后的确认文案未覆盖分叉和较短版本')
 })
 
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
