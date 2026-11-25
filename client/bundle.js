@@ -75,7 +75,6 @@ window.__ModuleLoader__.load({
 
     const ZH = {
       title: '同步',
-      syncNow: '立即同步',
       syncing: '同步中，可能需要一分钟…',
       syncDone: '同步完成',
       syncFailed: '同步失败',
@@ -139,9 +138,9 @@ window.__ModuleLoader__.load({
       tokenConfigured: '已配置',
       tokenHint: '需为目标私有仓库所在平台的令牌（gitcode.com / github.com / gitee.com），且有读写权限。删仓重建需额外带 delete_repo 权限',
       clearToken: '清除',
-      autoSyncLabel: '定时自动同步',
-      syncOnStartupLabel: '启动时同步',
-      intervalLabel: '同步间隔（分钟）',
+      autoSyncLabel: '定时自动上传',
+      syncOnStartupLabel: '启动时下载',
+      intervalLabel: '自动上传间隔（分钟）',
       sessionsDeleteSyncLabel: '会话删除传导',
       sessionsDeleteSyncHint: '开启后：上传时本机已删的会话会同步删云端；下载时云端已删的会话会同步删本机。关闭则删除操作互不影响（同名会话的覆盖同步不受此开关控制）。有防回滚/防误删守卫',
       conflictModeLabel: '冲突处理',
@@ -220,7 +219,6 @@ window.__ModuleLoader__.load({
 
     const EN = {
       title: 'Sync',
-      syncNow: 'Sync now',
       syncing: 'Syncing, may take a minute…',
       syncDone: 'Sync complete',
       syncFailed: 'Sync failed',
@@ -282,9 +280,9 @@ window.__ModuleLoader__.load({
       tokenConfigured: 'configured',
       tokenHint: 'Must be a token of the platform hosting the target private repo (gitcode.com / github.com / gitee.com), with read/write access. Repo rebuild additionally needs delete_repo',
       clearToken: 'Clear',
-      autoSyncLabel: 'Auto sync on schedule',
-      syncOnStartupLabel: 'Sync on startup',
-      intervalLabel: 'Interval (minutes)',
+      autoSyncLabel: 'Auto upload on schedule',
+      syncOnStartupLabel: 'Download on startup',
+      intervalLabel: 'Auto-upload interval (minutes)',
       sessionsDeleteSyncLabel: 'Session deletion sync',
       sessionsDeleteSyncHint: 'When on: uploading deletes cloud sessions removed locally; downloading deletes local sessions removed from cloud. When off, deletions do not propagate (overwrite of same-id sessions is unaffected). Rollback and accidental-deletion guards apply',
       conflictModeLabel: 'Conflict handling',
@@ -811,16 +809,6 @@ window.__ModuleLoader__.load({
         return () => clearInterval(timer)
       }, [])
 
-      const doSync = async () => {
-        setBusy(true)
-        try {
-          const r = await fetch(API + '/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-          const d = await r.json().catch(() => ({}))
-          if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status)
-          onToast(t('syncDone'), 2600)
-        } catch (e) { onToast(t('syncFailed') + ': ' + e.message, 4000) }
-        finally { setBusy(false); refresh() }
-      }
       // AI smart align: POST runs a deterministic sync first (remote-only files
       // pulled back), then streams the semantic-merge agent run; dialog opens
       // already running with the both-modified file list.

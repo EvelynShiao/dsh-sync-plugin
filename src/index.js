@@ -3767,7 +3767,7 @@ const ALIGN_PROMPT_ZH = [
   '4. settings.yaml 逐键保留双方；本机路径/机器相关字段以本机为准；任何 token/apiKey/密钥字段保留两边但**严禁在输出中回显密钥值**。',
   '5. 二进制或压缩文件（.zst/.gz 及 session 日志二进制）不合并，保留本机版，在汇报里列出。',
   '6. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv；令牌不得出现在任何输出或提交信息里。',
-  '7. 合并完成后触发确定性同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`，等待返回 JSON。',
+  '7. 合并完成后上传本机结果：`curl -s -X POST {{apiBase}}/dsh-sync/api/upload`，等待返回 JSON。',
   '8. 再查状态：`curl -s {{apiBase}}/dsh-sync/api/status`。若 pendingConflict 非空（仍有冲突 PR）：在影子仓库 `git fetch https://oauth2:<令牌>@gitcode.com/<owner>/<repo>.git <分支>` → checkout 该分支 → `git merge FETCH_HEAD` → 按上述规则解冲突 → `git add -A && git -c user.name=dsh-sync -c user.email=dsh-sync@local commit --no-edit` → push 回该分支 → 调 GitCode API 合并 PR（头用 `PRIVATE-TOKEN: <令牌>`，不要用 Authorization: Bearer；`PUT /repos/<owner>/<repo>/pulls/<编号>/merge`，body `{"merge_method":"squash"}`）。',
   '9. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果、PR 编号与链接（若有）。',
   '',
@@ -3804,7 +3804,7 @@ const REMOTE_ALIGN_PROMPT_ZH = [
   '3. settings.yaml（YAML）：逐键合并，保留两边所有 provider/model/credential 配置；本机路径/机器相关字段以本机为准；token/apiKey/密钥字段保留两边值但**严禁在输出中回显密钥值**。',
   '4. 插件清单（package.json 等 JSON）：并集合并 dependencies，保留两边所有插件条目；版本冲突取较新者。',
   '5. 只允许使用 bash 与 HTTP 请求工具；严禁使用 return/deliver/投递/IM 文件类工具；不要 printenv。',
-  '6. 合并完成后触发同步：`curl -s -X POST {{apiBase}}/dsh-sync/api/sync`。',
+  '6. 合并完成后上传本机结果：`curl -s -X POST {{apiBase}}/dsh-sync/api/upload`。',
   '7. 全程使用中文。最后汇报：备份了哪些文件、每个文件怎么合并的、同步触发结果。',
 ].join('\n')
 
@@ -4129,84 +4129,10 @@ module.exports = {
       return snapDir
     }
 
-    // ── Sync run: lock → push → pull → save ──
-    let syncRun = null
-    // 自动对齐去重：同一批 bothModified 文件 30 分钟内只自动跑一次，防止 agent
-    // 解决失败时随 autoSync 无限重试；规模闸门：清单太大（首收敛 churn、误删回滚）
-    // 不是人类尺度的"冲突"，AI 逐文件语义合并不现实，留给状态页展示/人工处理
-    const ALIGN_COOLDOWN_MS = 30 * 60 * 1000
-    const AUTO_ALIGN_MAX_FILES = 50
-    const alignState = { active: false, lastSig: '', lastAt: 0 }
-    const runSync = async ({ autoAlign = true } = {}) => {
-      if (syncRun !== null) return syncRun
-      syncRun = (async () => {
-        await stateLoaded
-        const eff = syncSettings()
-        if (!eff.repoUrl || !eff.token) throw new Error('未配置仓库地址或访问令牌（到 ⚙ 同步设置 中填写）')
-        if (!(await gitAvailable(eff.gitBinary))) throw new Error('PATH 上找不到 git')
-        const release = await acquireLock(lockFile)
-        if (release === null) throw new Error('另一个同步进程正在运行（已跳过）')
-        const started = Date.now()
-        let result = { pushed: false, pulled: false }
-        try {
-          // 影子仓库先行（首次运行在这里 clone）：reconcile 需要它来 fetch/回填
-          await ensureShadowRepo(eff.gitBinary, eff, repoDir).catch(e => ctx.logger.warn(`dsh-sync: shadow init: ${e && e.message}`))
-          const ctx2 = { repoDir, instanceId: state.instanceId, state, logger: ctx.logger }
-          // reconcile first: pull remote-only/untouched changes into live so
-          // the full-snapshot push below never deletes another replica's adds
-          result.reconcile = await reconcileRemote(eff.gitBinary, eff, ctx2).catch(e => { result.reconcileError = String(e && e.message); return null })
-          const fresh = (result.reconcile && Array.isArray(result.reconcile.bothModified)) ? result.reconcile.bothModified : []
-          state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
-          // 已挂账未解决的 bothModified 一并纳入（reconcile 只报本轮变更集里的文件，
-          // 但未解决文件的基线还在 pendingBoth 里，push 时同样要 preserve）
-          const pendings = Object.keys(state.pendingBoth)
-            .filter(p => !fresh.some(f => f.shadowPath === p))
-            .map(p => {
-              const livePath = resolveLivePath(syncSpec(eff, defaultRoots(), state.instanceId), p)
-              return livePath ? { shadowPath: p, livePath, baseCommit: state.pendingBoth[p] } : null
-            })
-            .filter(Boolean)
-          const both = [...fresh, ...pendings]
-          // 双方都改过的文件不随快照推送（preserve）：远端版本留在 main，本机版本留在
-          // live，等 AI 智能对齐做语义合并——不再静默覆盖
-          result.push = await runPush(eff.gitBinary, eff, { ...ctx2, preserve: both.map(f => f.shadowPath) }).catch(e => { result.pushError = String(e && e.message); return null })
-          result.pull = await runPull(eff.gitBinary, eff, ctx2).catch(e => { result.pullError = String(e && e.message); return null })
-          state.lastSyncAt = new Date().toISOString()
-          // conflictMode=ai：检测到双方改动 → 自动触发 AI 智能对齐（后台 job，
-          // 会话内可追问；agent 合并完 live 文件后自己会 curl /dsh-sync/api/sync 推送）
-          result.alignSkipped = autoAlign && eff.conflictMode === 'ai' && both.length > AUTO_ALIGN_MAX_FILES
-            ? { reason: `bothModified ${both.length} 个，超过自动对齐规模上限 ${AUTO_ALIGN_MAX_FILES}（多为双机首次收敛 churn，非人工冲突）；保留双方版本，可到设置页手动处理` }
-            : undefined
-          if (autoAlign && eff.conflictMode === 'ai' && both.length > 0 && both.length <= AUTO_ALIGN_MAX_FILES && !alignState.active) {
-            const sig = both.map(f => f.shadowPath).sort().join('|')
-            if (sig !== alignState.lastSig || Date.now() - alignState.lastAt > ALIGN_COOLDOWN_MS) {
-              alignState.lastSig = sig
-              alignState.lastAt = Date.now()
-              const startedJob = await startAlignJob(eff, both)
-              if (startedJob) result.align = { jobId: startedJob.id, bothModified: both.map(f => f.shadowPath) }
-            }
-          }
-          // 每日自动快照（本地滚动，勾选云端才上云——自动快照只落本地）
-          // opt-in：只有显式 snapshotAuto===true 才跑。原来 `!== false` 会把
-          // undefined（配置没持久化）也当开 → 删快照/任何同步都冒出 auto 快照。
-          if (eff.snapshotAuto === true) {
-            const today = new Date().toISOString().slice(0, 10)
-            if (state.lastAutoSnapshotDate !== today) {
-              try {
-                await createLocalSnapshot(eff, `auto-${today}`)
-                state.lastAutoSnapshotDate = today
-                await saveState()
-              } catch (e) { ctx.logger.warn(`dsh-sync: auto snapshot: ${e && e.message}`) }
-            }
-          }
-          try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
-          state.lastResult = { ...result, at: state.lastSyncAt, durationMs: Date.now() - started }
-          await saveState()
-        } finally { release() }
-        return result
-      })().finally(() => { syncRun = null })
-      return syncRun
-    }
+    // 旧 runSync（reconcile→push→pull 双向链）已退役。只保留上传/下载两个方向，
+    // AI 对齐仍需的只读对账在 /align/run 内显式调用，不再夹带自动上传或下载。
+    const activeDirections = new Set()
+    const alignState = { active: false }
 
     // ── 上传：本地 → 云（单向） ──
     const runUpload = async (eff) => {
@@ -5550,11 +5476,15 @@ module.exports = {
           if (job.code === 0 && both.length > 0) {
             for (const f of both) delete state.pendingBoth[f.shadowPath]
             saveState()
-            const post = (n) => runSync({ autoAlign: false }).catch(e => {
-              if (/另一个同步进程/.test(String(e && e.message)) && n < 4) setTimeout(() => post(n + 1), 5000)
-              else ctx.logger.warn(`dsh-sync: post-align sync: ${e && e.message}`)
-            })
-            setTimeout(() => post(0), 3000)
+            const post = async (n) => {
+              const release = await acquireLock(lockFile)
+              if (release === null) { if (n < 4) setTimeout(() => post(n + 1), 5000); return }
+              activeDirections.add('upload')
+              try { await runUpload(syncSettings()) }
+              catch (e) { ctx.logger.warn(`dsh-sync: post-align upload: ${e && e.message}`) }
+              finally { activeDirections.delete('upload'); release() }
+            }
+            setTimeout(() => post(0).catch(e => ctx.logger.warn(`dsh-sync: post-align upload: ${e && e.message}`)), 3000)
           }
         },
       })
@@ -5590,31 +5520,43 @@ module.exports = {
         onFinish: () => {
           // 对齐成功后补一次同步把合并结果推上去（延迟 + 锁重试）
           if (job.code === 0 && targets.length > 0) {
-            const post = (n) => runSync({ autoAlign: false }).catch(e => {
-              if (/另一个同步进程/.test(String(e && e.message)) && n < 4) setTimeout(() => post(n + 1), 5000)
-              else ctx.logger.warn(`dsh-sync: post-remote-align sync: ${e && e.message}`)
-            })
-            setTimeout(() => post(0), 3000)
+            const post = async (n) => {
+              const release = await acquireLock(lockFile)
+              if (release === null) { if (n < 4) setTimeout(() => post(n + 1), 5000); return }
+              activeDirections.add('upload')
+              try { await runUpload(syncSettings()) }
+              catch (e) { ctx.logger.warn(`dsh-sync: post-remote-align upload: ${e && e.message}`) }
+              finally { activeDirections.delete('upload'); release() }
+            }
+            setTimeout(() => post(0).catch(e => ctx.logger.warn(`dsh-sync: post-remote-align upload: ${e && e.message}`)), 3000)
           }
         },
       })
       return { job, targets }
     }
 
-    // ── Startup + periodic auto-sync ──
+    // 两个独立单向动作：启动时只下载；定时器只上传。autoSync 兼容旧配置键名，含义=自动上传。
     ctx.effect(() => {
-      const fireIfDue = async (reason) => {
+      const runDirection = async (direction) => {
         await stateLoaded
         const eff = syncSettings()
-        if (!eff.autoSync) return
-        if (reason === 'startup' && !eff.syncOnStartup) return
-        runSync().catch(e => ctx.logger.warn(`dsh-sync: ${reason} sync: ${e && e.message}`))
+        if (!eff.repoUrl || !eff.token) return
+        if (activeDirections.size) return
+        const release = await acquireLock(lockFile)
+        if (release === null) return
+        activeDirections.add(direction)
+        try {
+          if (direction === 'upload') await runUpload(eff)
+          else await runDownload(eff, { force: false })
+        } catch (e) { ctx.logger.warn(`dsh-sync: ${direction}: ${e && e.message}`) }
+        finally { activeDirections.delete(direction); release() }
       }
-      fireIfDue('startup')
-      const timer = setInterval(() => fireIfDue('interval'), Math.max(5, (syncSettings().intervalMinutes || 30)) * 60 * 1000)
+      if (syncSettings().syncOnStartup) runDirection('download').catch(e => ctx.logger.warn(`dsh-sync: startup download setup: ${e && e.message}`))
+      // autoSync=false 时启动绝不自动上传；true 也只按下方 interval 定时上传。
+      const timer = setInterval(() => { if (syncSettings().autoSync) runDirection('upload').catch(e => ctx.logger.warn(`dsh-sync: periodic upload setup: ${e && e.message}`)) }, Math.max(5, (syncSettings().intervalMinutes || 30)) * 60 * 1000)
       if (typeof timer.unref === 'function') timer.unref()
       return () => clearInterval(timer)
-    }, 'dsh-sync: auto-sync')
+    }, 'dsh-sync: directional-auto')
 
     // ── HTTP API ──
     ctx.effect(() => ctx.webServer.register({
@@ -5671,7 +5613,7 @@ module.exports = {
               },
               snapshot: { skills: eff.snapshotSkills === true, auto: eff.snapshotAuto !== false, localKeep: eff.snapshotLocalKeep || 30 },
               hasToken: typeof token === 'string' && token !== '',
-              syncing: syncRun !== null,
+              syncing: activeDirections.size > 0,
               pendingConflict: state.lastResult && state.lastResult.push && state.lastResult.push.conflict === true
                 ? { branch: state.lastPushedBranch, prNumber: state.lastPrNumber } : null,
               bothModifiedPending: Object.keys(state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}),
@@ -5689,10 +5631,11 @@ module.exports = {
             const release = await acquireLock(lockFile)
             if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行' }); return }
             try {
+              activeDirections.add('upload')
               const r = await runUpload(eff)
               sendJson(res, 200, r)
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
-            finally { release() }
+            finally { activeDirections.delete('upload'); release() }
             return
           }
           // POST /dsh-sync/api/download → 云 → 本地（先拍安全快照）
@@ -5737,10 +5680,11 @@ module.exports = {
                 safetyName = `pre-download-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
                 try { await createLocalSnapshot(eff, safetyName) } catch {}
               }
+              activeDirections.add('download')
               const r = await runDownload(eff, { force })
               sendJson(res, 200, { ...r, safetySnapshot: safetyName })
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
-            finally { release() }
+            finally { activeDirections.delete('download'); release() }
             return
           }
 
@@ -5870,17 +5814,21 @@ module.exports = {
             return
           }
 
-          // POST /dsh-sync/api/align/run → AI 智能对齐：先跑一次确定性同步
-          // （远端新增自动回填、bothModified 不覆盖），再把两边都改过的文件交
-          // agent 语义合并
+          // POST /dsh-sync/api/align/run → 只对齐：显式只读对账后交 agent 合并，
+          // 不执行旧的 push→pull 双向同步；合并完成后只上传结果。
           if (req.method === 'POST' && apiPath.endsWith('/dsh-sync/api/align/run')) {
             await stateLoaded
             const eff = syncSettings()
             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
-            let syncResult = null
-            try { syncResult = await runSync({ autoAlign: false }) }
-            catch (e) { sendJson(res, 400, { error: '同步预检失败：' + String(e && e.message || e) }); return }
-            const rec = syncResult && syncResult.reconcile
+            const release = await acquireLock(lockFile)
+            if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行' }); return }
+            let rec = null
+            try {
+              await ensureShadowRepo(eff.gitBinary, eff, repoDir)
+              rec = await reconcileRemote(eff.gitBinary, eff, { repoDir, instanceId: state.instanceId, state, logger: ctx.logger })
+              await saveState()
+            } catch (e) { release(); sendJson(res, 400, { error: '对账预检失败：' + String(e && e.message || e) }); return }
+            finally { release() }
             const fresh = (rec && Array.isArray(rec.bothModified)) ? rec.bothModified : []
             state.pendingBoth = state.pendingBoth && typeof state.pendingBoth === 'object' ? state.pendingBoth : {}
             const both = [...fresh, ...Object.keys(state.pendingBoth)
@@ -6152,10 +6100,16 @@ module.exports = {
             }
             await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots).catch(() => [])
             // 恢复把 cordis.patch.yml 写回了，但插件内存里的 liveSettings 还是旧值 ——
-            // 不刷新则下面这次 runSync 会拿旧值把刚恢复的配置又覆盖回去（恢复没生效的元凶）。
+            // 恢复后只上传恢复结果；旧双向 runSync 已退役。
             refreshLive()
             await new Promise((r) => setTimeout(r, 500))
-            runSync({ autoAlign: false }).catch(() => {})
+            const releaseRestore = await acquireLock(lockFile)
+            if (releaseRestore) {
+              activeDirections.add('upload')
+              try { await runUpload(syncSettings()) }
+              catch (e) { ctx.logger.warn(`dsh-sync: post-restore upload: ${e && e.message}`) }
+              finally { activeDirections.delete('upload'); releaseRestore() }
+            }
             sendJson(res, 200, { restored: restored, safetySnapshot: safetyName })
             return
           }
@@ -6208,7 +6162,7 @@ module.exports = {
                 try { await createLocalSnapshot(eff, safetyName) } catch {}
               }
               const applyResult = await applyRemotePullPlan(eff.gitBinary, eff, { repoDir, state, roots: defaultRoots() }, planResult.plan)
-              runSync({ autoAlign: false }).catch(() => {})
+              // 远端拉取只写本机；需要传播时由用户点上传，不再触发旧双向同步。
               try { await pruneLocalSnapshots(join(syncDir, 'snapshots'), eff.snapshotLocalKeep || 30, state.cloudSnapshots) } catch {}
               sendJson(res, 200, { ...applyResult, safetySnapshot: safetyName, plan: planResult.plan })
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }

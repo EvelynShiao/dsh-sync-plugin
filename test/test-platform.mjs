@@ -205,6 +205,7 @@ await t('通用模板参数化后含直推指令、不含 GitCode 专属认证',
   ok(out.includes('HEAD:sync/x-1'), '应含 push 回 sync 分支')
   ok(!out.includes('api.gitcode.com') && !out.includes('PRIVATE-TOKEN'), '不应残留 GitCode 专属认证（PRIVATE-TOKEN/api.gitcode.com）')
   ok(out.includes('不要用 --force') && !/push[^。\n]*--force(?!：)/.test(out.replace('不要用 --force', '禁止词')), '应禁止 force 且不出现非禁止语境的 --force')
+  ok(out.includes('HEAD:main') && !out.includes('/dsh-sync/api/sync'), '通用模板直推主分支，不得调用旧 /sync')
   ok(!out.includes('{{'), '参数应全部替换完毕')
 })
 
