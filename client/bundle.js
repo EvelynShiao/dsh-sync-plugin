@@ -1036,6 +1036,9 @@ window.__ModuleLoader__.load({
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   h('input', { type: 'checkbox', checked: sessionsDeleteSync, onChange: e => setSessionsDeleteSync(e.target.checked) }), t('sessionsDeleteSyncLabel')),
                 h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('sessionsDeleteSyncHint')),
+                h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 }, title: t('rollbackGuardHint') },
+                  h('input', { type: 'checkbox', checked: rollbackGuard, disabled: busy || status.syncing, onChange: e => setRollbackGuard(e.target.checked) }), t('rollbackGuardLabel')),
+                h('div', { className: 'sk-hint', style: { marginTop: -2 } }, t('rollbackGuardHint')),
                 h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)', fontSize: 13 } },
                   t('intervalLabel'), h('input', { className: 'sk-input', type: 'number', min: 5, value: intervalMinutes, onChange: e => setIntervalMinutes(Math.max(1, Number(e.target.value) || 30)), style: { width: 80 } }))),
               h('div', { className: 'sk-card' },
@@ -1110,8 +1113,6 @@ window.__ModuleLoader__.load({
                 h(ButtonLite, { disabled: !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : undefined, onClick: () => setBrowseOpen(true) }, t('browseRemote')),
                 h('span', { className: 'sk-spacer' }),
                 h(ButtonLite, { disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('uploadHint'), onClick: doUpload }, t('uploadBtn')),
-                h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 }, title: t('rollbackGuardHint') },
-                  h('input', { type: 'checkbox', checked: rollbackGuard, disabled: busy || status.syncing, onChange: e => setRollbackGuard(e.target.checked) }), t('rollbackGuardLabel')),
                 h(ButtonLite, { primary: true, disabled: busy || status.syncing || !status.repoUrl || !status.hasToken, title: !status.repoUrl || !status.hasToken ? t('notConfigured') : t('downloadHint'), onClick: doDownload }, t('downloadBtn')),
                 h(ButtonLite, { disabled: !busy, title: t('stopHint'), onClick: doStop }, t('stopBtn'))))
       } catch (renderErr) {
