@@ -4239,7 +4239,7 @@ module.exports = {
     }
 
     // ── 下载：云 → 本地（单向，覆盖本地） ──
-    const runDownload = async (eff) => {
+    const runDownload = async (eff, { force = false } = {}) => {
       // [fix-4] 残留 index.lock 自检：上次上传被强杀时 git 会留下锁，
       // 不处理的话后面 reset --hard 必失败——而老代码把那句失败吞了，
       // 于是出现「下载完成」但仓库没更新的假成功。
@@ -4750,12 +4750,26 @@ module.exports = {
           try { ctx.inject(['sessions'], async (svcs) => { if (typeof svcs?.sessions?.refresh === 'function') await svcs.sessions.refresh() }) } catch {}
         }
       } catch (e) { try { ctx.logger?.warn?.('dsh-sync: session-normalize: ' + (e && e.message)) } catch {} }
+      /* 强制覆盖前内存备份：raw/part 车道没有 sessions-jsonl 模块，不能引 main 的
+         buildSessionZstd。用本文件既有 scanZstdFrames 验证头帧 + 事件帧，保证备份仍可被宿主读取。 */
+      function buildMemoryBackupZstd(lines) {
+        const zlib = require('node:zlib')
+        const opts = { params: { [zlib.constants.ZSTD_c_checksumFlag]: 1 } }
+        const out = Buffer.concat([
+          zlib.zstdCompressSync(Buffer.from(lines[0] + '\n', 'utf8'), opts),
+          zlib.zstdCompressSync(Buffer.from(lines.slice(1).join('\n') + '\n', 'utf8'), opts),
+        ])
+        const frames = scanZstdFrames(out)
+        if (frames.length !== 2 || frames[0] !== lines[0] + '\n') throw new Error('内存会话备份帧校验失败')
+        return out
+      }
+
       // 强制扫盘刷新：下载后无条件刷新会话列表 + 触发投影预热，让新会话不重启就显示
       try { ctx.inject(['sessions'], async (svcs) => { if (typeof svcs?.sessions?.refresh === 'function') await svcs.sessions.refresh() }) } catch {}
       try { ctx.logger?.info?.('dsh-sync: download done, sessions refresh dispatched') } catch {}
       state.lastSyncAt = new Date().toISOString()
       await saveState()
-      return { downloaded: true, applied, skipped }
+      return { downloaded: true, forced: force, applied, skipped }
     }
     // ── Agent-run jobs (action buttons → apiproxy 主对话级 session) ──
     // conflictRunJobs: 冲突 PR 解决；alignRunJobs: AI 智能对齐（语义合并双方改动）
@@ -4960,14 +4974,40 @@ module.exports = {
             const release = await acquireLock(lockFile)
             if (release === null) { sendJson(res, 400, { error: '另一个同步进程正在运行' }); return }
             try {
-              // pre-download 安全快照改 opt-in（snapshotSafety===true 才建）：它每次下载都建、
-              // 越积越多，用户不要自动快照。云端仍有原始数据，下载失败可重新下载。
+              // 强制覆盖是用户显式确认的单次操作：先把本机 sessions 整组原样备份，
+              // 包括尚未落盘的宿主内存尾巴。raw/part 车道继续整份机械覆盖，不做 seq 新旧判断。
+              const body = await readJsonBody(req)
+              const force = body.force === true
               let safetyName
-              if (eff.snapshotSafety === true) {
+              if (force) {
+                safetyName = `pre-force-download-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
+                try {
+                  const liveSessions = join(dshHome(), 'sessions')
+                  const liveBackup = join(syncDir, 'snapshots', safetyName, 'sessions')
+                  await fsP.mkdir(liveBackup, { recursive: true })
+                  await copyTree(liveSessions, liveBackup, {})
+                  await ctx.inject(['sessions'], async (svcs) => {
+                    for (const sid of Object.keys(state.lastCloudSessions || {})) {
+                      try {
+                        const s = svcs?.sessions?.get(sid)
+                        if (!s || typeof s.snapshotEvents !== 'function') continue
+                        const evs = s.snapshotEvents()
+                        if (!Array.isArray(evs) || !evs.length || typeof s.header?.cwd !== 'string') continue
+                        const memPath = join(liveBackup, encodeWorkspaceDir(s.header.cwd), sid, 'session.v4.jsonl.zstd')
+                        await fsP.mkdir(join(memPath, '..'), { recursive: true })
+                        await fsP.writeFile(memPath, buildMemoryBackupZstd([JSON.stringify(s.header), ...evs.map(e => JSON.stringify(e))]))
+                      } catch (e) { try { ctx.logger?.warn?.('dsh-sync: 强制覆盖内存备份 ' + sid + ': ' + String((e && e.message) || e)) } catch {} }
+                    }
+                  })
+                } catch (e) {
+                  sendJson(res, 400, { error: '强制覆盖前备份失败，已取消下载：' + String((e && e.message) || e) })
+                  return
+                }
+              } else if (eff.snapshotSafety === true) {
                 safetyName = `pre-download-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}`
                 try { await createLocalSnapshot(eff, safetyName) } catch {}
               }
-              const r = await runDownload(eff)
+              const r = await runDownload(eff, { force })
               sendJson(res, 200, { ...r, safetySnapshot: safetyName })
             } catch (e) { sendJson(res, 400, { error: String(e && e.message || e) }) }
             finally { release() }

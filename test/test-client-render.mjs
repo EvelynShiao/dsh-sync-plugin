@@ -100,5 +100,17 @@ await t('isGitCode=false：重建按钮禁用', async () => {
   ok(rebuild, '重建按钮应存在')
 })
 
+await t('强制云端覆盖按钮渲染在 sk-body 树内，并有独立确认文案', async () => {
+  injectSeq = { 0: STATUS_OK }; seq = 0
+  const tree = SettingsSection({ t: (k) => k })
+  const force = findText(tree, 'forceDownloadBtn')
+  ok(force, '强制覆盖按钮未渲染')
+  ok(hasAncestor(force, (n) => n.type === 'div' && n.props && n.props.className === 'sk-body'), '强制覆盖按钮不在 sk-body 树内')
+  const button = force.ancestors.findLast((n) => n.props && typeof n.props.onClick === 'function')
+  ok(button && button.props.title === 'forceDownloadHint', '按钮缺少独立强制覆盖提示')
+  const { ZH } = __internals
+  ok(ZH.forceDownloadConfirm.includes('分叉') && ZH.forceDownloadConfirm.includes('较短版本'), '确认文案未覆盖分叉和较短版本')
+})
+
 console.log(`\n=== 结果：${pass} 通过 / ${fail} 失败 ===`)
 process.exit(fail === 0 ? 0 : 1)
