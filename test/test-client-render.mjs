@@ -108,6 +108,8 @@ await t('防回滚是默认勾选的 checkbox，不再有独立强制覆盖按�
   ok(hasAncestor(label, (n) => n.type === 'div' && n.props && n.props.className === 'sk-body'), '勾选框不在 sk-body 树内')
   const checkbox = label.ancestors.flatMap(n => n.kids || []).find(n => n && n.type === 'input' && n.props?.type === 'checkbox')
   ok(checkbox && checkbox.props.checked === true && typeof checkbox.props.onChange === 'function', '防回滚不是默认勾选的交互 checkbox')
+  const texts = []; flatten(tree, texts)
+  ok(texts.indexOf('rollbackGuardLabel') > texts.indexOf('sessionsDeleteSyncHint') && texts.indexOf('rollbackGuardLabel') < texts.indexOf('intervalLabel'), '勾选框不在「会话删除传导」说明下方')
   ok(!findText(tree, 'forceDownloadBtn'), '不应再渲染独立强制覆盖按钮')
   const { ZH } = __internals
   ok(ZH.forceDownloadConfirm.includes('分叉') && ZH.forceDownloadConfirm.includes('较短版本'), '取消勾选后的确认文案未覆盖分叉和较短版本')
