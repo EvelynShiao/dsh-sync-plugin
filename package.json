@@ -2,7 +2,7 @@
   "name": "@weibaohui/dsh-sync",
   "version": "9999.9.9",
   "description": "dsh-sync custom build",
-  "license": "MIT",
+  "license": "MPL-2.0",
   "scripts": {
     "build:client": "node scripts/build-client.mjs",
     "check:client": "node scripts/build-client.mjs --check"
