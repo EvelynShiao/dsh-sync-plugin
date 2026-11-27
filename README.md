@@ -101,6 +101,5 @@
 
 本仓库整体按 **Mozilla Public License 2.0（MPL-2.0）** 发布，全文见 [LICENSE](LICENSE)。
 
-这是对上游项目的分支/修改版本：上游原始许可证与版权声明保留在
-[LICENSE-UPSTREAM](LICENSE-UPSTREAM)，出处与改动说明见 [NOTICE](NOTICE)。
-上游文件保留其原许可证，本仓库中由 EvelynShiao 修改或新增的文件按 MPL-2.0 发布。
+本仓库不含需要保留第三方许可证原文的上游 LICENSE 文件，因此不设 LICENSE-UPSTREAM；
+上游情况见 [NOTICE](NOTICE)。
