@@ -101,5 +101,6 @@
 
 本仓库整体按 **Mozilla Public License 2.0（MPL-2.0）** 发布，全文见 [LICENSE](LICENSE)。
 
-本仓库不含需要保留第三方许可证原文的上游 LICENSE 文件，因此不设 LICENSE-UPSTREAM；
-上游情况见 [NOTICE](NOTICE)。
+上游：[@weibaohui/dsh-sync](https://github.com/weibaohui/dsh-sync)（MIT，Copyright (c) 2026 weibaohui）。
+上游 MIT 许可证原文保留在 [LICENSE-UPSTREAM](LICENSE-UPSTREAM)，出处与改动说明见 [NOTICE](NOTICE)。
+上游文件保留其 MIT 许可，本仓库中由 EvelynShiao 修改或新增的文件按 MPL-2.0 发布。
