@@ -1,0 +1,17 @@
+dsh-sync（@weibaohui/dsh-sync 的 fork）
+Copyright (c) 2026 EvelynShiao（本仓库的修改与新增部分）
+
+许可证
+------
+本仓库的整体发布许可证为 Mozilla Public License 2.0（见 LICENSE）。
+
+上游许可
+--------
+上游：https://github.com/weibaohui/dsh-sync（npm 包 @weibaohui/dsh-sync，MIT）
+Copyright (c) 2026 weibaohui
+上游 MIT 许可证全文保留在 LICENSE-UPSTREAM，其版权与许可声明不得移除。
+
+说明：MPL-2.0 是文件级弱著佐权。上游 MIT 允许再许可，因此本仓库整体可按
+MPL-2.0 发布；上游原始文件保留其 MIT 许可与版权声明，本仓库中由 EvelynShiao
+修改或新增的文件按 MPL-2.0 发布。分发本仓库或其衍生作品时，请一并保留
+LICENSE、LICENSE-UPSTREAM 与本 NOTICE。

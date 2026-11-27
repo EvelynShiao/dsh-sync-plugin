@@ -96,3 +96,11 @@
 - 手机端插件装在 `plugin-src/`（`profiles/web/node_modules` 是指回它的符号链接），本版所有路径计算都兼容两种布局
 - **memory.sqlite 会坏**：提示词绑定/版本住在里面，它是二进制单文件，宿主被杀就可能截断。库一坏，旧版本会把「读不到」当成「本机没有」写进云端，静默抹掉共享配置。9999.9.15 起有 `quick_check` 保护 + 明确日志（`logs/dsh-sync-init.log` 里搜 `UNREADABLE` / `不合法`）。修复流程见仓库外的 `mem-rescue` 备份目录。
 - 重装手机插件：`mv 旧目录 && git clone --depth 1 <GitCode地址> 新目录 && rm -rf 新目录/.git`，link: 按路径解析会自动接上
+
+## 许可证与上游
+
+本仓库整体按 **Mozilla Public License 2.0（MPL-2.0）** 发布，全文见 [LICENSE](LICENSE)。
+
+上游：[@weibaohui/dsh-sync](https://github.com/weibaohui/dsh-sync)（MIT，Copyright (c) 2026 weibaohui）。
+上游 MIT 许可证原文保留在 [LICENSE-UPSTREAM](LICENSE-UPSTREAM)，出处与改动说明见 [NOTICE](NOTICE)。
+上游文件保留其 MIT 许可，本仓库中由 EvelynShiao 修改或新增的文件按 MPL-2.0 发布。
