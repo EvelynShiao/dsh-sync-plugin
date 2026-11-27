@@ -5562,10 +5562,21 @@ module.exports = {
     ctx.effect(() => ctx.webServer.register({
       kind: 'prefix',
       path: '/dsh-sync/api',
+      // [2026-11-27] dsh 0.2.0 把路由准入收归 webServer：register 新增 auth 策略
+      // （anonymous/required/deny，默认 required），同时从 connection 移除
+      // requestRejection/ConnectionRequestRejection。显式声明 required 与新老语义一致：
+      // 老宿主忽略未知字段、仍由下面的能力探测栅栏把关；新宿主由准入层把关。
+      auth: 'required',
       handler: async (req, res) => {
         // 与其它 host 路由一致的信任栅栏：connection 服务的 Host/Origin 检查
         // 加浏览器认证，防止本机任意网页跨站调用。
-        const rejection = ctx.connection.requestRejection(req)
+        // [2026-11-27] 0.2.0 已删除 connection.requestRejection —— 原来直接调用会抛
+        // TypeError 冒泡出 handler，路由回 400 空 body，客户端 getJson 抛错而 refresh
+        // 没有 catch，设置页「同步」永远停在加载中（用户实测：不停转圈）。
+        // 改为能力探测：老宿主继续用原栅栏，新宿主交给上面的 auth 准入层。
+        const rejection = typeof (ctx.connection && ctx.connection.requestRejection) === 'function'
+          ? ctx.connection.requestRejection(req)
+          : undefined
         if (rejection !== undefined) {
           res.writeHead(rejection)
           res.end()

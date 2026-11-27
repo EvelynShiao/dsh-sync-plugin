@@ -75,6 +75,9 @@ window.__ModuleLoader__.load({
 
     const ZH = {
       title: '同步',
+      panelWaiting: '正在读取同步状态…',
+      panelUnavailable: '同步状态读取失败',
+      panelUnavailableHint: '面板拿不到状态就会一直停在「正在读取」。上面是后端返回的原始错误；重开 DSH 后仍失败，请把这一行发给维护者。',
       syncing: '同步中，可能需要一分钟…',
       syncDone: '同步完成',
       syncFailed: '同步失败',
@@ -219,6 +222,9 @@ window.__ModuleLoader__.load({
 
     const EN = {
       title: 'Sync',
+      panelWaiting: 'Reading sync status…',
+      panelUnavailable: 'Could not read sync status',
+      panelUnavailableHint: 'Without a status the panel stays on "reading" forever. The raw backend error is above; if it persists after reopening DSH, send that line to the maintainer.',
       syncing: 'Syncing, may take a minute…',
       syncDone: 'Sync complete',
       syncFailed: 'Sync failed',
@@ -779,9 +785,14 @@ window.__ModuleLoader__.load({
       const [snapCloud, setSnapCloud] = useState(false)
       const [snapBusy, setSnapBusy] = useState(false)
       const [browseOpen, setBrowseOpen] = useState(false)
+      // [2026-11-27] 面板状态读取失败必须可见：此前 refresh 的 .catch(() => {}) 把错误全吞了，
+      // 后端一回非 200（例如 dsh 0.2.0 删掉 connection.requestRejection 让路由抛 400），
+      // status 永远是 null，界面就停在「正在读取」——用户看到的就是「同步插件用不了/一直转圈」。
+      const [statusError, setStatusError] = useState(null)
 
       const onToast = (text, ms = 3000) => { setToastText(text); setTimeout(() => setToastText(null), ms) }
       const refresh = () => getJson(API + '/status').then(d => {
+        setStatusError(null)
         setStatus(d)
         setRepoUrl(d.repoUrl)
         setBranch(d.branch)
@@ -801,7 +812,12 @@ window.__ModuleLoader__.load({
         if (d.strategies) setGs(prev => ({ ...prev, ...d.strategies }))
         if (d.snapshot) setSnapCfg(d.snapshot)
         getJson(API + '/snapshot/list').then(l => setSnapList(l)).catch(() => {})
-      }).catch(() => {})
+      }).catch((err) => {
+        // 不再静默吞错：留下可读原因，配合下面的 status===null 分支把「一直转圈」变成明确报错。
+        const msg = String((err && err.message) || err || 'status request failed')
+        setStatusError(msg)
+        try { (globalThis.__skErrors = globalThis.__skErrors || []).push('status: ' + msg) } catch {}
+      })
       useEffect(() => {
         refresh()
         const timer = setInterval(refresh, 15000)
@@ -965,6 +981,23 @@ window.__ModuleLoader__.load({
       const doClearToken = async () => {
         try { await putSettings({ token: null }); onToast(t('saved'), 2200); refresh() }
         catch (e) { onToast(e.message || t('operationFailed'), 4000) }
+      }
+
+      // [2026-11-27] status 还没读到就先给一个明确的等待/失败态，不进 body 的巨型三元（那里
+      // 直接读 status.repoUrl 会抛错，只能落到 catch 里显示一句无上下文的异常）。
+      if (status === null) {
+        return h('div', { className: 'sk-page' },
+          h('div', { className: 'sk-body' },
+            h('div', { className: 'sk-card' },
+              statusError === null
+                ? h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                    h('div', { className: 'sk-spin', style: { width: 14, height: 14, borderWidth: 2 } }),
+                    t('panelWaiting'))
+                : h('div', null,
+                    h('div', { style: { color: 'var(--dsw-alias-state-error-primary)', fontWeight: 600 } },
+                      '\u26A0\uFE0F ' + t('panelUnavailable')),
+                    h('div', { className: 'sk-dir', style: { wordBreak: 'break-word', margin: '4px 0' } }, statusError),
+                    h('div', { className: 'sk-dir', style: { marginTop: 2 } }, t('panelUnavailableHint'))))))
       }
 
       let body
