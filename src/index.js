@@ -1178,10 +1178,84 @@ function resolveLivePath(spec, shadowRel) {
 
 // ── Shadow repo lifecycle ──
 
+/* [2026-11-27 空壳仓事故] 只看 `.git` 存在就认为仓库可用是不成立的：clone 被中断
+   （App 重启/超时/断电）会留下「.git 目录在、对象库 0 个、refs 全空」的空壳，此后
+   每次 fetch 都在空壳上跑，同步静默失败到底。判定改为「.git 存在 且 HEAD 可解析」，
+   否则按不存在处理，走重建分支。 */
+async function shadowRepoHealthy(binary, repoDir) {
+  try { await fsP.access(join(repoDir, '.git')) } catch { return false }
+  // HEAD 可解析 = 正常仓
+  try { await gitExec(binary, ['rev-parse', '--verify', 'HEAD'], repoDir); return true } catch { }
+  // HEAD 不可解析时，只要还有任何提交对象就说明不是空壳（首次 push 前的本地 init 仓），
+  // 保留原地继续，不要拿重建去覆盖它
+  try {
+    const n = Number((await gitExec(binary, ['rev-list', '--all', '--count'], repoDir)).trim())
+    if (Number.isFinite(n) && n > 0) return true
+  } catch { }
+  return false
+}
+
+/* [2026-11-27 自愈] 影子仓是纯派生物：数据源永远是 live 目录 + 云端，本地副本坏了
+   删掉重克隆零损失。所以 git 层任何「仓库本身坏了」的报错都不该变成用户要手工修的
+   死结——自动重建一次再重试。之前只有空壳判定，对象缺失/半截包/坏 ref 全靠人工。 */
+const REPO_CORRUPTION_RE = /not a git repository|bad object|corrupt|unable to read (tree|object|commit|loose)|reference is not a tree|invalid object|missing (blob|tree|commit)|packfile|early EOF|index file (smaller|corrupt)|bad (sha1|object)|loose object .* is corrupt|fatal: .*shallow/i
+
+/** 删本地影子仓并重新克隆。克隆失败（多为网络）则把旧仓原样搬回，不比之前更糟。 */
+async function recloneShadowRepo(binary, eff, repoDir, logger) {
+  const remote = authedUrl(eff.repoUrl, eff.token)
+  const brokenDir = `${repoDir}.broken-${Date.now()}`
+  logger?.warn?.('[dsh-sync] 影子仓损坏，自动重建（只删本地派生物，不动本机数据与云端）')
+  await fsP.rm(brokenDir, { recursive: true, force: true }).catch(() => {})
+  // 先改名挪开：rename 同盘瞬时，且失败可回滚
+  try { await fsP.rename(repoDir, brokenDir) } catch {
+    await fsP.rm(repoDir, { recursive: true, force: true }).catch(() => {})
+  }
+  try {
+    await gitExec(binary, ['clone', '-b', eff.branch, '--depth', '1', remote, repoDir])
+    // clone 会把带 token 的 URL 写进 .git/config——立刻换回干净地址
+    await gitExec(binary, ['remote', 'set-url', 'origin', eff.repoUrl], repoDir).catch(() => {})
+    await fsP.rm(brokenDir, { recursive: true, force: true }).catch(() => {})
+    logger?.info?.('[dsh-sync] 影子仓重建完成')
+    return remote
+  } catch (e) {
+    await fsP.rm(repoDir, { recursive: true, force: true }).catch(() => {})
+    await fsP.rename(brokenDir, repoDir).catch(() => {})
+    logger?.warn?.('[dsh-sync] 影子仓重建失败（' + String((e && e.message) || e).slice(0, 120) + '），已回滚')
+    throw e
+  }
+}
+
+/* [2026-11-27] 残留锁类报错：git 只会说「另一个 git 进程在跑」，实际是上次中断留下的锁。
+   这类先清锁重试（代价极低），清完仍失败才考虑重建。 */
+const GIT_LOCK_RE = /Unable to create '.*\.lock'|Another git process seems to be running|remove the file manually|index\.lock|shallow\.lock/i
+
+/** fetch 包装：残留锁 → 清锁重试；仓库损坏 → 自动重建影子仓后重试一次。 */
+async function gitFetchWithHeal(binary, fetchArgs, repoDir, eff, logger) {
+  try {
+    return await gitExec(binary, fetchArgs, repoDir)
+  } catch (e) {
+    const msg = String((e && e.message) || '')
+    if (GIT_LOCK_RE.test(msg)) {
+      logger?.warn?.('[dsh-sync] fetch 撞上残留 git 锁，清理后重试: ' + msg.slice(0, 160))
+      await clearStaleGitLock(repoDir)
+      try { return await gitExec(binary, fetchArgs, repoDir) } catch (e2) {
+        const m2 = String((e2 && e2.message) || '')
+        if (!REPO_CORRUPTION_RE.test(m2)) throw e2
+        logger?.warn?.('[dsh-sync] 清锁后仍失败且指向仓库损坏，自动重建: ' + m2.slice(0, 160))
+        await recloneShadowRepo(binary, eff, repoDir, logger)
+        return await gitExec(binary, fetchArgs, repoDir)
+      }
+    }
+    if (!REPO_CORRUPTION_RE.test(msg)) throw e
+    logger?.warn?.('[dsh-sync] fetch 失败且指向影子仓损坏，自动重建后重试: ' + msg.slice(0, 160))
+    await recloneShadowRepo(binary, eff, repoDir, logger)
+    return await gitExec(binary, fetchArgs, repoDir)
+  }
+}
+
 async function ensureShadowRepo(binary, eff, repoDir) {
   const remote = authedUrl(eff.repoUrl, eff.token)
-  let exists = false
-  try { await fsP.access(join(repoDir, '.git')); exists = true } catch { exists = false }
+  const exists = await shadowRepoHealthy(binary, repoDir)
   if (!exists) {
     await fsP.rm(repoDir, { recursive: true, force: true }).catch(() => {})
     await fsP.mkdir(join(repoDir, '..'), { recursive: true })
@@ -1725,15 +1799,31 @@ async function applyWorkspaceOrder(order, ctx) {
 // 报 "remove the file manually to continue"。sync 自己有 .lock 保证同一时刻只有一个
 // 同步在跑，所以此刻若 index.lock 还在 = 上次中断的残留，安全删除。
 async function clearStaleGitLock(repoDir) {
-  const lock = join(repoDir, '.git', 'index.lock')
+  /* [2026-11-27 事故根因] 原来只清 index.lock —— 但下载/上传全走 `git fetch --depth 1`，
+     那条路要抢的是 .git/shallow.lock，不是 index.lock。clone 被中断（App 重启/超时）留下的
+     shallow.lock 会让此后**每一次** fetch 都报 "Unable to create '...shallow.lock': File exists"
+     → 同步永久失败，且报错只说「另一个 git 进程在跑」，根本指不到真相。
+     本函数只在持有 sync .lock 时被调 = 必无活 git，这些锁一律是残留，安全删。 */
   let removed = false
-  try { await fsP.access(lock); await fsP.unlink(lock); removed = true } catch { }
+  for (const name of ['index.lock', 'shallow.lock', 'HEAD.lock', 'config.lock', 'packed-refs.lock']) {
+    const lock = join(repoDir, '.git', name)
+    try { await fsP.access(lock); await fsP.unlink(lock); removed = true } catch { }
+  }
   /* [2026-11-15 安全停止配套] 被 10min 超时/停止按钮杀掉的 fetch 会留 tmp_pack_* 半截包
      （git 判定 garbage，喂大仓库画像）。本函数只在持有 sync .lock 时被调 = 必无活 git，清之安全。 */
   try {
     const packDir = join(repoDir, '.git', 'objects', 'pack')
     for (const ent of await fsP.readdir(packDir).catch(() => [])) {
       if (String(ent).startsWith('tmp_pack_')) await fsP.rm(join(packDir, ent), { force: true }).catch(() => { })
+    }
+  } catch { }
+  // refs 目录下的 *.lock（fetch 写 remote ref 时中断留下）
+  try {
+    for (const sub of ['refs/heads', 'refs/remotes/origin']) {
+      const dir = join(repoDir, '.git', sub)
+      for (const ent of await fsP.readdir(dir).catch(() => [])) {
+        if (String(ent).endsWith('.lock')) { await fsP.rm(join(dir, ent), { force: true }).catch(() => { }); removed = true }
+      }
     }
   } catch { }
   return removed
@@ -2239,6 +2329,13 @@ async function pushWithSelfHeal(binary, pushArgs, repoDir, eff, state, logger, e
     return out
   } catch (firstErr) {
     const msg = String(firstErr && firstErr.message || '')
+    /* [2026-11-27 自愈] 推送阶段的仓库损坏（对象/ref 坏、半截包）同样自动重建：
+       影子仓是派生物，重建后重推一次即可，不该让用户去手工删 .git。 */
+    if (REPO_CORRUPTION_RE.test(msg)) {
+      logger?.warn?.('[dsh-sync] 推送失败且指向影子仓损坏，自动重建后重试: ' + msg.slice(0, 160))
+      await recloneShadowRepo(binary, eff, repoDir, logger)
+      return await run(binary, pushArgs, repoDir)
+    }
     if (!REBUILD_WARNING_RE.test(msg)) throw firstErr
     logger?.warn?.('[dsh-sync] 推送被拒（体积超限），触发自愈阶梯: ' + msg.slice(0, 160))
     // ① 本地 gc 重试
@@ -2698,7 +2795,7 @@ async function runPush(binary, eff, { repoDir, instanceId, state, logger, roots,
   let settingsPreserved = false
 
   // 1. fetch origin/main → FETCH_HEAD (canonical baseline)
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  try { await gitFetchWithHeal(binary, ['fetch', remote, eff.branch], repoDir, eff, logger) } catch (e) {
     // first-ever push to an empty remote: no main yet, skip fetch
     if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
   }
@@ -2873,7 +2970,7 @@ async function runPull(binary, eff, { repoDir, state, logger, roots }) {
   const remote = authedUrl(eff.repoUrl, eff.token)
   const spec = syncSpec(eff, roots, state.instanceId)
   const lastSynced = state.lastSyncedCommit
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  try { await gitFetchWithHeal(binary, ['fetch', remote, eff.branch], repoDir, eff, logger) } catch (e) {
     if (!/Could not find|doesn't exist|empty/i.test(String(e && e.message))) throw e
     return { pulled: false, empty: true }
   }
@@ -3189,7 +3286,7 @@ async function reconcileRemote(binary, eff, { repoDir, state, logger, roots }) {
   try { await fs.promises.access(join(repoDir, '.git')) } catch { return { reconciled: false, noShadow: true } }
   const remote = authedUrl(eff.repoUrl, eff.token)
   const spec = syncSpec(eff, roots, state.instanceId)
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  try { await gitFetchWithHeal(binary, ['fetch', remote, eff.branch], repoDir, eff, logger) } catch (e) {
     if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
     return { reconciled: false, empty: true }
   }
@@ -3363,7 +3460,7 @@ async function pruneLocalSnapshots(snapshotsDir, keep, cloudNames) {
  *  并走一次 分支 → PR → 合并（非 GitCode 远端退化为推分支）。 */
 async function promoteSnapshotToCloud(binary, eff, { repoDir, instanceId, state, logger }, snapName, srcDir) {
   const remote = authedUrl(eff.repoUrl, eff.token)
-  try { await gitExec(binary, ['fetch', remote, eff.branch], repoDir) } catch (e) {
+  try { await gitFetchWithHeal(binary, ['fetch', remote, eff.branch], repoDir, eff, logger) } catch (e) {
     if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
   }
   const hasRemote = await gitExec(binary, ['rev-parse', '--verify', 'FETCH_HEAD'], repoDir).then(() => true).catch(() => false)
@@ -3974,7 +4071,7 @@ module.exports = {
   name: 'dsh-sync',
   inject: ['webServer', 'settings', 'connection'],
   Config,
-  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectPlatform, platformRequest, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, CONFLICT_PROMPT_GENERIC, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, pruneCloudExtras, pruneLocalOnlySessions, walCheckpointTruncate, safeSqliteLanding, sqliteLandingCleanup,
+  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectPlatform, platformRequest, authedUrl, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, contentSignature, treeSignature,acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, shadowRepoHealthy, recloneShadowRepo, gitFetchWithHeal, clearStaleGitLock, REPO_CORRUPTION_RE, GIT_LOCK_RE, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, CONFLICT_PROMPT_GENERIC, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, gateSqlitePayload, pruneCloudExtras, pruneLocalOnlySessions, walCheckpointTruncate, safeSqliteLanding, sqliteLandingCleanup,
     // remote backup browser（导出供测试）
     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
     // 完整性门（导出供测试：好/坏样本回归）
@@ -4255,7 +4352,7 @@ module.exports = {
       /* [2026-11-15 抗堵 v1] --depth 1：上传只需要云端基线 tip（覆盖语义+force push 不需要历史）。
          对端 squash 重写后无公共对象，全量 fetch 曾达 48MB；拥塞时段 ~60KB/s 时 14min 必撞旧 10min 超时。
          depth 1 把最坏情况锁死在 tip 快照大小。副作用：影子仓 shallow 化（squash 计数已用 state 兜底）。 */
-      try { await gitExec(eff.gitBinary, ['fetch', '--depth', '1', remote, eff.branch], repoDir) } catch (e) {
+      try { await gitFetchWithHeal(eff.gitBinary, ['fetch', '--depth', '1', remote, eff.branch], repoDir, eff, ctx.logger) } catch (e) {
         if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
       }
       /* [skills 退役 2026-10-26] syncSkills=false 后 spec 无 skills 组，但影子仓/云端
@@ -4632,6 +4729,9 @@ module.exports = {
         if (e && e.code === 'ENOENT') { /* 无锁，正常 */ }
         else if (e && /^影子仓库被 git 占用/.test(String(e.message))) throw e
       }
+      /* [2026-11-27] shallow.lock 等残留锁一并清（下载全走 fetch --depth 1，抢的就是它）。
+         此处已持有 sync .lock，必无活 git，残留锁安全删。 */
+      await clearStaleGitLock(repoDir)
       const allDownloadedSessionIds = [],
         skipped = []
       const notes = []
@@ -4640,7 +4740,7 @@ module.exports = {
       const remote = await ensureShadowRepo(eff.gitBinary, eff, repoDir)
       const spec = syncSpec(eff, defaultRoots(), state.instanceId)
       /* [2026-11-15 抗堵 v1] 下载同样只需要 tip 全树（fetch --depth 1），理由同上传侧 */
-      try { await gitExec(eff.gitBinary, ['fetch', '--depth', '1', remote, eff.branch], repoDir) } catch (e) {
+      try { await gitFetchWithHeal(eff.gitBinary, ['fetch', '--depth', '1', remote, eff.branch], repoDir, eff, ctx.logger) } catch (e) {
         if (!/could ?n[o']?t find|doesn't exist|no such|unborn|empty/i.test(String(e && e.message))) throw e
         return { downloaded: false, empty: true }
       }
@@ -4660,16 +4760,32 @@ module.exports = {
       if (headSha && fetchSha && headSha === fetchSha) {
         syncLogLine('下载极速短路: FETCH_HEAD==HEAD(' + headSha.slice(0, 10) + ')，免 checkout/reset 全树扫描')
       } else {
-        try {
-          await gitExec(eff.gitBinary, ['checkout', eff.branch], repoDir)
-        } catch (e) {
-          skipped.push('checkout ' + eff.branch + ' 失败: ' + String(e && e.message))
+        /* [2026-11-27 自愈] 对齐失败分两类：仓库本身坏了（对象/ref 损坏）→ 自动重建重克隆
+           后重试一次；否则（多为残留 index.lock）保留原有可读报错。 */
+        const alignToFetchHead = async () => {
+          try {
+            await gitExec(eff.gitBinary, ['checkout', eff.branch], repoDir)
+          } catch (e) {
+            skipped.push('checkout ' + eff.branch + ' 失败: ' + String(e && e.message))
+          }
+          await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir)
         }
         try {
-          await gitExec(eff.gitBinary, ['reset', '--hard', 'FETCH_HEAD'], repoDir)
+          await alignToFetchHead()
         } catch (e) {
-          // [fix-1] 老代码是 .catch(()=>{}) —— 失败被吞掉，界面照样报「下载完成」
-          throw new Error('影子仓库更新失败：' + String(e && e.message) + '。最常见原因是上次中断留下的 index.lock。')
+          const msg = String(e && e.message || '')
+          if (!REPO_CORRUPTION_RE.test(msg)) {
+            // [fix-1] 老代码是 .catch(()=>{}) —— 失败被吞掉，界面照样报「下载完成」
+            throw new Error('影子仓库更新失败：' + msg + '。最常见原因是上次中断留下的 index.lock。')
+          }
+          ctx.logger?.warn?.('[dsh-sync] 下载对齐失败且指向仓库损坏，自动重建后重试: ' + msg.slice(0, 160))
+          await recloneShadowRepo(eff.gitBinary, eff, repoDir, ctx.logger)
+          await gitFetchWithHeal(eff.gitBinary, ['fetch', '--depth', '1', remote, eff.branch], repoDir, eff, ctx.logger)
+          try {
+            await alignToFetchHead()
+          } catch (e2) {
+            throw new Error('影子仓库更新失败（自动重建后仍失败）：' + String(e2 && e2.message || e2))
+          }
         }
       }
       const applied = []
